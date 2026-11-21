@@ -16,7 +16,7 @@ Update this table in the completion report of every phase. Status values: `Not s
 | 0 | Confirm product choices | Done (ADR 0001; open actions tracked there) |
 | 1 | Bootstrap the repository | Done |
 | 2 | Schemas and symbol normalization | Done |
-| 3 | Market-data adapter | Not started |
+| 3 | Market-data adapter | Done |
 | 4 | Deterministic technical analysis | Not started |
 | 5 | Analysis service and CLI (Milestone A) | Not started |
 | 6 | Gemini behind tools | Not started |
