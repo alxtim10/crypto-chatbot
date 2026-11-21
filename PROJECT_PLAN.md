@@ -17,7 +17,7 @@ Update this table in the completion report of every phase. Status values: `Not s
 | 1 | Bootstrap the repository | Done |
 | 2 | Schemas and symbol normalization | Done |
 | 3 | Market-data adapter | Done |
-| 4 | Deterministic technical analysis | Not started |
+| 4 | Deterministic technical analysis | Done |
 | 5 | Analysis service and CLI (Milestone A) | Not started |
 | 6 | Gemini behind tools | Not started |
 | 7 | Telegram commands and bounded memory | Not started |
