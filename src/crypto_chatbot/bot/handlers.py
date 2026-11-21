@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import html
 import logging
 import re
+import traceback
 import uuid
 from collections.abc import Iterable, Sequence
 from typing import Any
@@ -78,7 +80,11 @@ class SecretRedactingFilter(logging.Filter):
         if redacted != formatted or record.args:
             record.msg = redacted
             record.args = ()
-        if record.exc_text:
+        if record.exc_info:
+            formatted_exc = "".join(traceback.format_exception(*record.exc_info))
+            record.exc_text = self.redact_text(formatted_exc).rstrip("\n")
+            record.exc_info = None
+        elif record.exc_text:
             record.exc_text = self.redact_text(record.exc_text)
         return True
 
@@ -168,7 +174,10 @@ class BotService:
                 user_text=f"/analyze {' '.join(args)}".strip(),
             )
         except CommandParseError as exc:
-            return split_telegram_message(str(exc), TELEGRAM_MAX_MESSAGE_LENGTH)
+            return split_telegram_message(
+                html.escape(str(exc), quote=False),
+                TELEGRAM_MAX_MESSAGE_LENGTH,
+            )
         except SQLAlchemyError:
             logger.exception(
                 "request_id=%s user_id=%s action=analyze db_error", request_id, user_id
@@ -196,7 +205,10 @@ class BotService:
                 user_text=f"/compare {' '.join(args)}".strip(),
             )
         except CommandParseError as exc:
-            return split_telegram_message(str(exc), TELEGRAM_MAX_MESSAGE_LENGTH)
+            return split_telegram_message(
+                html.escape(str(exc), quote=False),
+                TELEGRAM_MAX_MESSAGE_LENGTH,
+            )
         except SQLAlchemyError:
             logger.exception(
                 "request_id=%s user_id=%s action=compare db_error", request_id, user_id
@@ -237,7 +249,10 @@ class BotService:
             rendered = render_watchlist_message(prefs.watchlist, note=note, html_mode=True)
             return split_telegram_message(rendered, TELEGRAM_MAX_MESSAGE_LENGTH)
         except CommandParseError as exc:
-            return split_telegram_message(str(exc), TELEGRAM_MAX_MESSAGE_LENGTH)
+            return split_telegram_message(
+                html.escape(str(exc), quote=False),
+                TELEGRAM_MAX_MESSAGE_LENGTH,
+            )
         except SQLAlchemyError:
             logger.exception(
                 "request_id=%s user_id=%s action=watchlist db_error", request_id, user_id
@@ -286,7 +301,11 @@ class BotService:
         if denied is not None or user_id is None:
             return denied or _deny_chunks("not_allowlisted")
         cmd = command_text.strip().split()[0] if command_text.strip() else "/"
-        return (f"Perintah '{cmd}' tidak dikenali. Gunakan /help untuk melihat daftar perintah.",)
+        escaped_cmd = html.escape(cmd, quote=False)
+        return (
+            f"Perintah '{escaped_cmd}' tidak dikenali. "
+            "Gunakan /help untuk melihat daftar perintah.",
+        )
 
     async def handle_text_message(
         self,
@@ -307,7 +326,10 @@ class BotService:
                 default_timeframe=prefs.default_timeframe,
             )
             if isinstance(intent, RefusalIntent):
-                return split_telegram_message(intent.message, TELEGRAM_MAX_MESSAGE_LENGTH)
+                return split_telegram_message(
+                    html.escape(intent.message, quote=False),
+                    TELEGRAM_MAX_MESSAGE_LENGTH,
+                )
             if isinstance(intent, AnalyzeIntent):
                 return await self._execute_single_analysis(
                     user_id=user_id,
