@@ -27,6 +27,10 @@ class Settings(BaseSettings):
     telegram_bot_token: SecretStr
     gemini_api_key: SecretStr
     gemini_model: str = Field(min_length=1)
+    gemini_timeout_seconds: float = Field(default=15.0, gt=0)
+    gemini_max_output_tokens: int = Field(default=1024, ge=64, le=4096)
+    gemini_user_daily_cap: int = Field(default=30, ge=1)
+    gemini_global_daily_cap: int = Field(default=200, ge=1)
     database_url: SecretStr
     allowed_telegram_user_ids: Annotated[tuple[int, ...], NoDecode] = Field(min_length=1)
 
