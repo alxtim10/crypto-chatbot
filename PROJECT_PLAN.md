@@ -18,7 +18,7 @@ Update this table in the completion report of every phase. Status values: `Not s
 | 2 | Schemas and symbol normalization | Done |
 | 3 | Market-data adapter | Done |
 | 4 | Deterministic technical analysis | Done |
-| 5 | Analysis service and CLI (Milestone A) | Not started |
+| 5 | Analysis service and CLI (Milestone A) | Done |
 | 6 | Gemini behind tools | Not started |
 | 7 | Telegram commands and bounded memory | Not started |
 | 8 | End-to-end MVP validation (Milestone B) | Not started |

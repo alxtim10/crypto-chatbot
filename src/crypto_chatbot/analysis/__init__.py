@@ -1,5 +1,6 @@
-"""Deterministic technical analysis engine (indicators, regimes, structure, events)."""
+"""Deterministic technical analysis engine (indicators, regimes, structure, service)."""
 
+from crypto_chatbot.analysis.factors import build_factors
 from crypto_chatbot.analysis.failed_breakout import (
     DEFAULT_FAILED_BREAKOUT_WINDOW,
     detect_failed_breakouts,
@@ -42,6 +43,11 @@ from crypto_chatbot.analysis.regimes import (
     TRENDING_ADX_MIN,
     classify_regime,
 )
+from crypto_chatbot.analysis.service import (
+    AnalysisService,
+    build_analysis_snapshot,
+    compute_candles_sha256,
+)
 from crypto_chatbot.analysis.structure import (
     DEFAULT_PIVOT_K,
     StructureAnalysis,
@@ -68,6 +74,7 @@ __all__ = [
     "MIN_HISTORY_RSI_14",
     "RANGING_ADX_MAX",
     "TRENDING_ADX_MIN",
+    "AnalysisService",
     "IndicatorResult",
     "MtfRsiResult",
     "PreviousPeriodLevels",
@@ -76,7 +83,10 @@ __all__ = [
     "analyze_market_structure",
     "atr_percentile_series",
     "atr_series",
+    "build_analysis_snapshot",
+    "build_factors",
     "classify_regime",
+    "compute_candles_sha256",
     "compute_mtf_rsi_alignment",
     "compute_previous_period_levels",
     "compute_technical_metrics",

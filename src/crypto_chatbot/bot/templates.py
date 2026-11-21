@@ -1,0 +1,241 @@
+"""Deterministic Indonesian formatting and Telegram HTML rendering."""
+
+from __future__ import annotations
+
+import html
+from datetime import UTC, datetime, timedelta, timezone
+
+from crypto_chatbot.schemas.analysis import (
+    AnalysisSnapshot,
+    Fact,
+    FactorDirection,
+    MarketStructure,
+    MtfRsiAlignment,
+    Regime,
+)
+from crypto_chatbot.schemas.market import QualityStatus
+
+WIB = timezone(timedelta(hours=7))
+TELEGRAM_MAX_MESSAGE_LENGTH = 4096
+
+_REGIME_LABELS: dict[Regime, str] = {
+    Regime.HIGH_VOLATILITY: "Volatilitas Tinggi",
+    Regime.TRENDING_UP: "Tren Naik",
+    Regime.TRENDING_DOWN: "Tren Turun",
+    Regime.RANGING: "Mendatar (Ranging)",
+    Regime.TRANSITIONAL: "Transisi",
+}
+
+_STRUCTURE_LABELS: dict[MarketStructure, str] = {
+    MarketStructure.BULLISH: "Bullish (HH + HL terkonfirmasi)",
+    MarketStructure.BEARISH: "Bearish (LH + LL terkonfirmasi)",
+    MarketStructure.MIXED: "Bercampur (Mixed)",
+}
+
+_MTF_LABELS: dict[MtfRsiAlignment, str] = {
+    MtfRsiAlignment.ALIGNED_BULLISH: "Selaras di atas 50 (1h, 4h, 1d)",
+    MtfRsiAlignment.ALIGNED_BEARISH: "Selaras di bawah 50 (1h, 4h, 1d)",
+    MtfRsiAlignment.MIXED: "Tercampur antar timeframe",
+}
+
+
+def format_timestamp_utc_wib(dt: datetime) -> str:
+    """Format a timezone-aware datetime showing both UTC and WIB."""
+    utc_dt = dt.astimezone(UTC)
+    wib_dt = utc_dt.astimezone(WIB)
+    return f"{utc_dt.strftime('%Y-%m-%d %H:%M UTC')} ({wib_dt.strftime('%H:%M WIB')})"
+
+
+def format_indonesian_number(value: float, decimals: int, *, signed: bool = False) -> str:
+    """Format a float with `.` thousands separator and `,` decimal separator."""
+    if decimals < 0:
+        raise ValueError("decimals must be >= 0")
+    sign = ""
+    if value < 0:
+        sign = "-"
+    elif signed and value > 0:
+        sign = "+"
+
+    abs_str = f"{abs(value):,.{decimals}f}"
+    int_part, _, frac_part = abs_str.partition(".")
+    int_id = int_part.replace(",", ".")
+    if decimals == 0:
+        return f"{sign}{int_id}"
+    return f"{sign}{int_id},{frac_part}"
+
+
+def format_fact_value(fact: Fact) -> str:
+    """Render a `Fact` value deterministically according to its `display_format`."""
+    fmt = fact.display_format
+    val = fact.value
+    if fmt == "price":
+        decimals = 4 if abs(val) < 1.0 else 2
+        return f"{format_indonesian_number(val, decimals)} {fact.unit}"
+    if fmt == "signed_percent":
+        return f"{format_indonesian_number(val, 2, signed=True)}%"
+    if fmt == "percent":
+        return f"{format_indonesian_number(val, 2)}%"
+    if fmt == "decimal_1":
+        return format_indonesian_number(val, 1)
+    if fmt == "ratio_2":
+        return f"{format_indonesian_number(val, 2)}x"
+    return format_indonesian_number(val, 2)
+
+
+def _esc(text: str, html_mode: bool) -> str:
+    return html.escape(text, quote=False) if html_mode else text
+
+
+def _bold(text: str, html_mode: bool) -> str:
+    escaped = _esc(text, html_mode)
+    return f"<b>{escaped}</b>" if html_mode else escaped
+
+
+def render_deterministic_snapshot(
+    snapshot: AnalysisSnapshot,
+    *,
+    html_mode: bool = False,
+) -> str:
+    """Render an `AnalysisSnapshot` deterministically without any LLM involvement."""
+    lines: list[str] = []
+    header = (
+        f"Analisis {snapshot.canonical_symbol} ({snapshot.timeframe.value}) - "
+        f"{snapshot.venue.upper()} {snapshot.market_type.value}"
+    )
+    lines.append(_bold(header, html_mode))
+    lines.append(
+        f"Waktu candle tutup (as_of): {_esc(format_timestamp_utc_wib(snapshot.as_of), html_mode)}"
+    )
+    lines.append(
+        f"Sumber: {_esc(snapshot.provider, html_mode)}:"
+        f"{_esc(snapshot.provider_symbol, html_mode)} "
+        f"| Snapshot: {_esc(snapshot.snapshot_id, html_mode)} "
+        f"| Versi: {_esc(snapshot.calc_version, html_mode)}"
+    )
+
+    flags_text = (
+        ", ".join(flag.value for flag in snapshot.quality_flags)
+        if snapshot.quality_flags
+        else "tidak ada"
+    )
+    lines.append(
+        f"Status kualitas: {_esc(snapshot.quality_status.value, html_mode)} "
+        f"(flag: {_esc(flags_text, html_mode)})"
+    )
+
+    if snapshot.quality_status is QualityStatus.INSUFFICIENT_DATA or snapshot.technical is None:
+        lines.append("")
+        lines.append(_bold("Ringkasan Status", html_mode))
+        lines.append(
+            _esc(
+                "Data tidak mencukupi, tidak segar, atau penyedia bermasalah sehingga "
+                "kondisi pasar terkini tidak dapat disajikan.",
+                html_mode,
+            )
+        )
+    else:
+        lines.append("")
+        lines.append(_bold("Fakta Terukur (Backend)", html_mode))
+        for fact in snapshot.facts:
+            lines.append(
+                f"- [{_esc(fact.fact_id, html_mode)}] {_esc(fact.label, html_mode)}: "
+                f"{_esc(format_fact_value(fact), html_mode)}"
+            )
+
+        lines.append("")
+        lines.append(_bold("Kondisi & Struktur", html_mode))
+        if snapshot.regime is not None:
+            lines.append(f"- Rezim: {_esc(_REGIME_LABELS[snapshot.regime], html_mode)}")
+        if snapshot.market_structure is not None:
+            lines.append(
+                f"- Struktur pivot: {_esc(_STRUCTURE_LABELS[snapshot.market_structure], html_mode)}"
+            )
+        if snapshot.technical.mtf_rsi_alignment is not None:
+            mtf_label = _esc(_MTF_LABELS[snapshot.technical.mtf_rsi_alignment], html_mode)
+            lines.append(f"- Penyelarasan RSI MTF: {mtf_label}")
+
+        if snapshot.events:
+            lines.append("- Event terkonfirmasi terbaru:")
+            fact_by_event = {
+                (fact.as_of, fact.value): fact.fact_id
+                for fact in snapshot.facts
+                if fact.display_format == "price"
+            }
+            for event in snapshot.events:
+                fid = fact_by_event.get((event.confirmation_time, event.level), "-")
+                confirm_text = _esc(format_timestamp_utc_wib(event.confirmation_time), html_mode)
+                lines.append(
+                    f"  * [{_esc(fid, html_mode)}] {_esc(event.event_type.value, html_mode)} | "
+                    f"konfirmasi: {confirm_text}"
+                )
+
+        if snapshot.factors:
+            lines.append("")
+            lines.append(_bold("Daftar Faktor Aturan (Bukan Probabilitas)", html_mode))
+            groups = (
+                (FactorDirection.SUPPORTS_BULLISH, "Mendukung naik"),
+                (FactorDirection.SUPPORTS_BEARISH, "Mendukung turun"),
+                (FactorDirection.NEUTRAL, "Netral / konteks"),
+            )
+            for direction, group_label in groups:
+                items = [f for f in snapshot.factors if f.direction is direction]
+                if not items:
+                    continue
+                lines.append(f"{_esc(group_label, html_mode)}:")
+                for item in items:
+                    refs = ", ".join(item.fact_ids)
+                    lines.append(f"- {_esc(item.description, html_mode)} [{_esc(refs, html_mode)}]")
+
+    if snapshot.limitations:
+        lines.append("")
+        lines.append(_bold("Keterbatasan & Catatan", html_mode))
+        for note in snapshot.limitations:
+            lines.append(f"- {_esc(note, html_mode)}")
+
+    lines.append("")
+    lines.append(
+        _esc(
+            "Disclaimer: Informasi ini bersifat riset dan edukasi berdasarkan pengukuran historis, "
+            "bukan saran transaksi, jaminan hasil, atau eksekusi order.",
+            html_mode,
+        )
+    )
+    return "\n".join(lines)
+
+
+def split_telegram_message(
+    text: str,
+    max_length: int = TELEGRAM_MAX_MESSAGE_LENGTH,
+) -> tuple[str, ...]:
+    """Split rendered text into chunks strictly <= `max_length` at line boundaries."""
+    if max_length < 64:
+        raise ValueError("max_length must be >= 64")
+    if len(text) <= max_length:
+        return (text,)
+
+    chunks: list[str] = []
+    current_lines: list[str] = []
+    current_len = 0
+
+    for line in text.splitlines():
+        while len(line) > max_length:
+            if current_lines:
+                chunks.append("\n".join(current_lines))
+                current_lines = []
+                current_len = 0
+            chunks.append(line[:max_length])
+            line = line[max_length:]
+
+        added_len = len(line) if not current_lines else len(line) + 1
+        if current_len + added_len > max_length:
+            chunks.append("\n".join(current_lines))
+            current_lines = [line]
+            current_len = len(line)
+        else:
+            current_lines.append(line)
+            current_len += added_len
+
+    if current_lines:
+        chunks.append("\n".join(current_lines))
+
+    return tuple(chunks)
