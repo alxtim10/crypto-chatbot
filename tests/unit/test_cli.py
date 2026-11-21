@@ -1,0 +1,49 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from crypto_chatbot import cli
+
+SECRET_TOKEN = "cli-test-telegram-token"
+
+
+@pytest.fixture
+def isolated_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Run in an empty directory so a developer's real `.env` is never read."""
+    monkeypatch.chdir(tmp_path)
+    for name in (
+        "TELEGRAM_BOT_TOKEN",
+        "GEMINI_API_KEY",
+        "GEMINI_MODEL",
+        "DATABASE_URL",
+        "ALLOWED_TELEGRAM_USER_IDS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    return tmp_path
+
+
+def test_check_config_fails_when_secrets_missing(
+    isolated_cwd: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert cli.main(["check-config"]) == 1
+    assert "TELEGRAM_BOT_TOKEN" in capsys.readouterr().err
+
+
+def test_check_config_succeeds_without_printing_secrets(
+    isolated_cwd: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", SECRET_TOKEN)
+    monkeypatch.setenv("GEMINI_API_KEY", "cli-test-gemini-key")
+    monkeypatch.setenv("GEMINI_MODEL", "test-model")
+    monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://u:cli-test-pw@localhost/db")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "111")
+
+    assert cli.main(["check-config"]) == 0
+
+    captured = capsys.readouterr()
+    output = captured.out + captured.err
+    assert "Configuration OK" in output
+    for secret in (SECRET_TOKEN, "cli-test-gemini-key", "cli-test-pw"):
+        assert secret not in output

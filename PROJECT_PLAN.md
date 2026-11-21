@@ -14,7 +14,7 @@ Update this table in the completion report of every phase. Status values: `Not s
 | Phase | Name | Status |
 |---|---|---|
 | 0 | Confirm product choices | Done (ADR 0001; open actions tracked there) |
-| 1 | Bootstrap the repository | Not started |
+| 1 | Bootstrap the repository | Done |
 | 2 | Schemas and symbol normalization | Not started |
 | 3 | Market-data adapter | Not started |
 | 4 | Deterministic technical analysis | Not started |

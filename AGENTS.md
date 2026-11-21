@@ -25,9 +25,10 @@ Reply to the user in Indonesian. Code, identifiers, docs, and commit messages in
 
 ## Commands
 
-Runtime: `.venv` (Python 3.14). Finalize these in Phase 1:
+Runtime: `.venv` (Python 3.14):
 
 - Lint and format: `.venv/bin/ruff check . && .venv/bin/ruff format --check .`
-- Types: `.venv/bin/mypy src`
+- Types: `.venv/bin/mypy src tests`
 - Tests: `.venv/bin/pytest`
 - Live network tests (opt-in, never required in CI): `.venv/bin/pytest -m live`
+- Config health check: `.venv/bin/crypto-chatbot check-config`
