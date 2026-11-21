@@ -23,6 +23,7 @@ from crypto_chatbot.llm.prompts import (
 from crypto_chatbot.llm.render import (
     RenderedNarration,
     render_analysis_response,
+    render_comparison_response,
     render_narration,
 )
 from crypto_chatbot.llm.tools import (
@@ -53,6 +54,7 @@ __all__ = [
     "build_gemini_tool_declarations",
     "build_narration_user_payload",
     "render_analysis_response",
+    "render_comparison_response",
     "render_narration",
     "sanitize_untrusted_text",
     "validate_narration",

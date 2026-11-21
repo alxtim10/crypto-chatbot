@@ -12,6 +12,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from crypto_chatbot.analysis.service import AnalysisService, build_analysis_snapshot
+from crypto_chatbot.app import run_polling
 from crypto_chatbot.bot.templates import render_deterministic_snapshot
 from crypto_chatbot.config import ConfigError, load_settings
 from crypto_chatbot.market_data.ccxt_provider import CcxtMarketDataProvider
@@ -20,7 +21,11 @@ from crypto_chatbot.market_data.symbols import SymbolError, resolve_mvp_spot_sym
 from crypto_chatbot.schemas.analysis import AnalysisSnapshot
 from crypto_chatbot.schemas.market import Timeframe
 from crypto_chatbot.storage.database import create_db_engine, init_db
-from crypto_chatbot.storage.repositories import MarketRepository, PostgresMarketRepository
+from crypto_chatbot.storage.repositories import (
+    MarketRepository,
+    PostgresMarketRepository,
+    PostgresUserMemoryRepository,
+)
 
 
 def _check_config() -> int:
@@ -154,6 +159,44 @@ def _run_analyze(
     return 0
 
 
+def _run_purge_expired() -> int:
+    database_url = os.environ.get("DATABASE_URL", "").strip()
+    if not database_url:
+        print("Error: DATABASE_URL environment variable is required", file=sys.stderr)
+        return 1
+    try:
+        engine = create_db_engine(database_url)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        init_db(engine)
+        repo = PostgresUserMemoryRepository(engine)
+        result = repo.purge_expired(now=datetime.now(UTC))
+    finally:
+        engine.dispose()
+
+    print(
+        "Purge completed: "
+        f"messages={result.deleted_messages}, "
+        f"conversations={result.deleted_conversations}, "
+        f"interactions={result.deleted_interactions}, "
+        f"snapshots={result.deleted_snapshots}"
+    )
+    return 0
+
+
+def _run_bot() -> int:
+    try:
+        settings = load_settings()
+    except ConfigError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+    run_polling(settings)
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="crypto-chatbot")
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -186,6 +229,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="Skip multi-timeframe RSI alignment fetch in live mode.",
     )
+    subcommands.add_parser(
+        "run-bot",
+        help="Run closed-beta Telegram bot via long polling.",
+    )
+    subcommands.add_parser(
+        "purge-expired",
+        help="Delete expired messages, interactions, and snapshots per retention policy.",
+    )
 
     args = parser.parse_args(argv)
     if args.command == "check-config":
@@ -199,6 +250,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             persist=args.persist,
             include_mtf=not args.no_mtf,
         )
+    if args.command == "run-bot":
+        return _run_bot()
+    if args.command == "purge-expired":
+        return _run_purge_expired()
     parser.error(f"unknown command: {args.command}")  # pragma: no cover
 
 

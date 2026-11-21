@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     gemini_global_daily_cap: int = Field(default=200, ge=1)
     database_url: SecretStr
     allowed_telegram_user_ids: Annotated[tuple[int, ...], NoDecode] = Field(min_length=1)
+    rate_limit_per_minute: int = Field(default=10, ge=1)
 
     @field_validator("telegram_bot_token", "gemini_api_key")
     @classmethod

@@ -103,3 +103,25 @@ def render_analysis_response(
             lines.append(f"- {_esc(note, html_mode)}")
 
     return "\n".join(lines)
+
+
+def render_comparison_response(
+    responses: tuple[AnalysisResponse, ...] | list[AnalysisResponse],
+    *,
+    html_mode: bool = True,
+) -> str:
+    """Render side-by-side descriptive comparison strictly from backend snapshots."""
+    if not responses:
+        return _esc("Tidak ada hasil analisis untuk dibandingkan.", html_mode)
+
+    tf_label = responses[0].snapshot.timeframe.value
+    symbols_header = ", ".join(r.snapshot.canonical_symbol for r in responses)
+    lines = [
+        _bold(f"Perbandingan Deskriptif ({symbols_header} - {tf_label})", html_mode),
+    ]
+
+    for resp in responses:
+        lines.append("")
+        lines.append(render_analysis_response(resp, html_mode=html_mode))
+
+    return "\n".join(lines)

@@ -18,7 +18,12 @@ from crypto_chatbot.market_data.quality import normalize_ohlcv_rows
 from crypto_chatbot.market_data.symbols import resolve_mvp_spot_symbol
 from crypto_chatbot.schemas.market import MarketType, Timeframe
 from crypto_chatbot.storage.database import create_db_engine, init_db
-from crypto_chatbot.storage.repositories import PostgresMarketRepository
+from crypto_chatbot.storage.repositories import (
+    LlmInteractionRecord,
+    PostgresMarketRepository,
+    PostgresUserMemoryRepository,
+    UserPreferences,
+)
 
 FIXTURE_1000 = Path(__file__).resolve().parents[1] / "fixtures" / "parity_1000_candles.json"
 
@@ -185,3 +190,98 @@ async def test_postgres_repository_round_trip_and_recomputation(
     assert recomputed.facts == original.facts
     assert recomputed.technical == original.technical
     assert recomputed.snapshot_id == original.snapshot_id
+
+
+def test_postgres_user_memory_isolation_forget_and_retention(
+    pg_repository: PostgresMarketRepository,
+) -> None:
+    mem_repo = PostgresUserMemoryRepository(pg_repository._engine)
+    now = datetime(2026, 11, 21, 12, 0, tzinfo=UTC)
+
+    # Large 64-bit Telegram IDs supported via BigInteger
+    user_a = 9_123_456_789
+    user_b = 9_987_654_321
+
+    mem_repo.save_preferences(
+        user_a,
+        UserPreferences(watchlist=("BTC/USDT", "SOL/USDT"), default_timeframe=Timeframe.H4),
+    )
+    mem_repo.save_preferences(
+        user_b,
+        UserPreferences(watchlist=("ETH/USDT",), default_timeframe=Timeframe.D1),
+    )
+
+    assert mem_repo.get_preferences(user_a).watchlist == ("BTC/USDT", "SOL/USDT")
+    assert mem_repo.get_preferences(user_b).watchlist == ("ETH/USDT",)
+
+    # Append 25 messages for user_a -> capped strictly at 20
+    for idx in range(25):
+        mem_repo.append_message(
+            user_a,
+            role="user" if idx % 2 == 0 else "assistant",
+            content=f"msg-{idx}",
+            snapshot_id="snap-a" if idx % 2 == 1 else None,
+            max_messages=20,
+            created_at=now - timedelta(minutes=25 - idx),
+        )
+    recent_a = mem_repo.get_recent_messages(user_a, limit=20)
+    assert len(recent_a) == 20
+    assert recent_a[0].content == "msg-5"
+    assert recent_a[-1].content == "msg-24"
+
+    # Old expired message + interaction for user_b (45 days old)
+    mem_repo.append_message(
+        user_b,
+        role="user",
+        content="expired-msg",
+        created_at=now - timedelta(days=45),
+    )
+    mem_repo.append_message(
+        user_b,
+        role="user",
+        content="fresh-msg",
+        created_at=now - timedelta(days=1),
+    )
+    mem_repo.record_llm_interaction(
+        LlmInteractionRecord(
+            telegram_user_id=user_a,
+            request_id="req-a",
+            snapshot_id="snap-a",
+            model_id="gemini-flash",
+            prompt_version="v1.0.0",
+            validation_passed=True,
+            latency_ms=100,
+            created_at=now,
+        )
+    )
+    mem_repo.record_llm_interaction(
+        LlmInteractionRecord(
+            telegram_user_id=user_b,
+            request_id="req-b-old",
+            snapshot_id="snap-b",
+            model_id="gemini-flash",
+            prompt_version="v1.0.0",
+            validation_passed=True,
+            latency_ms=100,
+            created_at=now - timedelta(days=45),
+        )
+    )
+
+    # /forget for user_a deletes user_a data only, leaving user_b intact
+    forget_res = mem_repo.forget_user_data(user_a)
+    assert forget_res.deleted_messages == 20
+    assert forget_res.deleted_conversations == 1
+    assert forget_res.deleted_preferences == 1
+    assert forget_res.deleted_interactions == 1
+    assert mem_repo.get_recent_messages(user_a) == ()
+    assert mem_repo.get_preferences(user_a).watchlist == ()
+    assert len(mem_repo.get_recent_messages(user_b)) == 2
+    assert mem_repo.get_preferences(user_b).watchlist == ("ETH/USDT",)
+
+    # Purge expired removes >30d message and interaction, preserving fresh message & prefs
+    purge_res = mem_repo.purge_expired(now=now)
+    assert purge_res.deleted_messages == 1
+    assert purge_res.deleted_interactions == 1
+    remaining_b = mem_repo.get_recent_messages(user_b)
+    assert [m.content for m in remaining_b] == ["fresh-msg"]
+    assert mem_repo.get_preferences(user_b).watchlist == ("ETH/USDT",)

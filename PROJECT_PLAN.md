@@ -20,7 +20,7 @@ Update this table in the completion report of every phase. Status values: `Not s
 | 4 | Deterministic technical analysis | Done |
 | 5 | Analysis service and CLI (Milestone A) | Done |
 | 6 | Gemini behind tools | Done |
-| 7 | Telegram commands and bounded memory | Not started |
+| 7 | Telegram commands and bounded memory | Done |
 | 8 | End-to-end MVP validation (Milestone B) | Not started |
 | 9 | Derivatives and liquidity data | Not started |
 | 10 | TradingView AI Agent Lens | Not started |

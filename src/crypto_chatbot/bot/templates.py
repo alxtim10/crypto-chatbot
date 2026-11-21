@@ -14,6 +14,11 @@ from crypto_chatbot.schemas.analysis import (
     Regime,
 )
 from crypto_chatbot.schemas.market import QualityStatus
+from crypto_chatbot.storage.repositories import (
+    ForgetResult,
+    StoredMessage,
+    UserPreferences,
+)
 
 WIB = timezone(timedelta(hours=7))
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096
@@ -239,3 +244,116 @@ def split_telegram_message(
         chunks.append("\n".join(current_lines))
 
     return tuple(chunks)
+
+
+def render_start_message() -> str:
+    """Render Indonesian onboarding message and research disclaimer."""
+    lines = [
+        "<b>Selamat datang di Crypto Research Assistant</b>",
+        (
+            "Bot ini adalah asisten riset dan edukasi pasar kripto berbasis data candle "
+            "tertutup Binance spot dan perhitungan indikator deterministik."
+        ),
+        "",
+        "<b>Cakupan MVP:</b>",
+        "- Simbol spot: BTC/USDT, ETH/USDT, SOL/USDT",
+        "- Timeframe: 1h, 4h, 1d (hanya candle yang sudah tutup)",
+        "",
+        "<b>Perintah Utama:</b>",
+        "- /analyze BTC 4h — analisis teknikal deterministik + penjelasan tervalidasi",
+        "- /compare BTC ETH 1d — perbandingan deskriptif antar koin",
+        "- /watchlist — lihat atau kelola daftar pantau eksplisit",
+        "- /memory — lihat preferensi dan batas memori percakapan",
+        "- /forget — hapus preferensi dan riwayat percakapan Anda",
+        "- /help — panduan lengkap penggunaan",
+        "",
+        (
+            "Disclaimer: Bot ini hanya menyajikan pengukuran historis untuk riset dan edukasi; "
+            "bukan saran transaksi, jaminan hasil, alokasi portofolio, atau eksekusi order."
+        ),
+    ]
+    return "\n".join(lines)
+
+
+def render_help_message() -> str:
+    """Render Indonesian help message covering all supported MVP commands."""
+    lines = [
+        "<b>Panduan Perintah</b>",
+        "- /analyze &lt;SIMBOL&gt; [1h|4h|1d] — contoh: /analyze BTC 4h",
+        (
+            "- /compare &lt;SIMBOL1&gt; &lt;SIMBOL2&gt; [SIMBOL3] [1h|4h|1d] "
+            "— contoh: /compare BTC ETH 1d"
+        ),
+        "- /watchlist — tampilkan daftar pantau",
+        "- /watchlist add &lt;BTC|ETH|SOL&gt; — tambah ke daftar pantau",
+        "- /watchlist remove &lt;BTC|ETH|SOL&gt; — hapus dari daftar pantau",
+        "- /memory — periksa preferensi eksplisit dan pesan tersimpan (maksimal 20 pesan)",
+        "- /forget — hapus seluruh preferensi dan memori percakapan Anda",
+        "",
+        (
+            "Pertanyaan lanjutan berbahasa alami seperti "
+            '<i>"bandingkan momentumnya dengan ETH"</i> akan memicu analisis backend segar.'
+        ),
+    ]
+    return "\n".join(lines)
+
+
+def render_watchlist_message(
+    watchlist: tuple[str, ...] | list[str],
+    *,
+    note: str | None = None,
+    html_mode: bool = True,
+) -> str:
+    """Render user's explicit watchlist safely."""
+    lines = [_bold("Daftar Pantau (Watchlist)", html_mode)]
+    if note:
+        lines.append(_esc(note, html_mode))
+    if watchlist:
+        for sym in watchlist:
+            lines.append(f"- {_esc(sym, html_mode)}")
+    else:
+        lines.append("Daftar pantau masih kosong. Tambah dengan /watchlist add BTC.")
+    return "\n".join(lines)
+
+
+def render_memory_message(
+    prefs: UserPreferences,
+    messages: tuple[StoredMessage, ...] | list[StoredMessage],
+    *,
+    html_mode: bool = True,
+) -> str:
+    """Render stored user preferences and bounded recent message count."""
+    wl = ", ".join(prefs.watchlist) if prefs.watchlist else "kosong"
+    lines = [
+        _bold("Memori & Preferensi Tersimpan", html_mode),
+        f"- Bahasa: {_esc(prefs.language, html_mode)}",
+        f"- Timeframe default: {_esc(prefs.default_timeframe.value, html_mode)}",
+        f"- Mata uang tampilan: {_esc(prefs.display_currency, html_mode)}",
+        f"- Watchlist: {_esc(wl, html_mode)}",
+        f"- Pesan tersimpan (maks 20): {len(messages)} pesan (retensi 30 hari)",
+    ]
+    if messages:
+        lines.append("")
+        lines.append(_bold("Riwayat Terbaru (Konteks Topik)", html_mode))
+        for msg in messages[-5:]:
+            ts = _esc(format_timestamp_utc_wib(msg.created_at), html_mode)
+            snippet = msg.content.replace("\n", " ")[:120]
+            lines.append(f"- [{_esc(msg.role, html_mode)} | {ts}] {_esc(snippet, html_mode)}")
+    lines.append("")
+    lines.append("Gunakan /forget kapan saja untuk menghapus preferensi dan riwayat percakapan.")
+    return "\n".join(lines)
+
+
+def render_forget_message(result: ForgetResult, *, html_mode: bool = True) -> str:
+    """Render confirmation of deleted user-scoped memory records."""
+    lines = [
+        _bold("Penghapusan Memori Selesai", html_mode),
+        "Data pribadi berikut untuk akun Anda telah dihapus permanen:",
+        f"- Pesan percakapan: {result.deleted_messages}",
+        f"- Utas percakapan: {result.deleted_conversations}",
+        f"- Preferensi pengguna: {result.deleted_preferences}",
+        f"- Log interaksi LLM: {result.deleted_interactions}",
+        "",
+        "Data pasar publik dan snapshot anonim tidak terpengaruh.",
+    ]
+    return "\n".join(lines)
