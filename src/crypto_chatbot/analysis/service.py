@@ -8,7 +8,13 @@ import itertools
 import json
 from collections.abc import Mapping, Sequence
 from datetime import datetime
+from typing import Any
 
+from crypto_chatbot.analysis.derivatives import (
+    DERIVATIVES_PARAMETERS,
+    DerivativesAnalysisResult,
+    compute_derivatives_metrics,
+)
 from crypto_chatbot.analysis.factors import build_factors
 from crypto_chatbot.analysis.failed_breakout import detect_failed_breakouts
 from crypto_chatbot.analysis.indicators import (
@@ -21,6 +27,7 @@ from crypto_chatbot.analysis.structure import analyze_market_structure
 from crypto_chatbot.market_data.base import (
     DEFAULT_CANDLE_LIMIT,
     MIN_FULL_HISTORY_CANDLES,
+    DerivativesLiquidityProvider,
     MarketDataProvider,
     OhlcvBatch,
 )
@@ -31,20 +38,23 @@ from crypto_chatbot.market_data.quality import (
 from crypto_chatbot.market_data.symbols import resolve_mvp_spot_symbol
 from crypto_chatbot.schemas.analysis import (
     AnalysisSnapshot,
+    DerivativesMetrics,
     Fact,
     InputRange,
     StructureEvent,
     StructureEventType,
     TechnicalMetrics,
 )
+from crypto_chatbot.schemas.derivatives import DerivativesContext
 from crypto_chatbot.schemas.market import (
     MarketCandle,
+    MarketType,
     ProviderMetadata,
     QualityFlag,
     QualityStatus,
     Timeframe,
 )
-from crypto_chatbot.storage.repositories import MarketRepository
+from crypto_chatbot.storage.repositories import DerivativesRepository, MarketRepository
 
 _BLOCKING_BATCH_FLAGS: frozenset[QualityFlag] = frozenset(
     {
@@ -72,6 +82,22 @@ _FLAG_LIMITATIONS: dict[QualityFlag, str] = {
     ),
     QualityFlag.DUPLICATE: "Terdapat candle duplikat pada respons mentah yang telah dideduplikasi.",
     QualityFlag.PROVIDER_ERROR: "Gagal mengambil data dari penyedia market data.",
+    QualityFlag.DERIVATIVES_UNAVAILABLE: (
+        "Sebagian data derivatif perpetual tidak tersedia; nilai tidak direkayasa."
+    ),
+    QualityFlag.ORDERBOOK_UNAVAILABLE: (
+        "Data order book tidak tersedia atau tidak valid; kedalaman tidak direkayasa."
+    ),
+    QualityFlag.SEQUENCE_GAP: (
+        "Terdeteksi celah urutan (sequence gap) pada order book dan dilakukan resinkronisasi."
+    ),
+    QualityFlag.PRICE_MISMATCH: "Terdapat deviasi harga lintas sumber di atas ambang toleransi.",
+    QualityFlag.SEVERE_PRICE_MISMATCH: (
+        "Terdeteksi deviasi harga lintas sumber berat; kondisi terkini tidak disajikan."
+    ),
+    QualityFlag.UNIT_MISMATCH: (
+        "Unit open interest tidak konsisten dengan notional dan harga referensi."
+    ),
 }
 
 
@@ -98,6 +124,16 @@ def compute_candles_sha256(candles: Sequence[MarketCandle]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _compute_derivatives_digest(metrics: DerivativesMetrics) -> str:
+    encoded = json.dumps(
+        metrics.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _compute_snapshot_id(
     *,
     provider: str,
@@ -111,8 +147,9 @@ def _compute_snapshot_id(
     mtf_hashes: Mapping[str, str],
     quality_status: QualityStatus,
     quality_flags: Sequence[QualityFlag],
+    derivatives_digest: str | None = None,
 ) -> str:
-    payload = {
+    payload: dict[str, Any] = {
         "as_of": as_of.isoformat(),
         "calc_version": calc_version,
         "canonical_symbol": canonical_symbol,
@@ -125,6 +162,8 @@ def _compute_snapshot_id(
         "timeframe": timeframe,
         "venue": venue,
     }
+    if derivatives_digest is not None:
+        payload["derivatives_digest"] = derivatives_digest
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(
         "utf-8"
     )
@@ -165,7 +204,10 @@ def _build_facts(
     latest_fb: StructureEvent | None,
     source: str,
     as_of: datetime,
+    base_unit: str,
     quote_currency: str,
+    timeframe_label: str,
+    derivatives: DerivativesMetrics | None = None,
 ) -> tuple[tuple[Fact, ...], dict[str, str]]:
     facts: list[Fact] = []
     fact_ids_by_key: dict[str, str] = {}
@@ -177,6 +219,7 @@ def _build_facts(
         unit: str,
         display_format: str,
         fact_as_of: datetime = as_of,
+        fact_source: str = source,
     ) -> str | None:
         if value is None:
             return None
@@ -188,7 +231,7 @@ def _build_facts(
                 value=value,
                 unit=unit,
                 display_format=display_format,
-                source=source,
+                source=fact_source,
                 as_of=fact_as_of,
             )
         )
@@ -307,6 +350,163 @@ def _build_facts(
             fact_as_of=event.confirmation_time,
         )
 
+    if derivatives is not None:
+        if derivatives.funding_venue and derivatives.funding_symbol:
+            f_source = f"{derivatives.funding_venue}:{derivatives.funding_symbol}"
+            add_fact(
+                "funding_rate_per_8h",
+                "Funding rate ternormalisasi (8h)",
+                derivatives.funding_rate_per_8h * 100.0
+                if derivatives.funding_rate_per_8h is not None
+                else None,
+                "%",
+                "funding_percent",
+                fact_source=f_source,
+            )
+            add_fact(
+                "funding_rate_annualized",
+                "Funding rate tahunan",
+                derivatives.funding_rate_annualized * 100.0
+                if derivatives.funding_rate_annualized is not None
+                else None,
+                "%",
+                "signed_percent",
+                fact_source=f_source,
+            )
+            add_fact(
+                "mark_index_basis_bps",
+                "Basis mark vs index price",
+                derivatives.mark_index_basis_bps,
+                "bps",
+                "signed_bps",
+                fact_source=f_source,
+            )
+
+        if derivatives.open_interest_venue and derivatives.open_interest_symbol:
+            oi_source = f"{derivatives.open_interest_venue}:{derivatives.open_interest_symbol}"
+            add_fact(
+                "open_interest_base",
+                "Open interest (unit dasar)",
+                derivatives.open_interest_base,
+                derivatives.open_interest_base_unit or base_unit,
+                "quantity",
+                fact_source=oi_source,
+            )
+            add_fact(
+                "open_interest_quote",
+                "Open interest (notional)",
+                derivatives.open_interest_quote,
+                derivatives.open_interest_quote_currency or quote_currency,
+                "notional_quote",
+                fact_source=oi_source,
+            )
+            oi_win = derivatives.open_interest_change_window or timeframe_label
+            add_fact(
+                "open_interest_change_pct",
+                f"Perubahan open interest ({oi_win})",
+                derivatives.open_interest_change_pct * 100.0
+                if derivatives.open_interest_change_pct is not None
+                else None,
+                "%",
+                "signed_percent",
+                fact_source=oi_source,
+            )
+
+        if derivatives.orderbook_venue and derivatives.orderbook_symbol:
+            ob_mkt = (
+                derivatives.orderbook_market_type.value
+                if derivatives.orderbook_market_type is not None
+                else MarketType.SPOT.value
+            )
+            ob_source = f"{derivatives.orderbook_venue}:{derivatives.orderbook_symbol}:{ob_mkt}"
+            add_fact(
+                "spread_bps",
+                "Spread bid-ask order book",
+                derivatives.spread_bps,
+                "bps",
+                "bps",
+                fact_source=ob_source,
+            )
+            add_fact(
+                "depth_10bps_bid_quote",
+                "Kedalaman bid (10 bps)",
+                derivatives.depth_10bps_bid_quote,
+                quote_currency,
+                "notional_quote",
+                fact_source=ob_source,
+            )
+            add_fact(
+                "depth_10bps_ask_quote",
+                "Kedalaman ask (10 bps)",
+                derivatives.depth_10bps_ask_quote,
+                quote_currency,
+                "notional_quote",
+                fact_source=ob_source,
+            )
+            add_fact(
+                "imbalance_10bps",
+                "Imbalance order book (10 bps)",
+                derivatives.imbalance_10bps,
+                "ratio",
+                "signed_decimal_2",
+                fact_source=ob_source,
+            )
+            add_fact(
+                "depth_50bps_bid_quote",
+                "Kedalaman bid (50 bps)",
+                derivatives.depth_50bps_bid_quote,
+                quote_currency,
+                "notional_quote",
+                fact_source=ob_source,
+            )
+            add_fact(
+                "depth_50bps_ask_quote",
+                "Kedalaman ask (50 bps)",
+                derivatives.depth_50bps_ask_quote,
+                quote_currency,
+                "notional_quote",
+                fact_source=ob_source,
+            )
+            add_fact(
+                "imbalance_50bps",
+                "Imbalance order book (50 bps)",
+                derivatives.imbalance_50bps,
+                "ratio",
+                "signed_decimal_2",
+                fact_source=ob_source,
+            )
+
+        if derivatives.liquidation_source_available:
+            liq_venue = derivatives.funding_venue or derivatives.open_interest_venue or "binance"
+            liq_symbol = derivatives.funding_symbol or derivatives.open_interest_symbol or "perp"
+            liq_source = f"{liq_venue}:{liq_symbol}"
+            add_fact(
+                "liquidation_long_quote",
+                "Likuidasi posisi long",
+                derivatives.liquidation_long_quote,
+                quote_currency,
+                "notional_quote",
+                fact_source=liq_source,
+            )
+            add_fact(
+                "liquidation_short_quote",
+                "Likuidasi posisi short",
+                derivatives.liquidation_short_quote,
+                quote_currency,
+                "notional_quote",
+                fact_source=liq_source,
+            )
+
+        if derivatives.cross_source_deviation_bps is not None:
+            add_fact(
+                "cross_source_deviation_bps",
+                "Deviasi harga lintas sumber",
+                derivatives.cross_source_deviation_bps,
+                "bps",
+                "bps",
+                fact_source=derivatives.cross_source_pair or source,
+            )
+
     return tuple(facts), fact_ids_by_key
 
 
@@ -316,10 +516,12 @@ def _build_limitations(
     merged_flags: Sequence[QualityFlag],
     status: QualityStatus,
     dropped_mtf: Sequence[Timeframe],
+    extra_notes: Sequence[str] = (),
 ) -> tuple[str, ...]:
     notes: list[str] = []
     if batch.error_message:
         notes.append(batch.error_message)
+    notes.extend(extra_notes)
     for flag in merged_flags:
         if flag in _FLAG_LIMITATIONS:
             notes.append(_FLAG_LIMITATIONS[flag])
@@ -351,6 +553,9 @@ def _insufficient_snapshot(
     as_of: datetime,
     flags: tuple[QualityFlag, ...],
     dropped_mtf: Sequence[Timeframe] = (),
+    extra_notes: Sequence[str] = (),
+    extra_params: Mapping[str, int | float | str] | None = None,
+    derivatives_digest: str | None = None,
 ) -> AnalysisSnapshot:
     snap_id = _compute_snapshot_id(
         provider=batch.metadata.provider,
@@ -364,7 +569,11 @@ def _insufficient_snapshot(
         mtf_hashes={},
         quality_status=QualityStatus.INSUFFICIENT_DATA,
         quality_flags=flags,
+        derivatives_digest=derivatives_digest,
     )
+    params = dict(INDICATOR_PARAMETERS)
+    if extra_params:
+        params.update(extra_params)
     return AnalysisSnapshot(
         snapshot_id=snap_id,
         provider=batch.metadata.provider,
@@ -376,8 +585,9 @@ def _insufficient_snapshot(
         as_of=as_of,
         input_range=input_range,
         calc_version=CALC_VERSION,
-        indicator_parameters=dict(INDICATOR_PARAMETERS),
+        indicator_parameters=params,
         technical=None,
+        derivatives=None,
         facts=(),
         regime=None,
         market_structure=None,
@@ -390,6 +600,7 @@ def _insufficient_snapshot(
             merged_flags=flags,
             status=QualityStatus.INSUFFICIENT_DATA,
             dropped_mtf=dropped_mtf,
+            extra_notes=extra_notes,
         ),
     )
 
@@ -398,9 +609,10 @@ def build_analysis_snapshot(
     batch: OhlcvBatch,
     *,
     mtf_batches: Mapping[Timeframe, OhlcvBatch] | None = None,
+    derivatives_context: DerivativesContext | None = None,
     use_available_time: bool = False,
 ) -> AnalysisSnapshot:
-    """Assemble a complete deterministic `AnalysisSnapshot` from a normalized `OhlcvBatch`."""
+    """Assemble a complete deterministic `AnalysisSnapshot` from spot and optional derivatives."""
     if batch.has_provider_error or not batch.candles:
         flags = tuple(dict.fromkeys(batch.quality_flags))
         return _insufficient_snapshot(
@@ -453,7 +665,30 @@ def build_analysis_snapshot(
     structure = analyze_market_structure(batch.candles)
     failed_breakouts = detect_failed_breakouts(batch.candles)
 
-    merged_flags = tuple(dict.fromkeys([*batch.quality_flags, *ind_result.quality_flags]))
+    deriv_result: DerivativesAnalysisResult | None = None
+    extra_params: dict[str, int | float | str] = {}
+    deriv_digest: str | None = None
+    if derivatives_context is not None:
+        deriv_result = compute_derivatives_metrics(
+            derivatives_context,
+            spot_symbol=batch.canonical_symbol,
+            timeframe=batch.timeframe,
+            as_of=as_of,
+            use_available_time=use_available_time,
+        )
+        extra_params = dict(DERIVATIVES_PARAMETERS)
+        if deriv_result.metrics is not None:
+            deriv_digest = _compute_derivatives_digest(deriv_result.metrics)
+
+    merged_flags = tuple(
+        dict.fromkeys(
+            [
+                *batch.quality_flags,
+                *ind_result.quality_flags,
+                *(deriv_result.quality_flags if deriv_result is not None else ()),
+            ]
+        )
+    )
     final_status = determine_quality_status(len(batch.candles), merged_flags)
     if regime is None or final_status is QualityStatus.INSUFFICIENT_DATA:
         return _insufficient_snapshot(
@@ -462,6 +697,9 @@ def build_analysis_snapshot(
             as_of=as_of,
             flags=merged_flags,
             dropped_mtf=dropped_mtf,
+            extra_notes=deriv_result.limitations if deriv_result is not None else (),
+            extra_params=extra_params,
+            derivatives_digest=deriv_digest,
         )
 
     recent_events, latest_sh, latest_sl, latest_fb = _select_recent_events(
@@ -478,7 +716,10 @@ def build_analysis_snapshot(
         latest_fb=latest_fb,
         source=source,
         as_of=as_of,
+        base_unit=batch.metadata.base_unit,
         quote_currency=batch.metadata.quote_currency,
+        timeframe_label=batch.timeframe.value,
+        derivatives=deriv_result.metrics if deriv_result is not None else None,
     )
 
     recent_cutoff = as_of - 10 * batch.timeframe.duration
@@ -489,6 +730,7 @@ def build_analysis_snapshot(
         failed_breakouts=failed_breakouts,
         recent_cutoff_time=recent_cutoff,
         fact_ids_by_key=fact_ids_by_key,
+        derivatives=deriv_result.metrics if deriv_result is not None else None,
     )
 
     snap_id = _compute_snapshot_id(
@@ -503,7 +745,10 @@ def build_analysis_snapshot(
         mtf_hashes=mtf_hashes,
         quality_status=final_status,
         quality_flags=merged_flags,
+        derivatives_digest=deriv_digest,
     )
+    params = dict(INDICATOR_PARAMETERS)
+    params.update(extra_params)
 
     return AnalysisSnapshot(
         snapshot_id=snap_id,
@@ -516,8 +761,9 @@ def build_analysis_snapshot(
         as_of=as_of,
         input_range=input_range,
         calc_version=CALC_VERSION,
-        indicator_parameters=dict(INDICATOR_PARAMETERS),
+        indicator_parameters=params,
         technical=ind_result.metrics,
+        derivatives=deriv_result.metrics if deriv_result is not None else None,
         facts=facts,
         regime=regime,
         market_structure=structure.market_structure,
@@ -530,6 +776,7 @@ def build_analysis_snapshot(
             merged_flags=merged_flags,
             status=final_status,
             dropped_mtf=dropped_mtf,
+            extra_notes=deriv_result.limitations if deriv_result is not None else (),
         ),
     )
 
@@ -577,15 +824,20 @@ def _batch_from_stored_candles(
 
 
 class AnalysisService:
-    """Orchestrates market-data fetching, deterministic snapshot creation, and persistence."""
+    """Orchestrates spot & derivatives fetching, deterministic snapshot creation, and storage."""
 
     def __init__(
         self,
         provider: MarketDataProvider,
         repository: MarketRepository | None = None,
+        *,
+        derivatives_provider: DerivativesLiquidityProvider | None = None,
+        derivatives_repository: DerivativesRepository | None = None,
     ) -> None:
         self._provider = provider
         self._repository = repository
+        self._derivatives_provider = derivatives_provider
+        self._derivatives_repository = derivatives_repository
 
     async def analyze(
         self,
@@ -594,6 +846,7 @@ class AnalysisService:
         *,
         limit: int = DEFAULT_CANDLE_LIMIT,
         include_mtf: bool = True,
+        include_derivatives: bool = True,
         persist: bool = True,
     ) -> AnalysisSnapshot:
         """Fetch market data, build an `AnalysisSnapshot`, and optionally persist it."""
@@ -604,13 +857,14 @@ class AnalysisService:
             limit=limit,
         )
 
-        mtf_batches: dict[Timeframe, OhlcvBatch] | None = None
-        if (
-            include_mtf
-            and primary.candles
+        primary_ok = (
+            bool(primary.candles)
             and determine_quality_status(len(primary.candles), primary.quality_flags)
             is not QualityStatus.INSUFFICIENT_DATA
-        ):
+        )
+
+        mtf_batches: dict[Timeframe, OhlcvBatch] | None = None
+        if include_mtf and primary_ok:
             other_tfs = [
                 tf for tf in (Timeframe.H1, Timeframe.H4, Timeframe.D1) if tf is not timeframe
             ]
@@ -622,7 +876,29 @@ class AnalysisService:
             )
             mtf_batches = dict(zip(other_tfs, fetched, strict=True))
 
-        snapshot = build_analysis_snapshot(primary, mtf_batches=mtf_batches)
+        derivatives_context: DerivativesContext | None = None
+        if self._derivatives_provider is not None and include_derivatives and primary_ok:
+            funding_batch, oi_batch, ob_batch, liq_batch = await asyncio.gather(
+                self._derivatives_provider.get_funding_rate(mapping.base),
+                self._derivatives_provider.get_open_interest(mapping.base, timeframe),
+                self._derivatives_provider.get_order_book(
+                    mapping.canonical_symbol,
+                    market_type=MarketType.SPOT,
+                ),
+                self._derivatives_provider.get_liquidations(mapping.base),
+            )
+            derivatives_context = DerivativesContext(
+                funding=funding_batch,
+                open_interest=oi_batch,
+                order_book=ob_batch,
+                liquidations=liq_batch,
+            )
+
+        snapshot = build_analysis_snapshot(
+            primary,
+            mtf_batches=mtf_batches,
+            derivatives_context=derivatives_context,
+        )
 
         if persist and self._repository is not None:
             if primary.candles:
@@ -632,6 +908,41 @@ class AnalysisService:
                     if mtf_batch.candles:
                         self._repository.save_candles(mtf_batch.candles)
             self._repository.save_snapshot(snapshot)
+
+        if persist and self._derivatives_repository is not None and derivatives_context is not None:
+            if (
+                derivatives_context.funding is not None
+                and derivatives_context.funding.observation is not None
+            ):
+                self._derivatives_repository.save_funding_observations(
+                    [derivatives_context.funding.observation]
+                )
+            if derivatives_context.open_interest is not None:
+                oi_rows = [
+                    *(
+                        [derivatives_context.open_interest.latest]
+                        if derivatives_context.open_interest.latest is not None
+                        else []
+                    ),
+                    *derivatives_context.open_interest.history,
+                ]
+                if oi_rows:
+                    self._derivatives_repository.save_open_interest_observations(oi_rows)
+            if (
+                derivatives_context.order_book is not None
+                and derivatives_context.order_book.snapshot is not None
+            ):
+                self._derivatives_repository.save_order_book_snapshot(
+                    derivatives_context.order_book.snapshot
+                )
+            if (
+                derivatives_context.liquidations is not None
+                and derivatives_context.liquidations.source_available
+                and derivatives_context.liquidations.events
+            ):
+                self._derivatives_repository.save_liquidation_events(
+                    derivatives_context.liquidations.events
+                )
 
         return snapshot
 

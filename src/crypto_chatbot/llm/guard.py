@@ -121,6 +121,15 @@ def _build_allowlist_patterns(
             re.compile(rf"\b(?:ATR\s+percentile|persentil\s+ATR)\s*{atr_win}\b", re.IGNORECASE)
         )
 
+    funding_hours = _int_param(indicator_parameters, "funding_norm_interval_hours")
+    if funding_hours is not None:
+        patterns.append(re.compile(rf"\b{funding_hours}h\b", re.IGNORECASE))
+
+    for band_key in ("orderbook_depth_band_tight_bps", "orderbook_depth_band_wide_bps"):
+        band_bps = _int_param(indicator_parameters, band_key)
+        if band_bps is not None:
+            patterns.append(re.compile(rf"\b{band_bps}\s*bps\b", re.IGNORECASE))
+
     for symbol in allowed_symbols:
         if symbol:
             patterns.append(re.compile(re.escape(symbol), re.IGNORECASE))
@@ -158,9 +167,22 @@ def validate_narration(
         if fid not in known_fact_ids:
             reasons.append(f"unknown_fact_id:{fid}")
 
+    allowed_symbols: list[str] = [snapshot.canonical_symbol, snapshot.provider_symbol]
+    allowed_pairs: set[str] = {snapshot.canonical_symbol.upper()}
+    if snapshot.derivatives is not None:
+        for deriv_sym in (
+            snapshot.derivatives.funding_symbol,
+            snapshot.derivatives.open_interest_symbol,
+            snapshot.derivatives.orderbook_symbol,
+        ):
+            if deriv_sym:
+                allowed_symbols.append(deriv_sym)
+                if "/" in deriv_sym:
+                    allowed_pairs.add(deriv_sym.upper())
+
     allowlist = _build_allowlist_patterns(
         snapshot.indicator_parameters,
-        (snapshot.canonical_symbol, snapshot.provider_symbol),
+        tuple(dict.fromkeys(allowed_symbols)),
     )
 
     text_fields = [
@@ -194,7 +216,7 @@ def validate_narration(
             reasons.append("secret_pattern_detected")
 
         for pair in _PAIR_MENTION_RE.findall(text.upper()):
-            if pair != snapshot.canonical_symbol.upper():
+            if pair not in allowed_pairs:
                 reasons.append("unsupported_symbol_mentioned")
 
     unique_reasons = tuple(dict.fromkeys(reasons))

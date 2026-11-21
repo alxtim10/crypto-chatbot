@@ -7,8 +7,15 @@ from typing import Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from crypto_chatbot.schemas.derivatives import (
+    FundingRateBatch,
+    LiquidationBatch,
+    OpenInterestBatch,
+    OrderBookBatch,
+)
 from crypto_chatbot.schemas.market import (
     MarketCandle,
+    MarketType,
     ProviderMetadata,
     QualityFlag,
     Timeframe,
@@ -55,5 +62,37 @@ class MarketDataProvider(Protocol):
         timeframe: Timeframe,
         limit: int = DEFAULT_CANDLE_LIMIT,
     ) -> OhlcvBatch: ...
+
+    async def close(self) -> None: ...
+
+
+class DerivativesLiquidityProvider(Protocol):
+    """Separate provider interface for perpetual derivatives and L2 order-book data."""
+
+    async def get_funding_rate(self, symbol: str) -> FundingRateBatch: ...
+
+    async def get_open_interest(
+        self,
+        symbol: str,
+        timeframe: Timeframe = Timeframe.H4,
+        history_limit: int = 30,
+        *,
+        reference_price: float | None = None,
+    ) -> OpenInterestBatch: ...
+
+    async def get_order_book(
+        self,
+        symbol: str,
+        *,
+        market_type: MarketType = MarketType.SPOT,
+        limit: int = 100,
+    ) -> OrderBookBatch: ...
+
+    async def get_liquidations(
+        self,
+        symbol: str,
+        *,
+        limit: int = 50,
+    ) -> LiquidationBatch: ...
 
     async def close(self) -> None: ...

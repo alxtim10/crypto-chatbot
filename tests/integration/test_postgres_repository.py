@@ -14,18 +14,28 @@ import pytest
 
 from crypto_chatbot.analysis.service import AnalysisService
 from crypto_chatbot.market_data.base import DEFAULT_CANDLE_LIMIT, OhlcvBatch
+from crypto_chatbot.market_data.derivatives_quality import (
+    normalize_funding_rate_payload,
+    normalize_liquidation_events,
+    normalize_open_interest_payload,
+)
+from crypto_chatbot.market_data.orderbook import normalize_order_book_payload
 from crypto_chatbot.market_data.quality import normalize_ohlcv_rows
-from crypto_chatbot.market_data.symbols import resolve_mvp_spot_symbol
+from crypto_chatbot.market_data.symbols import resolve_mvp_spot_symbol, resolve_symbol
 from crypto_chatbot.schemas.market import MarketType, Timeframe
 from crypto_chatbot.storage.database import create_db_engine, init_db
 from crypto_chatbot.storage.repositories import (
     LlmInteractionRecord,
+    PostgresDerivativesRepository,
     PostgresMarketRepository,
     PostgresUserMemoryRepository,
     UserPreferences,
 )
 
 FIXTURE_1000 = Path(__file__).resolve().parents[1] / "fixtures" / "parity_1000_candles.json"
+DERIV_FIXTURE = (
+    Path(__file__).resolve().parents[1] / "fixtures" / "binance_btc_derivatives_sample.json"
+)
 
 
 def _run(cmd: list[str], *, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -285,3 +295,87 @@ def test_postgres_user_memory_isolation_forget_and_retention(
     remaining_b = mem_repo.get_recent_messages(user_b)
     assert [m.content for m in remaining_b] == ["fresh-msg"]
     assert mem_repo.get_preferences(user_b).watchlist == ("ETH/USDT",)
+
+
+def test_postgres_derivatives_repository_persistence_and_point_in_time(
+    pg_repository: PostgresMarketRepository,
+) -> None:
+    repo = PostgresDerivativesRepository(pg_repository._engine)
+    raw = json.loads(DERIV_FIXTURE.read_text(encoding="utf-8"))
+    received = datetime.fromisoformat(raw["received_time"])
+    perp = resolve_symbol("BTC", market_type=MarketType.PERPETUAL)
+    spot = resolve_symbol("BTC", market_type=MarketType.SPOT)
+
+    funding_batch = normalize_funding_rate_payload(
+        raw["funding_rate"],
+        symbol=perp,
+        received_time=received,
+        funding_interval_hours=raw["funding_interval_hours"],
+        now=received,
+    )
+    assert funding_batch.observation is not None
+    assert repo.save_funding_observations([funding_batch.observation]) == 1
+    assert repo.save_funding_observations([funding_batch.observation]) == 0
+    loaded_funding = repo.load_funding_observations(
+        venue="binance",
+        canonical_symbol=perp.canonical_symbol,
+        end_available_time=received,
+    )
+    assert len(loaded_funding) == 1
+    assert loaded_funding[0].rate_per_8h == funding_batch.observation.rate_per_8h
+    assert (
+        repo.load_funding_observations(
+            venue="binance",
+            canonical_symbol=perp.canonical_symbol,
+            end_available_time=received - timedelta(minutes=5),
+        )
+        == ()
+    )
+
+    oi_batch = normalize_open_interest_payload(
+        raw["open_interest"]["latest"],
+        raw["open_interest"]["history"],
+        symbol=perp,
+        timeframe=Timeframe.H4,
+        received_time=received,
+    )
+    assert oi_batch.latest is not None
+    oi_all = [oi_batch.latest, *oi_batch.history]
+    assert repo.save_open_interest_observations(oi_all) == len(oi_all)
+    assert repo.save_open_interest_observations(oi_all) == 0
+    loaded_oi_hist = repo.load_open_interest_observations(
+        venue="binance",
+        canonical_symbol=perp.canonical_symbol,
+        period="4h",
+    )
+    assert len(loaded_oi_hist) == 2
+
+    ob_batch = normalize_order_book_payload(
+        raw["order_book"],
+        symbol=spot,
+        received_time=received,
+    )
+    assert ob_batch.snapshot is not None
+    assert repo.save_order_book_snapshot(ob_batch.snapshot) is True
+    assert repo.save_order_book_snapshot(ob_batch.snapshot) is False
+    loaded_books = repo.load_order_book_snapshots(
+        venue="binance",
+        canonical_symbol=spot.canonical_symbol,
+        market_type=MarketType.SPOT,
+    )
+    assert len(loaded_books) == 1
+    assert loaded_books[0].sequence_id == 500100
+
+    liq_batch = normalize_liquidation_events(
+        raw["liquidations"],
+        symbol=perp,
+        received_time=received,
+        source_available=True,
+    )
+    assert repo.save_liquidation_events(liq_batch.events) == 2
+    assert repo.save_liquidation_events(liq_batch.events) == 0
+    loaded_liqs = repo.load_liquidation_events(
+        venue="binance",
+        canonical_symbol=perp.canonical_symbol,
+    )
+    assert len(loaded_liqs) == 2

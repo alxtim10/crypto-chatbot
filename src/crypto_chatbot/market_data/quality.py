@@ -33,6 +33,7 @@ _INSUFFICIENT_FLAGS: frozenset[QualityFlag] = frozenset(
         QualityFlag.SYMBOL_MISMATCH,
         QualityFlag.GAP,
         QualityFlag.PROVIDER_ERROR,
+        QualityFlag.SEVERE_PRICE_MISMATCH,
     }
 )
 
@@ -41,6 +42,10 @@ _DEGRADED_FLAGS: frozenset[QualityFlag] = frozenset(
         QualityFlag.SHORT_HISTORY,
         QualityFlag.ZERO_VOLUME,
         QualityFlag.FLAT_PRICE,
+        QualityFlag.PRICE_MISMATCH,
+        QualityFlag.DERIVATIVES_UNAVAILABLE,
+        QualityFlag.ORDERBOOK_UNAVAILABLE,
+        QualityFlag.UNIT_MISMATCH,
     }
 )
 

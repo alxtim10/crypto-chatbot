@@ -153,6 +153,56 @@ class TechnicalMetrics(BaseModel):
         return self
 
 
+class DerivativesMetrics(BaseModel):
+    """Venue-attributed perpetual derivatives, order-book liquidity, and cross-source checks."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    funding_venue: str | None = None
+    funding_symbol: str | None = None
+    funding_rate: FiniteFloat | None = None
+    funding_interval_hours: FiniteFloat | None = Field(default=None, gt=0)
+    funding_rate_per_8h: FiniteFloat | None = None
+    funding_rate_annualized: FiniteFloat | None = None
+    next_funding_time: UtcDatetime | None = None
+    mark_price: FiniteFloat | None = Field(default=None, gt=0)
+    index_price: FiniteFloat | None = Field(default=None, gt=0)
+    mark_index_basis_bps: FiniteFloat | None = None
+
+    open_interest_venue: str | None = None
+    open_interest_symbol: str | None = None
+    open_interest_base: FiniteFloat | None = Field(default=None, ge=0)
+    open_interest_base_unit: str | None = None
+    open_interest_quote: FiniteFloat | None = Field(default=None, ge=0)
+    open_interest_quote_currency: str | None = None
+    open_interest_change_pct: FiniteFloat | None = None
+    open_interest_change_window: str | None = None
+
+    orderbook_venue: str | None = None
+    orderbook_symbol: str | None = None
+    orderbook_market_type: MarketType | None = None
+    best_bid: FiniteFloat | None = Field(default=None, gt=0)
+    best_ask: FiniteFloat | None = Field(default=None, gt=0)
+    mid_price: FiniteFloat | None = Field(default=None, gt=0)
+    spread_abs: FiniteFloat | None = Field(default=None, gt=0)
+    spread_bps: FiniteFloat | None = Field(default=None, gt=0)
+    depth_10bps_bid_quote: FiniteFloat | None = Field(default=None, ge=0)
+    depth_10bps_ask_quote: FiniteFloat | None = Field(default=None, ge=0)
+    imbalance_10bps: FiniteFloat | None = Field(default=None, ge=-1.0, le=1.0)
+    depth_50bps_bid_quote: FiniteFloat | None = Field(default=None, ge=0)
+    depth_50bps_ask_quote: FiniteFloat | None = Field(default=None, ge=0)
+    imbalance_50bps: FiniteFloat | None = Field(default=None, ge=-1.0, le=1.0)
+    orderbook_resync_count: int = Field(default=0, ge=0)
+
+    liquidation_source_available: bool = False
+    liquidation_count: int | None = Field(default=None, ge=0)
+    liquidation_long_quote: FiniteFloat | None = Field(default=None, ge=0)
+    liquidation_short_quote: FiniteFloat | None = Field(default=None, ge=0)
+
+    cross_source_deviation_bps: FiniteFloat | None = Field(default=None, ge=0)
+    cross_source_pair: str | None = None
+
+
 class AnalysisSnapshot(BaseModel):
     """Complete deterministic snapshot passed to templates and Gemini (PROJECT_PLAN §5.8)."""
 
@@ -170,6 +220,7 @@ class AnalysisSnapshot(BaseModel):
     calc_version: str = Field(min_length=1)
     indicator_parameters: dict[str, int | float | str] = Field(default_factory=dict)
     technical: TechnicalMetrics | None = None
+    derivatives: DerivativesMetrics | None = None
     facts: tuple[Fact, ...] = ()
     regime: Regime | None = None
     market_structure: MarketStructure | None = None

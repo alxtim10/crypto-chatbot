@@ -206,3 +206,176 @@ class LlmInteractionRow(Base):
         default=lambda: datetime.now(UTC),
         index=True,
     )
+
+
+class FundingRateRow(Base):
+    """Raw venue-specific perpetual funding-rate observations (`funding_rate_observations`)."""
+
+    __tablename__ = "funding_rate_observations"
+    __table_args__ = (
+        UniqueConstraint(
+            "provider",
+            "venue",
+            "canonical_symbol",
+            "market_type",
+            "observed_time",
+            name="uq_funding_rate_identity",
+        ),
+        Index(
+            "ix_funding_rate_lookup",
+            "venue",
+            "canonical_symbol",
+            "available_time",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    venue: Mapped[str] = mapped_column(String(64), nullable=False)
+    canonical_symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    provider_symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    market_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    observed_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    next_funding_time: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    received_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    available_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    funding_rate: Mapped[float] = mapped_column(Double, nullable=False)
+    funding_interval_hours: Mapped[float] = mapped_column(Double, nullable=False)
+    rate_per_8h: Mapped[float] = mapped_column(Double, nullable=False)
+    annualized_rate: Mapped[float] = mapped_column(Double, nullable=False)
+    mark_price: Mapped[float | None] = mapped_column(Double, nullable=True)
+    index_price: Mapped[float | None] = mapped_column(Double, nullable=True)
+    quality_flags: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    raw_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+
+
+class OpenInterestRow(Base):
+    """Raw venue-specific perpetual open-interest observations (`open_interest_observations`)."""
+
+    __tablename__ = "open_interest_observations"
+    __table_args__ = (
+        UniqueConstraint(
+            "provider",
+            "venue",
+            "canonical_symbol",
+            "market_type",
+            "period",
+            "observed_time",
+            name="uq_open_interest_identity",
+        ),
+        Index(
+            "ix_open_interest_lookup",
+            "venue",
+            "canonical_symbol",
+            "period",
+            "available_time",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    venue: Mapped[str] = mapped_column(String(64), nullable=False)
+    canonical_symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    provider_symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    market_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    period: Mapped[str] = mapped_column(String(16), nullable=False)
+    observed_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    received_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    available_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    open_interest_contracts: Mapped[float] = mapped_column(Double, nullable=False)
+    raw_unit: Mapped[str] = mapped_column(String(32), nullable=False)
+    contract_size: Mapped[float] = mapped_column(Double, nullable=False)
+    open_interest_base: Mapped[float | None] = mapped_column(Double, nullable=True)
+    base_unit: Mapped[str] = mapped_column(String(32), nullable=False)
+    open_interest_quote: Mapped[float | None] = mapped_column(Double, nullable=True)
+    quote_currency: Mapped[str] = mapped_column(String(32), nullable=False)
+    quality_flags: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    raw_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+
+
+class OrderBookSnapshotRow(Base):
+    """Venue-specific L2 order-book snapshots (`order_book_snapshots`)."""
+
+    __tablename__ = "order_book_snapshots"
+    __table_args__ = (
+        UniqueConstraint(
+            "provider",
+            "venue",
+            "canonical_symbol",
+            "market_type",
+            "observed_time",
+            "sequence_key",
+            name="uq_order_book_snapshot_identity",
+        ),
+        Index(
+            "ix_order_book_lookup",
+            "venue",
+            "canonical_symbol",
+            "market_type",
+            "available_time",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    venue: Mapped[str] = mapped_column(String(64), nullable=False)
+    canonical_symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    provider_symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    market_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    observed_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    received_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    available_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    sequence_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    sequence_key: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    best_bid: Mapped[float] = mapped_column(Double, nullable=False)
+    best_ask: Mapped[float] = mapped_column(Double, nullable=False)
+    mid_price: Mapped[float] = mapped_column(Double, nullable=False)
+    spread_abs: Mapped[float] = mapped_column(Double, nullable=False)
+    spread_bps: Mapped[float] = mapped_column(Double, nullable=False)
+    base_unit: Mapped[str] = mapped_column(String(32), nullable=False)
+    quote_currency: Mapped[str] = mapped_column(String(32), nullable=False)
+    resync_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    depth_bands: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
+    quality_flags: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    raw_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+
+
+class LiquidationEventRow(Base):
+    """Normalized forced-liquidation events (`liquidation_events`)."""
+
+    __tablename__ = "liquidation_events"
+    __table_args__ = (
+        UniqueConstraint(
+            "provider",
+            "venue",
+            "canonical_symbol",
+            "event_key",
+            name="uq_liquidation_event_identity",
+        ),
+        Index(
+            "ix_liquidation_lookup",
+            "venue",
+            "canonical_symbol",
+            "available_time",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    venue: Mapped[str] = mapped_column(String(64), nullable=False)
+    canonical_symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    provider_symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    market_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    event_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    received_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    available_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    side: Mapped[str] = mapped_column(String(32), nullable=False)
+    price: Mapped[float] = mapped_column(Double, nullable=False)
+    base_quantity: Mapped[float] = mapped_column(Double, nullable=False)
+    quote_notional: Mapped[float] = mapped_column(Double, nullable=False)
+    base_unit: Mapped[str] = mapped_column(String(32), nullable=False)
+    quote_currency: Mapped[str] = mapped_column(String(32), nullable=False)
+    event_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    raw_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)

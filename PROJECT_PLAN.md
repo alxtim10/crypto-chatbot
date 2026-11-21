@@ -22,7 +22,7 @@ Update this table in the completion report of every phase. Status values: `Not s
 | 6 | Gemini behind tools | Done |
 | 7 | Telegram commands and bounded memory | Done |
 | 8 | End-to-end MVP validation (Milestone B) | Done (VPS live check pending per ADR 0001) |
-| 9 | Derivatives and liquidity data | Not started |
+| 9 | Derivatives and liquidity data | Done |
 | 10 | TradingView AI Agent Lens | Not started |
 | 11 | News and sentiment | Not started |
 | 12 | Offline ML | Not started |

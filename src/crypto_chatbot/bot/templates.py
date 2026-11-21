@@ -78,8 +78,18 @@ def format_fact_value(fact: Fact) -> str:
         return f"{format_indonesian_number(val, decimals)} {fact.unit}"
     if fmt == "signed_percent":
         return f"{format_indonesian_number(val, 2, signed=True)}%"
+    if fmt == "funding_percent":
+        return f"{format_indonesian_number(val, 4, signed=True)}%"
     if fmt == "percent":
         return f"{format_indonesian_number(val, 2)}%"
+    if fmt == "bps":
+        return f"{format_indonesian_number(val, 2)} bps"
+    if fmt == "signed_bps":
+        return f"{format_indonesian_number(val, 2, signed=True)} bps"
+    if fmt in {"notional_quote", "quantity"}:
+        return f"{format_indonesian_number(val, 2)} {fact.unit}"
+    if fmt == "signed_decimal_2":
+        return format_indonesian_number(val, 2, signed=True)
     if fmt == "decimal_1":
         return format_indonesian_number(val, 1)
     if fmt == "ratio_2":
@@ -172,6 +182,60 @@ def render_deterministic_snapshot(
                 lines.append(
                     f"  * [{_esc(fid, html_mode)}] {_esc(event.event_type.value, html_mode)} | "
                     f"konfirmasi: {confirm_text}"
+                )
+
+        if snapshot.derivatives is not None:
+            deriv = snapshot.derivatives
+            lines.append("")
+            lines.append(_bold("Derivatif & Likuiditas (Venue Tunggal)", html_mode))
+            if (
+                deriv.funding_venue
+                and deriv.funding_symbol
+                and deriv.funding_rate_per_8h is not None
+            ):
+                lines.append(
+                    f"- Sumber funding rate: {_esc(deriv.funding_venue.upper(), html_mode)} "
+                    f"{_esc(deriv.funding_symbol, html_mode)}"
+                )
+            else:
+                lines.append("- Sumber funding rate: tidak tersedia (nilai tidak direkayasa)")
+            if (
+                deriv.open_interest_venue
+                and deriv.open_interest_symbol
+                and deriv.open_interest_base is not None
+            ):
+                lines.append(
+                    f"- Sumber open interest: {_esc(deriv.open_interest_venue.upper(), html_mode)} "
+                    f"{_esc(deriv.open_interest_symbol, html_mode)}"
+                )
+            else:
+                lines.append("- Sumber open interest: tidak tersedia (nilai tidak direkayasa)")
+            if deriv.orderbook_venue and deriv.orderbook_symbol and deriv.mid_price is not None:
+                ob_mkt = (
+                    deriv.orderbook_market_type.value if deriv.orderbook_market_type else "spot"
+                )
+                resync_note = (
+                    " (telah resinkronisasi setelah sequence gap)"
+                    if deriv.orderbook_resync_count > 0
+                    else ""
+                )
+                lines.append(
+                    f"- Sumber order book: {_esc(deriv.orderbook_venue.upper(), html_mode)} "
+                    f"{_esc(deriv.orderbook_symbol, html_mode)} ({_esc(ob_mkt, html_mode)})"
+                    f"{_esc(resync_note, html_mode)}"
+                )
+            else:
+                lines.append("- Sumber order book: tidak tersedia (nilai tidak direkayasa)")
+            if deriv.liquidation_source_available:
+                lines.append("- Status data likuidasi: tersedia dari sumber terkonfigurasi")
+            else:
+                lines.append(
+                    "- Status data likuidasi: tidak tersedia pada endpoint REST publik "
+                    "(tidak direkayasa)"
+                )
+            if deriv.cross_source_pair:
+                lines.append(
+                    f"- Pemeriksaan harga lintas sumber: {_esc(deriv.cross_source_pair, html_mode)}"
                 )
 
         if snapshot.factors:

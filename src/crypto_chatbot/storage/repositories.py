@@ -12,6 +12,15 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
 from crypto_chatbot.schemas.analysis import AnalysisSnapshot
+from crypto_chatbot.schemas.derivatives import (
+    FundingRateObservation,
+    LiquidationEvent,
+    LiquidationSide,
+    OpenInterestObservation,
+    OrderBookDepthBand,
+    OrderBookLevel,
+    OrderBookSnapshot,
+)
 from crypto_chatbot.schemas.market import (
     MarketCandle,
     MarketType,
@@ -22,9 +31,13 @@ from crypto_chatbot.schemas.market import (
 from crypto_chatbot.storage.models import (
     AnalysisSnapshotRow,
     ConversationRow,
+    FundingRateRow,
+    LiquidationEventRow,
     LlmInteractionRow,
     MarketCandleRow,
     MessageRow,
+    OpenInterestRow,
+    OrderBookSnapshotRow,
     UserPreferenceRow,
     UserRow,
 )
@@ -124,6 +137,58 @@ class MarketRepository(Protocol):
     def save_snapshot(self, snapshot: AnalysisSnapshot) -> None: ...
 
     def get_snapshot(self, snapshot_id: str) -> AnalysisSnapshot | None: ...
+
+
+class DerivativesRepository(Protocol):
+    """Repository interface for raw venue-specific derivatives & order-book observations."""
+
+    def save_funding_observations(self, observations: Sequence[FundingRateObservation]) -> int: ...
+
+    def load_funding_observations(
+        self,
+        *,
+        venue: str,
+        canonical_symbol: str,
+        end_available_time: datetime | None = None,
+        limit: int | None = None,
+    ) -> tuple[FundingRateObservation, ...]: ...
+
+    def save_open_interest_observations(
+        self, observations: Sequence[OpenInterestObservation]
+    ) -> int: ...
+
+    def load_open_interest_observations(
+        self,
+        *,
+        venue: str,
+        canonical_symbol: str,
+        period: str | None = None,
+        end_available_time: datetime | None = None,
+        limit: int | None = None,
+    ) -> tuple[OpenInterestObservation, ...]: ...
+
+    def save_order_book_snapshot(self, snapshot: OrderBookSnapshot) -> bool: ...
+
+    def load_order_book_snapshots(
+        self,
+        *,
+        venue: str,
+        canonical_symbol: str,
+        market_type: MarketType,
+        end_available_time: datetime | None = None,
+        limit: int | None = None,
+    ) -> tuple[OrderBookSnapshot, ...]: ...
+
+    def save_liquidation_events(self, events: Sequence[LiquidationEvent]) -> int: ...
+
+    def load_liquidation_events(
+        self,
+        *,
+        venue: str,
+        canonical_symbol: str,
+        end_available_time: datetime | None = None,
+        limit: int | None = None,
+    ) -> tuple[LiquidationEvent, ...]: ...
 
 
 class UserMemoryRepository(Protocol):
@@ -572,4 +637,364 @@ class PostgresUserMemoryRepository:
             deleted_conversations=deleted_convs,
             deleted_interactions=deleted_ints,
             deleted_snapshots=deleted_snaps,
+        )
+
+
+class PostgresDerivativesRepository:
+    """Synchronous PostgreSQL repository for raw venue-specific derivatives & order books."""
+
+    def __init__(self, engine: Engine) -> None:
+        self._engine = engine
+
+    def save_funding_observations(self, observations: Sequence[FundingRateObservation]) -> int:
+        if not observations:
+            return 0
+        rows = [
+            {
+                "provider": obs.provider,
+                "venue": obs.venue,
+                "canonical_symbol": obs.canonical_symbol,
+                "provider_symbol": obs.provider_symbol,
+                "market_type": obs.market_type.value,
+                "observed_time": obs.observed_time,
+                "next_funding_time": obs.next_funding_time,
+                "received_time": obs.received_time,
+                "available_time": obs.available_time,
+                "funding_rate": obs.funding_rate,
+                "funding_interval_hours": obs.funding_interval_hours,
+                "rate_per_8h": obs.rate_per_8h,
+                "annualized_rate": obs.annualized_rate,
+                "mark_price": obs.mark_price,
+                "index_price": obs.index_price,
+                "quality_flags": [flag.value for flag in obs.quality_flags],
+                "raw_payload": obs.raw_payload,
+            }
+            for obs in observations
+        ]
+        stmt = (
+            insert(FundingRateRow)
+            .values(rows)
+            .on_conflict_do_nothing(constraint="uq_funding_rate_identity")
+            .returning(FundingRateRow.id)
+        )
+        with Session(self._engine) as session, session.begin():
+            return len(session.scalars(stmt).all())
+
+    def load_funding_observations(
+        self,
+        *,
+        venue: str,
+        canonical_symbol: str,
+        end_available_time: datetime | None = None,
+        limit: int | None = None,
+    ) -> tuple[FundingRateObservation, ...]:
+        stmt = select(FundingRateRow).where(
+            FundingRateRow.venue == venue,
+            FundingRateRow.canonical_symbol == canonical_symbol,
+        )
+        if end_available_time is not None:
+            stmt = stmt.where(FundingRateRow.available_time <= _to_utc(end_available_time))
+        if limit is not None:
+            if limit < 1:
+                raise ValueError("limit must be >= 1")
+            stmt = stmt.order_by(FundingRateRow.observed_time.desc()).limit(limit)
+        else:
+            stmt = stmt.order_by(FundingRateRow.observed_time.asc())
+        with Session(self._engine) as session:
+            db_rows = list(session.scalars(stmt))
+        if limit is not None:
+            db_rows.reverse()
+        return tuple(
+            FundingRateObservation(
+                provider=row.provider,
+                venue=row.venue,
+                canonical_symbol=row.canonical_symbol,
+                provider_symbol=row.provider_symbol,
+                market_type=MarketType(row.market_type),
+                observed_time=_to_utc(row.observed_time),
+                next_funding_time=_to_utc(row.next_funding_time) if row.next_funding_time else None,
+                received_time=_to_utc(row.received_time),
+                available_time=_to_utc(row.available_time),
+                funding_rate=row.funding_rate,
+                funding_interval_hours=row.funding_interval_hours,
+                rate_per_8h=row.rate_per_8h,
+                annualized_rate=row.annualized_rate,
+                mark_price=row.mark_price,
+                index_price=row.index_price,
+                quality_flags=tuple(QualityFlag(flag) for flag in row.quality_flags),
+                raw_payload=dict(row.raw_payload),
+            )
+            for row in db_rows
+        )
+
+    def save_open_interest_observations(
+        self,
+        observations: Sequence[OpenInterestObservation],
+    ) -> int:
+        if not observations:
+            return 0
+        rows = [
+            {
+                "provider": obs.provider,
+                "venue": obs.venue,
+                "canonical_symbol": obs.canonical_symbol,
+                "provider_symbol": obs.provider_symbol,
+                "market_type": obs.market_type.value,
+                "period": obs.period,
+                "observed_time": obs.observed_time,
+                "received_time": obs.received_time,
+                "available_time": obs.available_time,
+                "open_interest_contracts": obs.open_interest_contracts,
+                "raw_unit": obs.raw_unit,
+                "contract_size": obs.contract_size,
+                "open_interest_base": obs.open_interest_base,
+                "base_unit": obs.base_unit,
+                "open_interest_quote": obs.open_interest_quote,
+                "quote_currency": obs.quote_currency,
+                "quality_flags": [flag.value for flag in obs.quality_flags],
+                "raw_payload": obs.raw_payload,
+            }
+            for obs in observations
+        ]
+        stmt = (
+            insert(OpenInterestRow)
+            .values(rows)
+            .on_conflict_do_nothing(constraint="uq_open_interest_identity")
+            .returning(OpenInterestRow.id)
+        )
+        with Session(self._engine) as session, session.begin():
+            return len(session.scalars(stmt).all())
+
+    def load_open_interest_observations(
+        self,
+        *,
+        venue: str,
+        canonical_symbol: str,
+        period: str | None = None,
+        end_available_time: datetime | None = None,
+        limit: int | None = None,
+    ) -> tuple[OpenInterestObservation, ...]:
+        stmt = select(OpenInterestRow).where(
+            OpenInterestRow.venue == venue,
+            OpenInterestRow.canonical_symbol == canonical_symbol,
+        )
+        if period is not None:
+            stmt = stmt.where(OpenInterestRow.period == period)
+        if end_available_time is not None:
+            stmt = stmt.where(OpenInterestRow.available_time <= _to_utc(end_available_time))
+        if limit is not None:
+            if limit < 1:
+                raise ValueError("limit must be >= 1")
+            stmt = stmt.order_by(OpenInterestRow.observed_time.desc()).limit(limit)
+        else:
+            stmt = stmt.order_by(OpenInterestRow.observed_time.asc())
+        with Session(self._engine) as session:
+            db_rows = list(session.scalars(stmt))
+        if limit is not None:
+            db_rows.reverse()
+        return tuple(
+            OpenInterestObservation(
+                provider=row.provider,
+                venue=row.venue,
+                canonical_symbol=row.canonical_symbol,
+                provider_symbol=row.provider_symbol,
+                market_type=MarketType(row.market_type),
+                period=row.period,
+                observed_time=_to_utc(row.observed_time),
+                received_time=_to_utc(row.received_time),
+                available_time=_to_utc(row.available_time),
+                open_interest_contracts=row.open_interest_contracts,
+                raw_unit=row.raw_unit,
+                contract_size=row.contract_size,
+                open_interest_base=row.open_interest_base,
+                base_unit=row.base_unit,
+                open_interest_quote=row.open_interest_quote,
+                quote_currency=row.quote_currency,
+                quality_flags=tuple(QualityFlag(flag) for flag in row.quality_flags),
+                raw_payload=dict(row.raw_payload),
+            )
+            for row in db_rows
+        )
+
+    def save_order_book_snapshot(self, snapshot: OrderBookSnapshot) -> bool:
+        sequence_key = str(snapshot.sequence_id) if snapshot.sequence_id is not None else ""
+        stored_payload = dict(snapshot.raw_payload)
+        stored_payload.setdefault("bids", [[lvl.price, lvl.quantity] for lvl in snapshot.bids[:25]])
+        stored_payload.setdefault("asks", [[lvl.price, lvl.quantity] for lvl in snapshot.asks[:25]])
+        payload = {
+            "provider": snapshot.provider,
+            "venue": snapshot.venue,
+            "canonical_symbol": snapshot.canonical_symbol,
+            "provider_symbol": snapshot.provider_symbol,
+            "market_type": snapshot.market_type.value,
+            "observed_time": snapshot.observed_time,
+            "received_time": snapshot.received_time,
+            "available_time": snapshot.available_time,
+            "sequence_id": snapshot.sequence_id,
+            "sequence_key": sequence_key,
+            "best_bid": snapshot.best_bid,
+            "best_ask": snapshot.best_ask,
+            "mid_price": snapshot.mid_price,
+            "spread_abs": snapshot.spread_abs,
+            "spread_bps": snapshot.spread_bps,
+            "base_unit": snapshot.base_unit,
+            "quote_currency": snapshot.quote_currency,
+            "resync_count": snapshot.resync_count,
+            "depth_bands": [band.model_dump(mode="json") for band in snapshot.depth_bands],
+            "quality_flags": [flag.value for flag in snapshot.quality_flags],
+            "raw_payload": stored_payload,
+        }
+        stmt = (
+            insert(OrderBookSnapshotRow)
+            .values(payload)
+            .on_conflict_do_nothing(constraint="uq_order_book_snapshot_identity")
+            .returning(OrderBookSnapshotRow.id)
+        )
+        with Session(self._engine) as session, session.begin():
+            inserted_ids = session.scalars(stmt).all()
+            return bool(inserted_ids)
+
+    def load_order_book_snapshots(
+        self,
+        *,
+        venue: str,
+        canonical_symbol: str,
+        market_type: MarketType,
+        end_available_time: datetime | None = None,
+        limit: int | None = None,
+    ) -> tuple[OrderBookSnapshot, ...]:
+        stmt = select(OrderBookSnapshotRow).where(
+            OrderBookSnapshotRow.venue == venue,
+            OrderBookSnapshotRow.canonical_symbol == canonical_symbol,
+            OrderBookSnapshotRow.market_type == market_type.value,
+        )
+        if end_available_time is not None:
+            stmt = stmt.where(OrderBookSnapshotRow.available_time <= _to_utc(end_available_time))
+        if limit is not None:
+            if limit < 1:
+                raise ValueError("limit must be >= 1")
+            stmt = stmt.order_by(OrderBookSnapshotRow.observed_time.desc()).limit(limit)
+        else:
+            stmt = stmt.order_by(OrderBookSnapshotRow.observed_time.asc())
+        with Session(self._engine) as session:
+            db_rows = list(session.scalars(stmt))
+        if limit is not None:
+            db_rows.reverse()
+
+        results: list[OrderBookSnapshot] = []
+        for row in db_rows:
+            raw_bids = row.raw_payload.get("bids") or [[row.best_bid, 1.0]]
+            raw_asks = row.raw_payload.get("asks") or [[row.best_ask, 1.0]]
+            bids = tuple(
+                OrderBookLevel(price=float(lvl[0]), quantity=float(lvl[1])) for lvl in raw_bids
+            )
+            asks = tuple(
+                OrderBookLevel(price=float(lvl[0]), quantity=float(lvl[1])) for lvl in raw_asks
+            )
+            bands = tuple(OrderBookDepthBand.model_validate(b) for b in row.depth_bands)
+            results.append(
+                OrderBookSnapshot(
+                    provider=row.provider,
+                    venue=row.venue,
+                    canonical_symbol=row.canonical_symbol,
+                    provider_symbol=row.provider_symbol,
+                    market_type=MarketType(row.market_type),
+                    observed_time=_to_utc(row.observed_time),
+                    received_time=_to_utc(row.received_time),
+                    available_time=_to_utc(row.available_time),
+                    sequence_id=row.sequence_id,
+                    bids=bids,
+                    asks=asks,
+                    best_bid=row.best_bid,
+                    best_ask=row.best_ask,
+                    mid_price=row.mid_price,
+                    spread_abs=row.spread_abs,
+                    spread_bps=row.spread_bps,
+                    depth_bands=bands,
+                    base_unit=row.base_unit,
+                    quote_currency=row.quote_currency,
+                    resync_count=row.resync_count,
+                    quality_flags=tuple(QualityFlag(flag) for flag in row.quality_flags),
+                    raw_payload=dict(row.raw_payload),
+                )
+            )
+        return tuple(results)
+
+    def save_liquidation_events(self, events: Sequence[LiquidationEvent]) -> int:
+        if not events:
+            return 0
+        rows = [
+            {
+                "provider": ev.provider,
+                "venue": ev.venue,
+                "canonical_symbol": ev.canonical_symbol,
+                "provider_symbol": ev.provider_symbol,
+                "market_type": ev.market_type.value,
+                "event_time": ev.event_time,
+                "received_time": ev.received_time,
+                "available_time": ev.available_time,
+                "side": ev.side.value,
+                "price": ev.price,
+                "base_quantity": ev.base_quantity,
+                "quote_notional": ev.quote_notional,
+                "base_unit": ev.base_unit,
+                "quote_currency": ev.quote_currency,
+                "event_key": ev.event_key,
+                "raw_payload": ev.raw_payload,
+            }
+            for ev in events
+        ]
+        stmt = (
+            insert(LiquidationEventRow)
+            .values(rows)
+            .on_conflict_do_nothing(constraint="uq_liquidation_event_identity")
+            .returning(LiquidationEventRow.id)
+        )
+        with Session(self._engine) as session, session.begin():
+            return len(session.scalars(stmt).all())
+
+    def load_liquidation_events(
+        self,
+        *,
+        venue: str,
+        canonical_symbol: str,
+        end_available_time: datetime | None = None,
+        limit: int | None = None,
+    ) -> tuple[LiquidationEvent, ...]:
+        stmt = select(LiquidationEventRow).where(
+            LiquidationEventRow.venue == venue,
+            LiquidationEventRow.canonical_symbol == canonical_symbol,
+        )
+        if end_available_time is not None:
+            stmt = stmt.where(LiquidationEventRow.available_time <= _to_utc(end_available_time))
+        if limit is not None:
+            if limit < 1:
+                raise ValueError("limit must be >= 1")
+            stmt = stmt.order_by(LiquidationEventRow.event_time.desc()).limit(limit)
+        else:
+            stmt = stmt.order_by(LiquidationEventRow.event_time.asc())
+        with Session(self._engine) as session:
+            db_rows = list(session.scalars(stmt))
+        if limit is not None:
+            db_rows.reverse()
+        return tuple(
+            LiquidationEvent(
+                provider=row.provider,
+                venue=row.venue,
+                canonical_symbol=row.canonical_symbol,
+                provider_symbol=row.provider_symbol,
+                market_type=MarketType(row.market_type),
+                event_time=_to_utc(row.event_time),
+                received_time=_to_utc(row.received_time),
+                available_time=_to_utc(row.available_time),
+                side=LiquidationSide(row.side),
+                price=row.price,
+                base_quantity=row.base_quantity,
+                quote_notional=row.quote_notional,
+                base_unit=row.base_unit,
+                quote_currency=row.quote_currency,
+                event_key=row.event_key,
+                raw_payload=dict(row.raw_payload),
+            )
+            for row in db_rows
         )

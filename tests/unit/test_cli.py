@@ -10,6 +10,9 @@ from crypto_chatbot.schemas.market import QualityStatus
 
 FIXTURE_1000 = Path(__file__).resolve().parents[1] / "fixtures" / "parity_1000_candles.json"
 FIXTURE_SAMPLE = Path(__file__).resolve().parents[1] / "fixtures" / "binance_btc_4h_sample.json"
+DERIV_FIXTURE = (
+    Path(__file__).resolve().parents[1] / "fixtures" / "binance_btc_derivatives_sample.json"
+)
 SECRET_TOKEN = "cli-test-telegram-token"
 
 
@@ -106,3 +109,28 @@ def test_cli_analyze_rejects_invalid_arguments(
 ) -> None:
     assert cli.main(argv) == 1
     assert "Error:" in capsys.readouterr().err
+
+
+def test_cli_analyze_with_derivatives_fixture(
+    isolated_cwd: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    rc = cli.main(
+        [
+            "analyze",
+            "BTC",
+            "4h",
+            "--fixture",
+            str(FIXTURE_1000),
+            "--derivatives-fixture",
+            str(DERIV_FIXTURE),
+            "--json",
+        ]
+    )
+    assert rc == 0
+    snap = AnalysisSnapshot.model_validate_json(capsys.readouterr().out)
+    assert snap.derivatives is not None
+    assert snap.derivatives.funding_symbol == "BTC/USDT:USDT"
+    assert snap.derivatives.orderbook_symbol == "BTC/USDT"
+    assert snap.derivatives.liquidation_source_available is True
+    assert snap.derivatives.liquidation_count == 2

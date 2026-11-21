@@ -12,6 +12,7 @@ from crypto_chatbot.analysis.regimes import (
 )
 from crypto_chatbot.analysis.structure import StructureAnalysis
 from crypto_chatbot.schemas.analysis import (
+    DerivativesMetrics,
     FactorDirection,
     FactorItem,
     MtfRsiAlignment,
@@ -52,6 +53,7 @@ def build_factors(
     failed_breakouts: Sequence[StructureEvent],
     recent_cutoff_time: datetime,
     fact_ids_by_key: Mapping[str, str],
+    derivatives: DerivativesMetrics | None = None,
 ) -> tuple[FactorItem, ...]:
     """Build descriptive, strictly non-probabilistic rule factors referencing snapshot facts."""
     factors: list[FactorItem] = []
@@ -273,6 +275,79 @@ def build_factors(
                     direction=direction,
                     fact_ids=(fact_ids_by_key["latest_failed_breakout"],),
                 )
+            )
+
+    if derivatives is not None:
+        if derivatives.funding_rate_per_8h is not None:
+            fr_8h = derivatives.funding_rate_per_8h
+            if fr_8h >= 0.0005:
+                desc = (
+                    "Funding rate ternormalisasi 8h bernilai positif tinggi "
+                    "(konsentrasi posisi long lebih padat; bukan jaminan arah)."
+                )
+            elif fr_8h <= -0.0005:
+                desc = (
+                    "Funding rate ternormalisasi 8h bernilai negatif tinggi "
+                    "(konsentrasi posisi short lebih padat; bukan jaminan arah)."
+                )
+            else:
+                desc = (
+                    "Funding rate ternormalisasi 8h berada dalam rentang moderat "
+                    "(konteks posisi perpetual satu venue)."
+                )
+            _add_if_facts_present(
+                factors,
+                fact_ids_by_key,
+                ("funding_rate_per_8h",),
+                rule_id="funding_rate_8h",
+                description=desc,
+                direction=FactorDirection.NEUTRAL,
+            )
+
+        if derivatives.open_interest_change_pct is not None:
+            oi_chg = derivatives.open_interest_change_pct
+            if oi_chg >= 0.05:
+                desc = (
+                    "Open interest perpetual meningkat cukup kuat "
+                    "(ekspansi kontrak terbuka di satu venue)."
+                )
+            elif oi_chg <= -0.05:
+                desc = (
+                    "Open interest perpetual menurun cukup kuat "
+                    "(kontraksi/penutupan kontrak terbuka di satu venue)."
+                )
+            else:
+                desc = "Perubahan open interest perpetual relatif moderat."
+            _add_if_facts_present(
+                factors,
+                fact_ids_by_key,
+                ("open_interest_change_pct",),
+                rule_id="open_interest_change",
+                description=desc,
+                direction=FactorDirection.NEUTRAL,
+            )
+
+        if derivatives.spread_bps is not None and derivatives.imbalance_10bps is not None:
+            imb = derivatives.imbalance_10bps
+            if imb >= 0.25:
+                desc = (
+                    "Order book 10 bps condong pada sisi bid "
+                    "(ketidakseimbangan likuiditas sesaat di satu venue)."
+                )
+            elif imb <= -0.25:
+                desc = (
+                    "Order book 10 bps condong pada sisi ask "
+                    "(ketidakseimbangan likuiditas sesaat di satu venue)."
+                )
+            else:
+                desc = "Kedalaman order book 10 bps relatif berimbang antara bid dan ask."
+            _add_if_facts_present(
+                factors,
+                fact_ids_by_key,
+                ("spread_bps", "imbalance_10bps"),
+                rule_id="orderbook_liquidity_imbalance",
+                description=desc,
+                direction=FactorDirection.NEUTRAL,
             )
 
     return tuple(factors)

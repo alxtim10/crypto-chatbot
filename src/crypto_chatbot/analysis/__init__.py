@@ -1,5 +1,10 @@
 """Deterministic technical analysis engine (indicators, regimes, structure, service)."""
 
+from crypto_chatbot.analysis.derivatives import (
+    DERIVATIVES_PARAMETERS,
+    DerivativesAnalysisResult,
+    compute_derivatives_metrics,
+)
 from crypto_chatbot.analysis.factors import build_factors
 from crypto_chatbot.analysis.failed_breakout import (
     DEFAULT_FAILED_BREAKOUT_WINDOW,
@@ -59,6 +64,7 @@ __all__ = [
     "CALC_VERSION",
     "DEFAULT_FAILED_BREAKOUT_WINDOW",
     "DEFAULT_PIVOT_K",
+    "DERIVATIVES_PARAMETERS",
     "HIGH_VOLATILITY_ATR_PERCENTILE",
     "INDICATOR_PARAMETERS",
     "MIN_HISTORY_ADX_14",
@@ -75,6 +81,7 @@ __all__ = [
     "RANGING_ADX_MAX",
     "TRENDING_ADX_MIN",
     "AnalysisService",
+    "DerivativesAnalysisResult",
     "IndicatorResult",
     "MtfRsiResult",
     "PreviousPeriodLevels",
@@ -87,6 +94,7 @@ __all__ = [
     "build_factors",
     "classify_regime",
     "compute_candles_sha256",
+    "compute_derivatives_metrics",
     "compute_mtf_rsi_alignment",
     "compute_previous_period_levels",
     "compute_technical_metrics",
