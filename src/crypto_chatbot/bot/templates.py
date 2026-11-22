@@ -352,6 +352,52 @@ def render_deterministic_snapshot(
                     f"- Pemeriksaan harga lintas sumber: {_esc(deriv.cross_source_pair, html_mode)}"
                 )
 
+        if snapshot.order_flow is not None and snapshot.order_flow.has_order_flow:
+            of = snapshot.order_flow
+            lines.append("")
+            lines.append(_bold("Mikrostruktur Order Flow (Candle Tutup)", html_mode))
+            tbr_str = (
+                f"{format_indonesian_number(of.taker_buy_ratio * 100.0, 1)}%"
+                if of.taker_buy_ratio is not None
+                else "tidak tersedia"
+            )
+            cvd_str = (
+                format_indonesian_number(of.cvd_20, 2, signed=True)
+                if of.cvd_20 is not None
+                else "tidak tersedia"
+            )
+            div_map = {
+                "bullish": "Divergensi Bullish (harga melemah, delta menguat)",
+                "bearish": "Divergensi Bearish (harga menguat, delta melemah)",
+                "none": "Tidak ada divergensi",
+            }
+            div_str = div_map.get(of.cvd_divergence or "none", of.cvd_divergence or "none")
+            lines.append(f"- Rasio taker buy: {_esc(tbr_str, html_mode)}")
+            lines.append(f"- CVD (20 candle): {_esc(cvd_str, html_mode)}")
+            lines.append(f"- Divergensi CVD: {_esc(div_str, html_mode)}")
+
+        if snapshot.cross_venue_derivatives is not None:
+            cv = snapshot.cross_venue_derivatives
+            lines.append("")
+            lines.append(_bold("Derivatif Lintas Venue (Multi-Venue)", html_mode))
+            v_list = ", ".join(v.upper() for v in cv.venues)
+            lines.append(
+                f"- Venue teramati: {_esc(v_list, html_mode)} "
+                f"(status: {_esc(cv.coverage_status, html_mode)})"
+            )
+            f_disp = (
+                f"{format_indonesian_number(cv.funding_dispersion_bps, 2)} bps"
+                if cv.funding_dispersion_bps is not None
+                else "tidak tersedia"
+            )
+            p_spr = (
+                f"{format_indonesian_number(cv.mark_price_spread_bps, 2)} bps"
+                if cv.mark_price_spread_bps is not None
+                else "tidak tersedia"
+            )
+            lines.append(f"- Dispersi funding: {_esc(f_disp, html_mode)}")
+            lines.append(f"- Spread mark price: {_esc(p_spr, html_mode)}")
+
         if snapshot.tradingview is not None:
             tv = snapshot.tradingview
             lines.append("")
@@ -373,6 +419,37 @@ def render_deterministic_snapshot(
 
         if snapshot.sentiment is not None:
             _append_sentiment_lines(lines, snapshot, html_mode=html_mode, max_sources=3)
+
+        if snapshot.prediction_markets is not None and snapshot.prediction_markets.observations:
+            pm = snapshot.prediction_markets
+            lines.append("")
+            lines.append(
+                _bold(
+                    "Konteks Pasar Prediksi (Harga Kontrak Tersirat — "
+                    "Bukan Probabilitas Menang Absolut)",
+                    html_mode,
+                )
+            )
+            for obs in pm.observations[:3]:
+                pct = format_indonesian_number(obs.implied_yes_prob * 100.0, 1)
+                vol_str = f"${format_indonesian_number(obs.volume_24h_usd, 0)}"
+                q_text = _esc(obs.question, html_mode)
+                v_name = obs.venue.upper()
+                if html_mode and obs.url:
+                    href = html.escape(obs.url, quote=True)
+                    lines.append(
+                        f'- <a href="{href}">{v_name}</a>: {q_text} → YES: {pct}% '
+                        f"(vol 24h: {vol_str})"
+                    )
+                else:
+                    lines.append(f"- [{v_name}] {q_text} → YES: {pct}% (vol 24h: {vol_str})")
+            lines.append(
+                _esc(
+                    "Peringatan: Harga kontrak mencerminkan dinamika taruhan & likuiditas pasar, "
+                    "bukan probabilitas kepastian statistik.",
+                    html_mode,
+                )
+            )
 
         if snapshot.smc is not None or snapshot.trade_setup is not None:
             lines.append("")
@@ -558,6 +635,38 @@ def render_compact_snapshot(
                 _esc(f"Derivatif ({venue_tag.upper()}): " + " | ".join(deriv_parts), html_mode)
             )
 
+    if snapshot.order_flow is not None and snapshot.order_flow.has_order_flow:
+        of = snapshot.order_flow
+        of_parts: list[str] = []
+        if of.taker_buy_ratio is not None:
+            of_parts.append(
+                f"Taker buy: {format_indonesian_number(of.taker_buy_ratio * 100.0, 1)}%"
+            )
+        if of.cvd_20 is not None:
+            of_parts.append(f"CVD20: {format_indonesian_number(of.cvd_20, 2, signed=True)}")
+        if of.cvd_divergence and of.cvd_divergence != "none":
+            of_parts.append(f"Div: {of.cvd_divergence.upper()}")
+        if of_parts:
+            lines.append(_esc("Order Flow (Closed): " + " | ".join(of_parts), html_mode))
+
+    if (
+        snapshot.cross_venue_derivatives is not None
+        and snapshot.cross_venue_derivatives.coverage_status == "full"
+    ):
+        cv = snapshot.cross_venue_derivatives
+        cv_parts: list[str] = []
+        if cv.funding_dispersion_bps is not None:
+            cv_parts.append(
+                f"Disp funding: {format_indonesian_number(cv.funding_dispersion_bps, 2)} bps"
+            )
+        if cv.mark_price_spread_bps is not None:
+            cv_parts.append(
+                f"Spread mark: {format_indonesian_number(cv.mark_price_spread_bps, 2)} bps"
+            )
+        if cv_parts:
+            v_tags = "/".join(v.upper() for v in cv.venues)
+            lines.append(_esc(f"Lintas Venue ({v_tags}): " + " | ".join(cv_parts), html_mode))
+
     if snapshot.tradingview is not None:
         tv = snapshot.tradingview
         tv_parts = [f"Event: {tv.event_type}"]
@@ -574,6 +683,24 @@ def render_compact_snapshot(
 
     if snapshot.sentiment is not None:
         _append_sentiment_lines(lines, snapshot, html_mode=html_mode, max_sources=2)
+
+    if snapshot.prediction_markets is not None and snapshot.prediction_markets.observations:
+        pm = snapshot.prediction_markets
+        pm_parts: list[str] = []
+        if pm.macro_fomc_cut_prob is not None:
+            pm_parts.append(
+                f"FOMC Cut: {format_indonesian_number(pm.macro_fomc_cut_prob * 100.0, 0)}%"
+            )
+        if pm.crypto_upside_prob is not None:
+            pm_parts.append(
+                f"Target YES: {format_indonesian_number(pm.crypto_upside_prob * 100.0, 0)}%"
+            )
+        elif pm.observations:
+            top_obs = pm.observations[0]
+            pct_val = format_indonesian_number(top_obs.implied_yes_prob * 100.0, 0)
+            pm_parts.append(f"{top_obs.question[:20]}… {pct_val}%")
+        if pm_parts:
+            lines.append(_esc("Pasar Prediksi (Tersirat): " + " | ".join(pm_parts), html_mode))
 
     if len(snapshot.mtf_overview) >= 2:
         lines.append("")

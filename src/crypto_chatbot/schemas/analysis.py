@@ -7,6 +7,10 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from crypto_chatbot.schemas.derivatives import (
+    CrossVenueDerivativesSummary,
+    OrderFlowMetrics,
+)
 from crypto_chatbot.schemas.market import (
     BLOCKING_QUALITY_FLAGS,
     FiniteFloat,
@@ -18,6 +22,7 @@ from crypto_chatbot.schemas.market import (
     validate_symbol_market_type,
 )
 from crypto_chatbot.schemas.news import SentimentMetrics
+from crypto_chatbot.schemas.prediction_market import PredictionMarketSummary
 from crypto_chatbot.schemas.tradingview import TradingViewMetrics
 
 FACT_ID_PATTERN = r"^F[1-9][0-9]*$"
@@ -399,6 +404,9 @@ class AnalysisSnapshot(BaseModel):
     tradingview: TradingViewMetrics | None = None
     sentiment: SentimentMetrics | None = None
     trade_setup: TradeSetup | None = None
+    order_flow: OrderFlowMetrics | None = None
+    cross_venue_derivatives: CrossVenueDerivativesSummary | None = None
+    prediction_markets: PredictionMarketSummary | None = None
     ml_prediction: ModelPredictionSummary | None = None
     facts: tuple[Fact, ...] = ()
     regime: Regime | None = None
@@ -446,6 +454,14 @@ class AnalysisSnapshot(BaseModel):
             raise ValueError(
                 "sentiment latest_available_time cannot exceed snapshot as_of (lookahead)"
             )
+
+        if self.prediction_markets is not None:
+            for obs in self.prediction_markets.observations:
+                if obs.available_time > self.as_of:
+                    raise ValueError(
+                        "prediction_market observation available_time cannot exceed "
+                        "snapshot as_of (lookahead)"
+                    )
 
         if self.smc is not None:
             for ev in (self.smc.latest_structure_break, self.smc.latest_sweep):

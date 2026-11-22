@@ -151,6 +151,7 @@ class MarketCandle(BaseModel):
     close: FiniteFloat = Field(gt=0)
     base_volume: FiniteFloat = Field(ge=0)
     quote_volume: FiniteFloat | None = Field(default=None, ge=0)
+    taker_buy_base_volume: FiniteFloat | None = Field(default=None, ge=0)
     base_unit: str = Field(min_length=1)
     quote_currency: str = Field(min_length=1)
     is_closed: bool
@@ -185,5 +186,10 @@ class MarketCandle(BaseModel):
 
         if self.low > self.high:
             raise ValueError("low must be <= high")
+
+        if self.taker_buy_base_volume is not None and self.taker_buy_base_volume > (
+            self.base_volume + 1e-6
+        ):
+            raise ValueError("taker_buy_base_volume cannot exceed base_volume")
 
         return self

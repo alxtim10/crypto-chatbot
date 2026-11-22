@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from enum import StrEnum
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -14,7 +15,7 @@ from crypto_chatbot.schemas.analysis import (
 )
 from crypto_chatbot.schemas.market import FiniteFloat, QualityStatus, Timeframe, UtcDatetime
 
-FEATURE_VERSION = "ml-feat-v1.0.0"
+FEATURE_VERSION = "ml-feat-v1.1.0"
 MODEL_VERSION = "l2-logreg-platt-v1.0.0"
 DEFAULT_TARGET_NAME = "next_24h_return_exceeds_cost"
 
@@ -23,6 +24,7 @@ class FeatureFamily(StrEnum):
     TECHNICAL = "technical"
     STRUCTURE_PIVOT = "structure_pivot"
     SENTIMENT = "sentiment"
+    ORDERFLOW = "orderflow"
 
 
 class CostAssumptions(BaseModel):
@@ -31,12 +33,20 @@ class CostAssumptions(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     fee_bps_per_side: FiniteFloat = Field(default=10.0, ge=0.0)
+    maker_fee_bps_per_side: FiniteFloat = Field(default=2.0, ge=0.0)
     spread_bps: FiniteFloat = Field(default=5.0, ge=0.0)
     slippage_bps: FiniteFloat = Field(default=5.0, ge=0.0)
     funding_bps_per_24h: FiniteFloat = Field(default=2.0, ge=0.0)
+    execution_style: Literal["taker", "maker"] = "taker"
 
     @property
     def round_trip_cost_bps(self) -> float:
+        if self.execution_style == "maker":
+            return (
+                2.0 * self.maker_fee_bps_per_side
+                + (0.5 * self.spread_bps)
+                + self.funding_bps_per_24h
+            )
         return (
             2.0 * self.fee_bps_per_side
             + self.spread_bps
@@ -47,6 +57,21 @@ class CostAssumptions(BaseModel):
     @property
     def round_trip_cost_rate(self) -> float:
         return self.round_trip_cost_bps / 10_000.0
+
+
+class CalibrationBinMetrics(BaseModel):
+    """Reliability bin metrics to audit calibration across probability intervals."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    bin_index: int = Field(ge=0)
+    bin_low: FiniteFloat = Field(ge=0.0, le=1.0)
+    bin_high: FiniteFloat = Field(ge=0.0, le=1.0)
+    sample_count: int = Field(ge=0)
+    mean_predicted_prob: FiniteFloat | None = Field(default=None, ge=0.0, le=1.0)
+    empirical_positive_rate: FiniteFloat | None = Field(default=None, ge=0.0, le=1.0)
+    calibration_gap: FiniteFloat | None = Field(default=None, ge=0.0, le=1.0)
+    mean_net_return: FiniteFloat | None = None
 
 
 class FeatureRow(BaseModel):
@@ -136,6 +161,7 @@ class EvaluationSummary(BaseModel):
     naive_brier: FiniteFloat = Field(ge=0.0, le=1.0)
     model_brier: FiniteFloat = Field(ge=0.0, le=1.0)
     brier_skill_vs_naive: FiniteFloat
+    brier_skill_score: FiniteFloat = Field(default=0.0)
     calibration_ece: FiniteFloat = Field(ge=0.0, le=1.0)
     balanced_accuracy: FiniteFloat = Field(ge=0.0, le=1.0)
     precision: FiniteFloat = Field(ge=0.0, le=1.0)
@@ -144,6 +170,9 @@ class EvaluationSummary(BaseModel):
     net_return_after_costs: FiniteFloat
     mean_return_per_trade_after_costs: FiniteFloat
     max_drawdown: FiniteFloat = Field(ge=0.0, le=1.0)
+    calibration_bins: tuple[CalibrationBinMetrics, ...] = ()
+    maker_net_return_after_costs: FiniteFloat | None = None
+    taker_net_return_after_costs: FiniteFloat | None = None
 
 
 class AblationResult(BaseModel):
@@ -263,8 +292,10 @@ class ShadowMonitoringReport(BaseModel):
     abstained_count: int = Field(ge=0)
     abstention_rate: FiniteFloat = Field(ge=0.0, le=1.0)
     realized_brier: FiniteFloat | None = Field(default=None, ge=0.0)
+    realized_brier_skill_score: FiniteFloat | None = None
     realized_ece: FiniteFloat | None = Field(default=None, ge=0.0, le=1.0)
     mean_max_zscore: FiniteFloat | None = Field(default=None, ge=0.0)
     drift_alert_count: int = Field(ge=0)
     is_healthy: bool
     alerts: tuple[str, ...] = ()
+    calibration_bins: tuple[CalibrationBinMetrics, ...] = ()

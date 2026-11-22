@@ -66,6 +66,7 @@ class MarketCandleRow(Base):
     close: Mapped[float] = mapped_column(Double, nullable=False)
     base_volume: Mapped[float] = mapped_column(Double, nullable=False)
     quote_volume: Mapped[float | None] = mapped_column(Double, nullable=True)
+    taker_buy_base_volume: Mapped[float | None] = mapped_column(Double, nullable=True)
     base_unit: Mapped[str] = mapped_column(String(32), nullable=False)
     quote_currency: Mapped[str] = mapped_column(String(32), nullable=False)
     is_closed: Mapped[bool] = mapped_column(Boolean, nullable=False)

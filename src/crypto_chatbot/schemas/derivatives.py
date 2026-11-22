@@ -352,3 +352,26 @@ class DerivativesContext(BaseModel):
     order_book: OrderBookBatch | None = None
     liquidations: LiquidationBatch | None = None
     reference_prices: tuple[ReferencePrice, ...] = ()
+
+
+class OrderFlowMetrics(BaseModel):
+    """Closed-bar order flow metrics calculated from taker buy aggression."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    taker_buy_ratio: FiniteFloat = Field(ge=0.0, le=1.0)
+    cvd_20: FiniteFloat
+    cvd_divergence: Literal["bullish", "bearish", "none"] = "none"
+    has_order_flow: bool = True
+
+
+class CrossVenueDerivativesSummary(BaseModel):
+    """Comparative derivatives pricing and funding dispersion across venues."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    venues: tuple[str, ...]
+    primary_venue: str
+    funding_dispersion_bps: FiniteFloat | None = None
+    mark_price_spread_bps: FiniteFloat | None = None
+    coverage_status: Literal["full", "partial", "unavailable"] = "unavailable"

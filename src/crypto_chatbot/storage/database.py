@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from sqlalchemy import Engine, create_engine
+from sqlalchemy import Engine, create_engine, text
 
 from crypto_chatbot.storage.models import Base
 
@@ -15,5 +15,12 @@ def create_db_engine(database_url: str) -> Engine:
 
 
 def init_db(engine: Engine) -> None:
-    """Create tables registered on `Base.metadata` if they do not exist."""
+    """Create tables registered on `Base.metadata` and ensure backwards-compatible columns."""
     Base.metadata.create_all(engine)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "ALTER TABLE market_candles "
+                "ADD COLUMN IF NOT EXISTS taker_buy_base_volume DOUBLE PRECISION;"
+            )
+        )

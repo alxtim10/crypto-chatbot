@@ -67,6 +67,10 @@ FEATURE_FAMILIES: dict[FeatureFamily, tuple[str, ...]] = {
         "sentiment_mean_conf",
         "sentiment_article_count_log",
     ),
+    FeatureFamily.ORDERFLOW: (
+        "taker_buy_ratio",
+        "cvd_zscore_20",
+    ),
 }
 
 ALL_FEATURE_NAMES: tuple[str, ...] = (
@@ -271,6 +275,25 @@ def _compute_causal_feature_rows(
             "sentiment_mean_conf": sent_conf,
             "sentiment_article_count_log": sent_count_log,
         }
+
+        # Order flow features
+        tbr = (
+            candle.taker_buy_base_volume / candle.base_volume
+            if (candle.taker_buy_base_volume is not None and candle.base_volume > 0.0)
+            else 0.5
+        )
+        cvd_window_start = max(0, idx - 19)
+        c_sub = candles[cvd_window_start : idx + 1]
+        sum_delta = 0.0
+        sum_vol = 0.0
+        for sc in c_sub:
+            if sc.taker_buy_base_volume is not None:
+                sum_delta += (2.0 * sc.taker_buy_base_volume) - sc.base_volume
+                sum_vol += sc.base_volume
+        cvd_ratio = sum_delta / sum_vol if sum_vol > 0.0 else 0.0
+
+        feat_dict["taker_buy_ratio"] = float(tbr)
+        feat_dict["cvd_zscore_20"] = float(max(-3.0, min(3.0, cvd_ratio)))
 
         if include_target_horizon:
             target_candle = candles[idx + horizon_bars]

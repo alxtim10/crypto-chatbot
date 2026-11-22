@@ -10,6 +10,7 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
 from typing import Any
 
+from crypto_chatbot.analysis.cross_venue import compute_cross_venue_derivatives
 from crypto_chatbot.analysis.derivatives import (
     DERIVATIVES_PARAMETERS,
     DerivativesAnalysisResult,
@@ -22,6 +23,7 @@ from crypto_chatbot.analysis.indicators import (
     INDICATOR_PARAMETERS,
     compute_technical_metrics,
 )
+from crypto_chatbot.analysis.orderflow import compute_closed_candle_orderflow
 from crypto_chatbot.analysis.regimes import classify_regime
 from crypto_chatbot.analysis.setup import SETUP_PARAMETERS, build_trade_setup
 from crypto_chatbot.analysis.smc import analyze_smc
@@ -33,6 +35,7 @@ from crypto_chatbot.market_data.base import (
     MarketDataProvider,
     OhlcvBatch,
 )
+from crypto_chatbot.market_data.bybit_derivatives import BybitDerivativesProvider
 from crypto_chatbot.market_data.quality import (
     determine_quality_status,
     is_candle_stale,
@@ -55,7 +58,11 @@ from crypto_chatbot.schemas.analysis import (
     TimeframeOverview,
     TradeSetup,
 )
-from crypto_chatbot.schemas.derivatives import DerivativesContext
+from crypto_chatbot.schemas.derivatives import (
+    CrossVenueDerivativesSummary,
+    DerivativesContext,
+    OrderFlowMetrics,
+)
 from crypto_chatbot.schemas.market import (
     MarketCandle,
     MarketType,
@@ -257,6 +264,8 @@ def _build_facts(
     trade_setup: TradeSetup | None = None,
     tradingview: TradingViewMetrics | None = None,
     sentiment: SentimentMetrics | None = None,
+    order_flow: OrderFlowMetrics | None = None,
+    cross_venue_derivatives: CrossVenueDerivativesSummary | None = None,
 ) -> tuple[tuple[Fact, ...], dict[str, str]]:
     facts: list[Fact] = []
     fact_ids_by_key: dict[str, str] = {}
@@ -752,6 +761,43 @@ def _build_facts(
             fact_source=sent_src,
         )
 
+    if order_flow is not None and order_flow.has_order_flow:
+        add_fact(
+            "order_flow_taker_buy_ratio",
+            "Taker buy ratio (bar tertutup)",
+            order_flow.taker_buy_ratio * 100.0,
+            "%",
+            "percent",
+        )
+        add_fact(
+            "order_flow_cvd_20",
+            "Cumulative Volume Delta (20 bar)",
+            order_flow.cvd_20,
+            base_unit,
+            "quantity",
+        )
+
+    if cross_venue_derivatives is not None:
+        cv_src = f"cross_venue:{','.join(cross_venue_derivatives.venues)}"
+        if cross_venue_derivatives.funding_dispersion_bps is not None:
+            add_fact(
+                "funding_dispersion_bps",
+                "Dispersi funding rate lintas venue",
+                cross_venue_derivatives.funding_dispersion_bps,
+                "bps",
+                "bps",
+                fact_source=cv_src,
+            )
+        if cross_venue_derivatives.mark_price_spread_bps is not None:
+            add_fact(
+                "mark_price_spread_bps",
+                "Spread mark price lintas venue",
+                cross_venue_derivatives.mark_price_spread_bps,
+                "bps",
+                "bps",
+                fact_source=cv_src,
+            )
+
     return tuple(facts), fact_ids_by_key
 
 
@@ -965,6 +1011,8 @@ def build_analysis_snapshot(
     derivatives_context: DerivativesContext | None = None,
     tradingview_packet: TradingViewPacket | None = None,
     news_observations: Sequence[SentimentObservation] | None = None,
+    cross_venue_derivatives: CrossVenueDerivativesSummary | None = None,
+    order_flow: OrderFlowMetrics | None = None,
     use_available_time: bool = False,
 ) -> AnalysisSnapshot:
     """Assemble a complete deterministic `AnalysisSnapshot` from spot and optional inputs."""
@@ -1159,6 +1207,7 @@ def build_analysis_snapshot(
         use_available_time=use_available_time,
     )
     source = f"{batch.metadata.venue}:{batch.canonical_symbol}:{batch.timeframe.value}"
+    actual_order_flow = order_flow or compute_closed_candle_orderflow(batch.candles)
     facts, fact_ids_by_key = _build_facts(
         metrics=ind_result.metrics,
         mtf_rsi_values=ind_result.mtf_rsi_values,
@@ -1176,6 +1225,8 @@ def build_analysis_snapshot(
         trade_setup=trade_setup,
         tradingview=tv_metrics,
         sentiment=sent_metrics,
+        order_flow=actual_order_flow,
+        cross_venue_derivatives=cross_venue_derivatives,
     )
 
     recent_cutoff = as_of - 10 * batch.timeframe.duration
@@ -1237,6 +1288,8 @@ def build_analysis_snapshot(
         tradingview=tv_metrics,
         sentiment=sent_metrics,
         trade_setup=trade_setup,
+        order_flow=actual_order_flow,
+        cross_venue_derivatives=cross_venue_derivatives,
         facts=facts,
         regime=regime,
         market_structure=structure.market_structure,
@@ -1309,12 +1362,14 @@ class AnalysisService:
         setup_repository: SetupLogRepository | None = None,
         tradingview_repository: TradingViewRepository | None = None,
         news_repository: NewsRepository | None = None,
+        bybit_provider: BybitDerivativesProvider | None = None,
         shadow_engine: ShadowInferenceEngine | None = None,
         prediction_repository: ModelPredictionRepository | None = None,
     ) -> None:
         self._provider = provider
         self._repository = repository
         self._derivatives_provider = derivatives_provider
+        self._bybit_provider = bybit_provider
         self._derivatives_repository = derivatives_repository
         self._setup_repository = setup_repository
         self._tradingview_repository = tradingview_repository
@@ -1391,6 +1446,19 @@ class AnalysisService:
                 liquidations=liq_batch,
             )
 
+        cross_venue: CrossVenueDerivativesSummary | None = None
+        if self._bybit_provider is not None and include_derivatives and primary_ok:
+            try:
+                bybit_funding = await self._bybit_provider.get_funding_rate(mapping.base)
+                bybit_context = (
+                    DerivativesContext(funding=bybit_funding)
+                    if bybit_funding.observation is not None
+                    else None
+                )
+                cross_venue = compute_cross_venue_derivatives(derivatives_context, bybit_context)
+            except Exception:
+                cross_venue = None
+
         tv_packet: TradingViewPacket | None = None
         if self._tradingview_repository is not None and primary_ok and primary.candles:
             tv_packet = self._tradingview_repository.load_latest_packet(
@@ -1416,6 +1484,7 @@ class AnalysisService:
             derivatives_context=derivatives_context,
             tradingview_packet=tv_packet,
             news_observations=news_observations,
+            cross_venue_derivatives=cross_venue,
         )
 
         if self._shadow_engine is not None:

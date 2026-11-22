@@ -108,6 +108,7 @@ def _ohlcv_equal(first: MarketCandle, second: MarketCandle) -> bool:
         and first.close == second.close
         and first.base_volume == second.base_volume
         and first.quote_volume == second.quote_volume
+        and first.taker_buy_base_volume == second.taker_buy_base_volume
     )
 
 
@@ -136,6 +137,12 @@ def _parse_raw_row(
         quote_volume = _to_finite_float(row[6])
         if quote_volume is None:
             return None, False, True
+
+    taker_buy_base_volume: float | None = None
+    if len(row) >= 10 and row[9] is not None:
+        raw_tb = _to_finite_float(row[9])
+        if raw_tb is not None and base_volume is not None:
+            taker_buy_base_volume = min(max(0.0, raw_tb), base_volume)
 
     if (
         ts_ms is None
@@ -176,6 +183,7 @@ def _parse_raw_row(
             close=close_price,
             base_volume=base_volume,
             quote_volume=quote_volume,
+            taker_buy_base_volume=taker_buy_base_volume,
             base_unit=symbol.base,
             quote_currency=symbol.quote,
             is_closed=True,

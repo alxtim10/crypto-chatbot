@@ -24,6 +24,7 @@ from crypto_chatbot.llm.gemini import (
     GeminiNarrator,
     GoogleGenAiTransport,
 )
+from crypto_chatbot.market_data.bybit_derivatives import BybitDerivativesProvider
 from crypto_chatbot.market_data.ccxt_provider import CcxtMarketDataProvider
 from crypto_chatbot.market_data.derivatives_provider import CcxtDerivativesLiquidityProvider
 from crypto_chatbot.memory.service import MemoryService
@@ -73,10 +74,12 @@ def build_telegram_application(
     memory_repo = PostgresUserMemoryRepository(engine)
     provider = CcxtMarketDataProvider()
     derivatives_provider = CcxtDerivativesLiquidityProvider()
+    bybit_provider = BybitDerivativesProvider()
     analysis_service = AnalysisService(
         provider=provider,
         repository=market_repo,
         derivatives_provider=derivatives_provider,
+        bybit_provider=bybit_provider,
         derivatives_repository=derivatives_repo,
         setup_repository=setup_repo,
         tradingview_repository=tradingview_repo,
@@ -114,6 +117,7 @@ def build_telegram_application(
         del app
         await provider.close()
         await derivatives_provider.close()
+        await bybit_provider.close()
         engine.dispose()
 
     application = (

@@ -257,6 +257,7 @@ class SetupLogRepository(Protocol):
         self,
         *,
         canonical_symbol: str | None = None,
+        timeframe: Timeframe | None = None,
         limit: int = 20,
     ) -> tuple[TradeSetupRecord, ...]: ...
 
@@ -340,6 +341,7 @@ class PostgresMarketRepository:
                 "close": candle.close,
                 "base_volume": candle.base_volume,
                 "quote_volume": candle.quote_volume,
+                "taker_buy_base_volume": candle.taker_buy_base_volume,
                 "base_unit": candle.base_unit,
                 "quote_currency": candle.quote_currency,
                 "is_closed": candle.is_closed,
@@ -415,6 +417,7 @@ class PostgresMarketRepository:
                 close=row.close,
                 base_volume=row.base_volume,
                 quote_volume=row.quote_volume,
+                taker_buy_base_volume=row.taker_buy_base_volume,
                 base_unit=row.base_unit,
                 quote_currency=row.quote_currency,
                 is_closed=row.is_closed,
@@ -1178,6 +1181,7 @@ class PostgresSetupLogRepository:
         self,
         *,
         canonical_symbol: str | None = None,
+        timeframe: Timeframe | None = None,
         limit: int = 20,
     ) -> tuple[TradeSetupRecord, ...]:
         if limit < 1:
@@ -1185,6 +1189,8 @@ class PostgresSetupLogRepository:
         stmt = select(TradeSetupRow)
         if canonical_symbol is not None:
             stmt = stmt.where(TradeSetupRow.canonical_symbol == canonical_symbol)
+        if timeframe is not None:
+            stmt = stmt.where(TradeSetupRow.timeframe == timeframe.value)
         stmt = stmt.order_by(TradeSetupRow.as_of.desc(), TradeSetupRow.id.desc()).limit(limit)
         with Session(self._engine) as session:
             rows = list(session.scalars(stmt))

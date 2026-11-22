@@ -12,6 +12,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from crypto_chatbot.analysis.service import AnalysisService, build_analysis_snapshot
 from crypto_chatbot.analysis.setup import evaluate_setup_against_candles
 from crypto_chatbot.app import run_bot
@@ -34,6 +36,7 @@ from crypto_chatbot.market_data.symbols import (
 )
 from crypto_chatbot.market_data.tradingview import parse_ai_agent_lens_packet
 from crypto_chatbot.ml.experiment import run_offline_experiment
+from crypto_chatbot.ml.shadow import compute_shadow_monitoring_report
 from crypto_chatbot.news.pipeline import build_sentiment_observations, deduplicate_articles
 from crypto_chatbot.ops import (
     BackupError,
@@ -55,6 +58,7 @@ from crypto_chatbot.storage.repositories import (
     PostgresDerivativesRepository,
     PostgresMarketRepository,
     PostgresMlExperimentRepository,
+    PostgresModelPredictionRepository,
     PostgresNewsRepository,
     PostgresSetupLogRepository,
     PostgresTradingViewRepository,
@@ -700,6 +704,200 @@ def _run_ml_experiment(
     return 0
 
 
+def _run_setup_stats(
+    *,
+    symbol: str | None = None,
+    timeframe: str | None = None,
+    as_json: bool = False,
+    database_url: str | None = None,
+) -> int:
+    try:
+        resolved_url = _resolve_database_url(database_url)
+        engine = create_db_engine(resolved_url)
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    tf_enum: Timeframe | None = None
+    if timeframe:
+        try:
+            tf_enum = Timeframe(timeframe)
+        except ValueError:
+            print(f"Error: Invalid timeframe '{timeframe}'", file=sys.stderr)
+            return 1
+
+    canonical: str | None = None
+    if symbol:
+        try:
+            canonical = resolve_mvp_spot_symbol(symbol).canonical_symbol
+        except Exception:
+            canonical = symbol if "/" in symbol else f"{symbol}/USDT"
+
+    try:
+        init_db(engine)
+        setup_repo = PostgresSetupLogRepository(engine)
+        setups = setup_repo.list_recent_setups(
+            canonical_symbol=canonical,
+            timeframe=tf_enum,
+            limit=500,
+        )
+    finally:
+        engine.dispose()
+
+    status_counts: dict[str, int] = {}
+    realized_rs: list[float] = []
+
+    for s in setups:
+        st = s.outcome_status if s.outcome_status else "pending"
+        status_counts[st] = status_counts.get(st, 0) + 1
+        if s.realized_r is not None:
+            realized_rs.append(s.realized_r)
+
+    total = len(setups)
+    tp_count = sum(status_counts.get(k, 0) for k in ("tp1", "tp2", "tp3"))
+    sl_count = status_counts.get("sl", 0)
+    closed_count = tp_count + sl_count
+    hit_rate = (tp_count / closed_count) if closed_count > 0 else None
+    mean_r = float(np.mean(realized_rs)) if realized_rs else None
+    median_r = float(np.median(realized_rs)) if realized_rs else None
+
+    report = {
+        "canonical_symbol": canonical or "all",
+        "timeframe": tf_enum.value if tf_enum else "all",
+        "total_setups": total,
+        "status_counts": status_counts,
+        "hit_rate_tp_vs_sl": round(hit_rate, 4) if hit_rate is not None else None,
+        "mean_realized_r": round(mean_r, 4) if mean_r is not None else None,
+        "median_realized_r": round(median_r, 4) if median_r is not None else None,
+        "realized_trade_count": len(realized_rs),
+    }
+
+    if as_json:
+        print(json.dumps(report, indent=2))
+        return 0
+
+    print("=====================================================================")
+    print("        AUDIT LEDGER: TRADE SETUP HISTORICAL OUTCOMES               ")
+    print("=====================================================================")
+    print(
+        f"Filter Simbol: {canonical or 'Semua'} | "
+        f"Timeframe: {tf_enum.value if tf_enum else 'Semua'}"
+    )
+    print(f"Total Setup Terdata: {total}")
+    print(
+        f"- TP (Hit Target 1/2/3): {tp_count} "
+        f"(TP1: {status_counts.get('tp1', 0)}, "
+        f"TP2: {status_counts.get('tp2', 0)}, "
+        f"TP3: {status_counts.get('tp3', 0)})"
+    )
+    print(f"- SL (Stop Loss): {sl_count}")
+    print(f"- Pending: {status_counts.get('pending', 0)}")
+    print(f"- Expired: {status_counts.get('expired', 0)}")
+    print(f"- Invalidated: {status_counts.get('invalidated', 0)}")
+    hr_str = f"{hit_rate * 100.0:.1f}%" if hit_rate is not None else "N/A"
+    print(f"Hit Rate Selesai (TP / (TP + SL)): {hr_str}")
+    mr_str = f"{mean_r:+.2f}R" if mean_r is not None else "N/A"
+    med_str = f"{median_r:+.2f}R" if median_r is not None else "N/A"
+    print(f"Rata-rata Realized R: {mr_str} | Median: {med_str} (Sampel: {len(realized_rs)})")
+    print("---------------------------------------------------------------------")
+    print("Catatan Integritas & Kepatuhan:")
+    print("Statistik di atas merupakan pengukuran matematis retrospektif dari setup")
+    print("yang tersimpan di database dan BUKAN jaminan keberhasilan di masa depan.")
+    print("=====================================================================")
+    return 0
+
+
+def _run_shadow_report(
+    *,
+    symbol: str | None = None,
+    timeframe: str | None = None,
+    as_json: bool = False,
+    database_url: str | None = None,
+) -> int:
+    try:
+        resolved_url = _resolve_database_url(database_url)
+        engine = create_db_engine(resolved_url)
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    tf_enum: Timeframe | None = None
+    if timeframe:
+        try:
+            tf_enum = Timeframe(timeframe)
+        except ValueError:
+            print(f"Error: Invalid timeframe '{timeframe}'", file=sys.stderr)
+            return 1
+
+    canonical: str | None = None
+    if symbol:
+        try:
+            canonical = resolve_mvp_spot_symbol(symbol).canonical_symbol
+        except Exception:
+            canonical = symbol if "/" in symbol else f"{symbol}/USDT"
+
+    try:
+        init_db(engine)
+        pred_repo = PostgresModelPredictionRepository(engine)
+        records = pred_repo.list_predictions(
+            canonical_symbol=canonical,
+            timeframe=tf_enum,
+            limit=500,
+        )
+    finally:
+        engine.dispose()
+
+    report = compute_shadow_monitoring_report(records)
+
+    if as_json:
+        print(report.model_dump_json(indent=2))
+        return 0
+
+    print("=====================================================================")
+    print("           AUDIT LEDGER: SHADOW MODEL MONITORING REPORT              ")
+    print("=====================================================================")
+    print(
+        f"Filter Simbol: {canonical or 'Semua'} | "
+        f"Timeframe: {tf_enum.value if tf_enum else 'Semua'}"
+    )
+    status_str = "SEHAT (HEALTHY)" if report.is_healthy else "PERINGATAN (ALERTS ACTIVE)"
+    print(f"Status Model: {status_str}")
+    print(f"Total Prediksi Shadow: {report.total_predictions}")
+    print(f"Prediksi Selesai (Settled): {report.settled_predictions}")
+    ab_rate = report.abstention_rate * 100.0
+    print(f"Tingkat Abstain: {ab_rate:.1f}% ({report.abstained_count} abstain)")
+    brier_str = f"{report.realized_brier:.4f}" if report.realized_brier is not None else "N/A"
+    bss_str = (
+        f"{report.realized_brier_skill_score:.4f}"
+        if report.realized_brier_skill_score is not None
+        else "N/A"
+    )
+    ece_str = f"{report.realized_ece:.4f}" if report.realized_ece is not None else "N/A"
+    print(f"Realized Brier Score: {brier_str} | Brier Skill Score (BSS): {bss_str}")
+    print(f"Realized ECE (Kalibrasi): {ece_str}")
+    print(f"Alert Deteksi Drift Fitur: {report.drift_alert_count} alert")
+    if report.alerts:
+        print(f"Daftar Alert Aktif: {', '.join(report.alerts)}")
+
+    if report.calibration_bins:
+        print("\nTabel Keandalan Kalibrasi (Reliability Bins):")
+        print(
+            f"{'Bin Range':<15} | {'Count':<6} | {'Mean Prob':<10} | {'Empirical':<10} | {'Gap':<8}"
+        )
+        print("-" * 60)
+        for b in report.calibration_bins:
+            rng = f"[{b.bin_low:.2f}, {b.bin_high:.2f}]"
+            mp = f"{b.mean_predicted_prob:.3f}" if b.mean_predicted_prob is not None else "-"
+            ep = (
+                f"{b.empirical_positive_rate:.3f}" if b.empirical_positive_rate is not None else "-"
+            )
+            gp = f"{b.calibration_gap:.3f}" if b.calibration_gap is not None else "-"
+            print(f"{rng:<15} | {b.sample_count:<6} | {mp:<10} | {ep:<10} | {gp:<8}")
+
+    print("=====================================================================")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="crypto-chatbot")
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -844,6 +1042,56 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Optional PostgreSQL URL override for DB health probe.",
     )
 
+    setup_stats_parser = subcommands.add_parser(
+        "setup-stats",
+        help="Summarize settled trade setups objectively from PostgreSQL audit ledger.",
+    )
+    setup_stats_parser.add_argument(
+        "--symbol",
+        default=None,
+        help="Optional filter by symbol (e.g. BTC, ETH, SOL).",
+    )
+    setup_stats_parser.add_argument(
+        "--timeframe",
+        default=None,
+        help="Optional filter by timeframe (e.g. 15m, 1h, 4h).",
+    )
+    setup_stats_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print summary in JSON format.",
+    )
+    setup_stats_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Optional PostgreSQL URL override.",
+    )
+
+    shadow_report_parser = subcommands.add_parser(
+        "shadow-report",
+        help="Audit live drift, abstention, and calibration across shadow ML prediction logs.",
+    )
+    shadow_report_parser.add_argument(
+        "--symbol",
+        default=None,
+        help="Optional filter by symbol (e.g. BTC, ETH, SOL).",
+    )
+    shadow_report_parser.add_argument(
+        "--timeframe",
+        default=None,
+        help="Optional filter by timeframe (e.g. 15m, 1h, 4h).",
+    )
+    shadow_report_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print report in JSON format.",
+    )
+    shadow_report_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Optional PostgreSQL URL override.",
+    )
+
     args = parser.parse_args(argv)
     if args.command == "check-config":
         return _check_config()
@@ -860,6 +1108,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             persist=args.persist,
             include_mtf=not args.no_mtf,
             include_derivatives=not args.no_derivatives,
+        )
+    if args.command == "setup-stats":
+        return _run_setup_stats(
+            symbol=args.symbol,
+            timeframe=args.timeframe,
+            as_json=args.json,
+            database_url=args.database_url,
+        )
+    if args.command == "shadow-report":
+        return _run_shadow_report(
+            symbol=args.symbol,
+            timeframe=args.timeframe,
+            as_json=args.json,
+            database_url=args.database_url,
         )
     if args.command == "run-bot":
         return _run_bot()

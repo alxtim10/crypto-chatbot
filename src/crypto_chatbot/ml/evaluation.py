@@ -9,6 +9,7 @@ import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
 from crypto_chatbot.schemas.ml import (
+    CalibrationBinMetrics,
     CostAssumptions,
     EvaluationSummary,
     FeatureRow,
@@ -16,6 +17,70 @@ from crypto_chatbot.schemas.ml import (
     MlExperimentConfig,
     RegimeSliceMetrics,
 )
+
+
+def compute_brier_skill_score(
+    brier: float,
+    naive_brier: float,
+) -> float:
+    """Compute Brier Skill Score: 1 - brier / naive_brier.
+
+    Returns 0.0 when naive_brier is zero and brier is zero.
+    Returns -1.0 when naive_brier is zero but brier > 0.
+    """
+    if naive_brier <= 1e-9:
+        return 0.0 if brier <= 1e-9 else -1.0
+    return float(1.0 - (brier / naive_brier))
+
+
+def compute_calibration_bins(
+    y_true: NDArray[np.float64],
+    p_pred: NDArray[np.float64],
+    *,
+    net_returns: NDArray[np.float64] | None = None,
+    n_bins: int = 5,
+) -> tuple[CalibrationBinMetrics, ...]:
+    """Compute discrete calibration bin metrics across the probability interval [0, 1]."""
+    edges = np.linspace(0.0, 1.0, n_bins + 1)
+    bins: list[CalibrationBinMetrics] = []
+    for b_idx in range(n_bins):
+        lo, hi = float(edges[b_idx]), float(edges[b_idx + 1])
+        if b_idx == n_bins - 1:
+            mask = (p_pred >= lo) & (p_pred <= hi)
+        else:
+            mask = (p_pred >= lo) & (p_pred < hi)
+        count = int(np.sum(mask))
+        if count == 0:
+            bins.append(
+                CalibrationBinMetrics(
+                    bin_index=b_idx,
+                    bin_low=lo,
+                    bin_high=hi,
+                    sample_count=0,
+                    mean_predicted_prob=None,
+                    empirical_positive_rate=None,
+                    calibration_gap=None,
+                    mean_net_return=None,
+                )
+            )
+            continue
+        acc = float(np.mean(y_true[mask]))
+        conf = float(np.mean(p_pred[mask]))
+        gap = abs(acc - conf)
+        mean_ret = float(np.mean(net_returns[mask])) if net_returns is not None else None
+        bins.append(
+            CalibrationBinMetrics(
+                bin_index=b_idx,
+                bin_low=lo,
+                bin_high=hi,
+                sample_count=count,
+                mean_predicted_prob=conf,
+                empirical_positive_rate=acc,
+                calibration_gap=gap,
+                mean_net_return=mean_ret,
+            )
+        )
+    return tuple(bins)
 
 
 def compute_ece(
@@ -68,7 +133,9 @@ def compute_evaluation_summary(
     naive_brier = float(np.mean((p_naive - y_true) ** 2))
     model_brier = float(np.mean((p_model - y_true) ** 2))
     skill = 1.0 - (model_brier / naive_brier) if naive_brier > 0.0 else 0.0
+    bss = compute_brier_skill_score(model_brier, naive_brier)
     ece = compute_ece(y_true, p_model, n_bins=5)
+    cal_bins = compute_calibration_bins(y_true, p_model, net_returns=fwd_ret, n_bins=5)
 
     y_pred = p_model >= prob_threshold
     y_pos = y_true >= 0.5
@@ -85,7 +152,16 @@ def compute_evaluation_summary(
     recall = tpr
 
     round_trip_cost = cost_assumptions.round_trip_cost_rate
+    maker_cost_rate = cost_assumptions.model_copy(
+        update={"execution_style": "maker"}
+    ).round_trip_cost_rate
+    taker_cost_rate = cost_assumptions.model_copy(
+        update={"execution_style": "taker"}
+    ).round_trip_cost_rate
+
     equity = 1.0
+    equity_maker = 1.0
+    equity_taker = 1.0
     peak = 1.0
     max_dd = 0.0
     trade_returns: list[float] = []
@@ -101,8 +177,12 @@ def compute_evaluation_summary(
             continue
         if bool(y_pred[idx]):
             net_r = max(-0.99, float(fwd_ret[idx]) - round_trip_cost)
+            net_r_m = max(-0.99, float(fwd_ret[idx]) - maker_cost_rate)
+            net_r_t = max(-0.99, float(fwd_ret[idx]) - taker_cost_rate)
             trade_returns.append(net_r)
             equity *= 1.0 + net_r
+            equity_maker *= 1.0 + net_r_m
+            equity_taker *= 1.0 + net_r_t
             if equity > peak:
                 peak = equity
             if peak > 0.0:
@@ -122,6 +202,7 @@ def compute_evaluation_summary(
         naive_brier=naive_brier,
         model_brier=model_brier,
         brier_skill_vs_naive=skill,
+        brier_skill_score=bss,
         calibration_ece=ece,
         balanced_accuracy=bal_acc,
         precision=precision,
@@ -130,6 +211,9 @@ def compute_evaluation_summary(
         net_return_after_costs=net_ret,
         mean_return_per_trade_after_costs=mean_ret,
         max_drawdown=min(1.0, max(0.0, max_dd)),
+        calibration_bins=cal_bins,
+        maker_net_return_after_costs=equity_maker - 1.0,
+        taker_net_return_after_costs=equity_taker - 1.0,
     )
 
 

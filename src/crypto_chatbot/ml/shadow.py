@@ -10,11 +10,16 @@ from datetime import UTC, datetime, timedelta
 
 import numpy as np
 
-from crypto_chatbot.ml.evaluation import compute_ece
+from crypto_chatbot.ml.evaluation import (
+    compute_brier_skill_score,
+    compute_calibration_bins,
+    compute_ece,
+)
 from crypto_chatbot.ml.features import extract_latest_production_features
 from crypto_chatbot.schemas.analysis import AnalysisSnapshot, ModelPredictionSummary
 from crypto_chatbot.schemas.market import MarketCandle, QualityStatus
 from crypto_chatbot.schemas.ml import (
+    CalibrationBinMetrics,
     CostAssumptions,
     MlExperimentConfig,
     MlInferenceMode,
@@ -297,12 +302,18 @@ def compute_shadow_monitoring_report(
         if not r.abstained and r.calibrated_probability is not None and r.realized_label is not None
     ]
     realized_brier: float | None = None
+    realized_bss: float | None = None
     realized_ece: float | None = None
+    cal_bins: tuple[CalibrationBinMetrics, ...] = ()
     if settled_pairs:
         y = np.array([pair[0] for pair in settled_pairs], dtype=np.float64)
         p = np.array([pair[1] for pair in settled_pairs], dtype=np.float64)
         realized_brier = float(np.mean((p - y) ** 2))
+        naive_p = float(np.mean(y))
+        naive_brier = float(np.mean((naive_p - y) ** 2))
+        realized_bss = compute_brier_skill_score(realized_brier, naive_brier)
         realized_ece = compute_ece(y, p, n_bins=5)
+        cal_bins = compute_calibration_bins(y, p, n_bins=5)
 
     alerts: list[str] = []
     if len(settled_pairs) < min_settled:
@@ -320,9 +331,11 @@ def compute_shadow_monitoring_report(
         abstained_count=abstained_count,
         abstention_rate=abstention_rate,
         realized_brier=realized_brier,
+        realized_brier_skill_score=realized_bss,
         realized_ece=realized_ece,
         mean_max_zscore=mean_z,
         drift_alert_count=drift_alerts,
         is_healthy=(not alerts),
         alerts=tuple(alerts),
+        calibration_bins=cal_bins,
     )
