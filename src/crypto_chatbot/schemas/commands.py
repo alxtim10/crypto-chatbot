@@ -21,6 +21,7 @@ class AnalyzeCommandArgs(BaseModel):
 
     symbol: str
     timeframe: Timeframe
+    detail: bool = False
 
     @field_validator("symbol", mode="before")
     @classmethod

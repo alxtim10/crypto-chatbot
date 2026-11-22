@@ -12,7 +12,7 @@ from crypto_chatbot.schemas.llm import LlmAnalysisNarration
 
 _BRACED_TOKEN_RE = re.compile(r"\{([^}]*)\}")
 _VALID_FACT_BODY_RE = re.compile(r"^F[1-9][0-9]*$")
-_TIMEFRAME_TOKEN_RE = re.compile(r"\b(?:1h|4h|1d)\b", re.IGNORECASE)
+_TIMEFRAME_TOKEN_RE = re.compile(r"\b(?:15m|15\s*menit|1h|4h|1d)\b", re.IGNORECASE)
 _PAIR_MENTION_RE = re.compile(r"\b[A-Z0-9]{2,10}/USDT(?::USDT)?\b")
 _URL_RE = re.compile(r"(?:https?://|www\.)", re.IGNORECASE)
 _SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -130,6 +130,10 @@ def _build_allowlist_patterns(
         if band_bps is not None:
             patterns.append(re.compile(rf"\b{band_bps}\s*bps\b", re.IGNORECASE))
 
+    tp_levels = _int_param(indicator_parameters, "trade_setup_tp_levels")
+    if tp_levels is not None and tp_levels >= 3:
+        patterns.append(re.compile(r"\bTP\s*[123]\b", re.IGNORECASE))
+
     for symbol in allowed_symbols:
         if symbol:
             patterns.append(re.compile(re.escape(symbol), re.IGNORECASE))
@@ -167,7 +171,8 @@ def validate_narration(
         if fid not in known_fact_ids:
             reasons.append(f"unknown_fact_id:{fid}")
 
-    allowed_symbols: list[str] = [snapshot.canonical_symbol, snapshot.provider_symbol]
+    base_ticker = snapshot.canonical_symbol.split("/")[0]
+    allowed_symbols: list[str] = [snapshot.canonical_symbol, snapshot.provider_symbol, base_ticker]
     allowed_pairs: set[str] = {snapshot.canonical_symbol.upper()}
     if snapshot.derivatives is not None:
         for deriv_sym in (

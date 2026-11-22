@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict
 
 from crypto_chatbot.bot.templates import (
     format_fact_value,
+    render_compact_snapshot,
     render_deterministic_snapshot,
 )
 from crypto_chatbot.llm.guard import validate_narration
@@ -74,14 +75,30 @@ def render_analysis_response(
     response: AnalysisResponse,
     *,
     html_mode: bool = False,
+    compact: bool = False,
 ) -> str:
     """Render backend facts first, plus validated Gemini narration if generated."""
-    base = render_deterministic_snapshot(response.snapshot, html_mode=html_mode)
+    base = (
+        render_compact_snapshot(response.snapshot, html_mode=html_mode)
+        if compact
+        else render_deterministic_snapshot(response.snapshot, html_mode=html_mode)
+    )
     if response.narration_status is not NarrationStatus.GENERATED or response.narration is None:
         return base
 
     rendered = render_narration(response.narration, response.snapshot)
-    lines: list[str] = [base, "", _bold("Penjelasan Narasi (Tervalidasi)", html_mode)]
+    if compact:
+        lines: list[str] = [base, "", _bold("Penjelasan Narasi (Tervalidasi)", html_mode)]
+        lines.append(_esc(rendered.summary, html_mode))
+        if rendered.supporting_factors:
+            lines.append(f"• Bull: {_esc(rendered.supporting_factors[0], html_mode)}")
+        if rendered.contradicting_factors:
+            lines.append(f"• Bear/Risiko: {_esc(rendered.contradicting_factors[0], html_mode)}")
+        lines.append(f"• Skenario naik: {_esc(rendered.bullish_scenario, html_mode)}")
+        lines.append(f"• Skenario turun: {_esc(rendered.bearish_scenario, html_mode)}")
+        return "\n".join(lines)
+
+    lines = [base, "", _bold("Penjelasan Narasi (Tervalidasi)", html_mode)]
     lines.append(f"Ringkasan: {_esc(rendered.summary, html_mode)}")
 
     if rendered.supporting_factors:
@@ -109,6 +126,7 @@ def render_comparison_response(
     responses: tuple[AnalysisResponse, ...] | list[AnalysisResponse],
     *,
     html_mode: bool = True,
+    compact: bool = True,
 ) -> str:
     """Render side-by-side descriptive comparison strictly from backend snapshots."""
     if not responses:
@@ -122,6 +140,6 @@ def render_comparison_response(
 
     for resp in responses:
         lines.append("")
-        lines.append(render_analysis_response(resp, html_mode=html_mode))
+        lines.append(render_analysis_response(resp, html_mode=html_mode, compact=compact))
 
     return "\n".join(lines)

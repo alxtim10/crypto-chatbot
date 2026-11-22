@@ -172,6 +172,7 @@ class BotService:
                 symbol=parsed.symbol,
                 timeframe=parsed.timeframe,
                 user_text=f"/analyze {' '.join(args)}".strip(),
+                compact=not parsed.detail,
             )
         except CommandParseError as exc:
             return split_telegram_message(
@@ -337,6 +338,7 @@ class BotService:
                     symbol=intent.symbol,
                     timeframe=intent.timeframe,
                     user_text=text,
+                    compact=True,
                 )
             if isinstance(intent, CompareIntent):
                 return await self._execute_comparison(
@@ -361,6 +363,7 @@ class BotService:
         symbol: str,
         timeframe: Timeframe,
         user_text: str,
+        compact: bool = True,
     ) -> tuple[str, ...]:
         context = self._memory.build_context_for_llm(user_id, current_question=user_text)
         snapshot = await self._analysis_service.analyze(symbol, timeframe)
@@ -384,7 +387,7 @@ class BotService:
             snapshot.quality_status.value,
             outcome.response.narration_status.value,
         )
-        rendered = render_analysis_response(outcome.response, html_mode=True)
+        rendered = render_analysis_response(outcome.response, html_mode=True, compact=compact)
         return split_telegram_message(rendered, TELEGRAM_MAX_MESSAGE_LENGTH)
 
     async def _execute_comparison(
@@ -426,7 +429,7 @@ class BotService:
             snapshots=snapshots,
             narrations=narrations,
         )
-        rendered = render_comparison_response(responses, html_mode=True)
+        rendered = render_comparison_response(responses, html_mode=True, compact=True)
         return split_telegram_message(rendered, TELEGRAM_MAX_MESSAGE_LENGTH)
 
 

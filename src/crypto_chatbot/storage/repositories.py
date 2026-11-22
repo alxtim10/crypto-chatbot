@@ -11,7 +11,7 @@ from sqlalchemy import Engine, delete, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
-from crypto_chatbot.schemas.analysis import AnalysisSnapshot
+from crypto_chatbot.schemas.analysis import AnalysisSnapshot, TradeSetup
 from crypto_chatbot.schemas.derivatives import (
     FundingRateObservation,
     LiquidationEvent,
@@ -38,6 +38,7 @@ from crypto_chatbot.storage.models import (
     MessageRow,
     OpenInterestRow,
     OrderBookSnapshotRow,
+    TradeSetupRow,
     UserPreferenceRow,
     UserRow,
 )
@@ -116,6 +117,36 @@ class PurgeResult(BaseModel):
     deleted_snapshots: int = Field(ge=0)
 
 
+class TradeSetupRecord(BaseModel):
+    """Persisted conditional trade setup and objective settlement state (`trade_setups`)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    snapshot_id: str
+    venue: str
+    canonical_symbol: str
+    timeframe: Timeframe
+    as_of: UtcDatetime
+    status: str
+    bias: str
+    entry_source: str | None = None
+    wait_reason: str | None = None
+    reference_price: float = Field(gt=0)
+    entry_low: float | None = Field(default=None, gt=0)
+    entry_high: float | None = Field(default=None, gt=0)
+    entry_mid: float | None = Field(default=None, gt=0)
+    stop_loss: float | None = Field(default=None, gt=0)
+    tp1: float | None = Field(default=None, gt=0)
+    tp2: float | None = Field(default=None, gt=0)
+    tp3: float | None = Field(default=None, gt=0)
+    rr_tp1: float | None = Field(default=None, gt=0)
+    rr_tp2: float | None = Field(default=None, gt=0)
+    rr_tp3: float | None = Field(default=None, gt=0)
+    outcome_status: str = "pending"
+    settled_at: UtcDatetime | None = None
+    realized_r: float | None = None
+
+
 class MarketRepository(Protocol):
     """Repository interface for immutable candles and deterministic snapshots."""
 
@@ -189,6 +220,36 @@ class DerivativesRepository(Protocol):
         end_available_time: datetime | None = None,
         limit: int | None = None,
     ) -> tuple[LiquidationEvent, ...]: ...
+
+
+class SetupLogRepository(Protocol):
+    """Repository interface for persistent deterministic trade setups & outcome settlement."""
+
+    def save_setup(
+        self,
+        snapshot: AnalysisSnapshot,
+        setup: TradeSetup,
+    ) -> bool: ...
+
+    def get_setup(self, snapshot_id: str) -> TradeSetupRecord | None: ...
+
+    def list_pending_setups(self, *, limit: int = 100) -> tuple[TradeSetupRecord, ...]: ...
+
+    def list_recent_setups(
+        self,
+        *,
+        canonical_symbol: str | None = None,
+        limit: int = 20,
+    ) -> tuple[TradeSetupRecord, ...]: ...
+
+    def update_settlement(
+        self,
+        snapshot_id: str,
+        *,
+        outcome_status: str,
+        settled_at: datetime | None,
+        realized_r: float | None,
+    ) -> bool: ...
 
 
 class UserMemoryRepository(Protocol):
@@ -998,3 +1059,134 @@ class PostgresDerivativesRepository:
             )
             for row in db_rows
         )
+
+
+def _row_to_setup_record(row: TradeSetupRow) -> TradeSetupRecord:
+    return TradeSetupRecord(
+        snapshot_id=row.snapshot_id,
+        venue=row.venue,
+        canonical_symbol=row.canonical_symbol,
+        timeframe=Timeframe(row.timeframe),
+        as_of=_to_utc(row.as_of),
+        status=row.status,
+        bias=row.bias,
+        entry_source=row.entry_source,
+        wait_reason=row.wait_reason,
+        reference_price=row.reference_price,
+        entry_low=row.entry_low,
+        entry_high=row.entry_high,
+        entry_mid=row.entry_mid,
+        stop_loss=row.stop_loss,
+        tp1=row.tp1,
+        tp2=row.tp2,
+        tp3=row.tp3,
+        rr_tp1=row.rr_tp1,
+        rr_tp2=row.rr_tp2,
+        rr_tp3=row.rr_tp3,
+        outcome_status=row.outcome_status,
+        settled_at=_to_utc(row.settled_at) if row.settled_at else None,
+        realized_r=row.realized_r,
+    )
+
+
+class PostgresSetupLogRepository:
+    """Synchronous PostgreSQL setup log & settlement repository (`trade_setups`)."""
+
+    def __init__(self, engine: Engine) -> None:
+        self._engine = engine
+
+    def save_setup(
+        self,
+        snapshot: AnalysisSnapshot,
+        setup: TradeSetup,
+    ) -> bool:
+        if snapshot.technical is None:
+            return False
+        payload = {
+            "snapshot_id": snapshot.snapshot_id,
+            "venue": snapshot.venue,
+            "canonical_symbol": snapshot.canonical_symbol,
+            "timeframe": snapshot.timeframe.value,
+            "as_of": snapshot.as_of,
+            "created_at": datetime.now(UTC),
+            "status": setup.status.value,
+            "bias": setup.bias.value,
+            "entry_source": setup.entry_source,
+            "wait_reason": setup.wait_reason,
+            "reference_price": snapshot.technical.last_close,
+            "entry_low": setup.entry_low,
+            "entry_high": setup.entry_high,
+            "entry_mid": setup.entry_mid,
+            "stop_loss": setup.stop_loss,
+            "tp1": setup.tp1,
+            "tp2": setup.tp2,
+            "tp3": setup.tp3,
+            "rr_tp1": setup.rr_tp1,
+            "rr_tp2": setup.rr_tp2,
+            "rr_tp3": setup.rr_tp3,
+            "outcome_status": "skipped_wait" if setup.status.value == "wait" else "pending",
+            "settled_at": None,
+            "realized_r": None,
+        }
+        stmt = (
+            insert(TradeSetupRow)
+            .values(payload)
+            .on_conflict_do_nothing(index_elements=["snapshot_id"])
+            .returning(TradeSetupRow.id)
+        )
+        with Session(self._engine) as session, session.begin():
+            return bool(session.scalars(stmt).all())
+
+    def get_setup(self, snapshot_id: str) -> TradeSetupRecord | None:
+        stmt = select(TradeSetupRow).where(TradeSetupRow.snapshot_id == snapshot_id)
+        with Session(self._engine) as session:
+            row = session.scalar(stmt)
+        return _row_to_setup_record(row) if row is not None else None
+
+    def list_pending_setups(self, *, limit: int = 100) -> tuple[TradeSetupRecord, ...]:
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        stmt = (
+            select(TradeSetupRow)
+            .where(TradeSetupRow.outcome_status.in_(("pending", "entry_triggered")))
+            .order_by(TradeSetupRow.as_of.asc())
+            .limit(limit)
+        )
+        with Session(self._engine) as session:
+            rows = list(session.scalars(stmt))
+        return tuple(_row_to_setup_record(row) for row in rows)
+
+    def list_recent_setups(
+        self,
+        *,
+        canonical_symbol: str | None = None,
+        limit: int = 20,
+    ) -> tuple[TradeSetupRecord, ...]:
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        stmt = select(TradeSetupRow)
+        if canonical_symbol is not None:
+            stmt = stmt.where(TradeSetupRow.canonical_symbol == canonical_symbol)
+        stmt = stmt.order_by(TradeSetupRow.as_of.desc(), TradeSetupRow.id.desc()).limit(limit)
+        with Session(self._engine) as session:
+            rows = list(session.scalars(stmt))
+        return tuple(_row_to_setup_record(row) for row in rows)
+
+    def update_settlement(
+        self,
+        snapshot_id: str,
+        *,
+        outcome_status: str,
+        settled_at: datetime | None,
+        realized_r: float | None,
+    ) -> bool:
+        with Session(self._engine) as session, session.begin():
+            row = session.scalar(
+                select(TradeSetupRow).where(TradeSetupRow.snapshot_id == snapshot_id)
+            )
+            if row is None:
+                return False
+            row.outcome_status = outcome_status
+            row.settled_at = _to_utc(settled_at) if settled_at is not None else None
+            row.realized_r = realized_r
+            return True

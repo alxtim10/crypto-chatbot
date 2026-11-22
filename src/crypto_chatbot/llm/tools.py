@@ -14,8 +14,7 @@ from crypto_chatbot.schemas.analysis import AnalysisSnapshot
 from crypto_chatbot.schemas.commands import AnalyzeCommandArgs, CompareCommandArgs
 
 ALLOWED_TOOL_NAMES: frozenset[str] = frozenset({"analyze_coin", "compare_coins"})
-_MVP_TOOL_SYMBOLS = ["BTC", "ETH", "SOL", "BTC/USDT", "ETH/USDT", "SOL/USDT"]
-_MVP_TOOL_TIMEFRAMES = ["1h", "4h", "1d"]
+_MVP_TOOL_TIMEFRAMES = ["15m", "1h", "4h", "1d"]
 
 
 class ToolError(ValueError):
@@ -32,12 +31,12 @@ class ToolExecutionResult(BaseModel):
 
 
 def build_gemini_tool_declarations() -> list[types.Tool]:
-    """Return narrow `google-genai` tool declarations strictly scoped to MVP spot analysis."""
+    """Return narrow `google-genai` tool declarations strictly scoped to Binance spot analysis."""
     analyze_decl = types.FunctionDeclaration(
         name="analyze_coin",
         description=(
             "Run deterministic spot market technical analysis on Binance closed candles "
-            "for one supported cryptocurrency pair."
+            "for one supported /USDT cryptocurrency pair."
         ),
         parameters_json_schema={
             "type": "object",
@@ -45,8 +44,9 @@ def build_gemini_tool_declarations() -> list[types.Tool]:
             "properties": {
                 "symbol": {
                     "type": "string",
-                    "enum": _MVP_TOOL_SYMBOLS,
-                    "description": "Supported MVP spot symbol.",
+                    "description": (
+                        "Binance /USDT spot symbol or base ticker (e.g. BTC, ETH, DOGE, SUI/USDT)."
+                    ),
                 },
                 "timeframe": {
                     "type": "string",
@@ -61,7 +61,7 @@ def build_gemini_tool_declarations() -> list[types.Tool]:
         name="compare_coins",
         description=(
             "Run deterministic side-by-side spot technical analysis for 2 or 3 distinct "
-            "supported cryptocurrency pairs on the same timeframe."
+            "Binance /USDT spot cryptocurrency pairs on the same timeframe."
         ),
         parameters_json_schema={
             "type": "object",
@@ -73,9 +73,8 @@ def build_gemini_tool_declarations() -> list[types.Tool]:
                     "maxItems": 3,
                     "items": {
                         "type": "string",
-                        "enum": _MVP_TOOL_SYMBOLS,
                     },
-                    "description": "Distinct supported MVP spot symbols.",
+                    "description": "Distinct Binance /USDT spot symbols or base tickers.",
                 },
                 "timeframe": {
                     "type": "string",

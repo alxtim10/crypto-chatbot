@@ -13,8 +13,9 @@ from pathlib import Path
 from typing import Any
 
 from crypto_chatbot.analysis.service import AnalysisService, build_analysis_snapshot
+from crypto_chatbot.analysis.setup import evaluate_setup_against_candles
 from crypto_chatbot.app import run_polling
-from crypto_chatbot.bot.templates import render_deterministic_snapshot
+from crypto_chatbot.bot.templates import render_compact_snapshot, render_deterministic_snapshot
 from crypto_chatbot.config import ConfigError, load_settings
 from crypto_chatbot.market_data.ccxt_provider import CcxtMarketDataProvider
 from crypto_chatbot.market_data.derivatives_provider import CcxtDerivativesLiquidityProvider
@@ -40,7 +41,9 @@ from crypto_chatbot.storage.repositories import (
     MarketRepository,
     PostgresDerivativesRepository,
     PostgresMarketRepository,
+    PostgresSetupLogRepository,
     PostgresUserMemoryRepository,
+    SetupLogRepository,
 )
 
 
@@ -56,13 +59,23 @@ def _check_config() -> int:
     return 0
 
 
-def _build_repositories_from_env() -> tuple[MarketRepository, DerivativesRepository, Any]:
+def _build_repositories_from_env() -> tuple[
+    MarketRepository,
+    DerivativesRepository,
+    SetupLogRepository,
+    Any,
+]:
     database_url = os.environ.get("DATABASE_URL", "").strip()
     if not database_url:
         raise ValueError("DATABASE_URL environment variable is required when --persist is set")
     engine = create_db_engine(database_url)
     init_db(engine)
-    return PostgresMarketRepository(engine), PostgresDerivativesRepository(engine), engine
+    return (
+        PostgresMarketRepository(engine),
+        PostgresDerivativesRepository(engine),
+        PostgresSetupLogRepository(engine),
+        engine,
+    )
 
 
 def _load_derivatives_fixture(
@@ -161,6 +174,7 @@ def _analyze_from_fixture(
     derivatives_fixture_path: Path | None,
     repository: MarketRepository | None,
     derivatives_repository: DerivativesRepository | None,
+    setup_repository: SetupLogRepository | None = None,
 ) -> AnalysisSnapshot:
     mapping = resolve_mvp_spot_symbol(symbol)
     if not fixture_path.is_file():
@@ -209,6 +223,8 @@ def _analyze_from_fixture(
         if batch.candles:
             repository.save_candles(batch.candles)
         repository.save_snapshot(snapshot)
+    if setup_repository is not None and snapshot.trade_setup is not None:
+        setup_repository.save_setup(snapshot, snapshot.trade_setup)
     return snapshot
 
 
@@ -220,6 +236,7 @@ async def _analyze_live(
     include_derivatives: bool,
     repository: MarketRepository | None,
     derivatives_repository: DerivativesRepository | None,
+    setup_repository: SetupLogRepository | None = None,
 ) -> AnalysisSnapshot:
     async with CcxtMarketDataProvider() as provider:
         if include_derivatives:
@@ -229,6 +246,7 @@ async def _analyze_live(
                     repository=repository,
                     derivatives_provider=deriv_provider,
                     derivatives_repository=derivatives_repository,
+                    setup_repository=setup_repository,
                 )
                 return await service.analyze(
                     symbol,
@@ -237,7 +255,11 @@ async def _analyze_live(
                     include_derivatives=True,
                     persist=repository is not None,
                 )
-        service = AnalysisService(provider=provider, repository=repository)
+        service = AnalysisService(
+            provider=provider,
+            repository=repository,
+            setup_repository=setup_repository,
+        )
         return await service.analyze(
             symbol,
             timeframe,
@@ -254,6 +276,7 @@ def _run_analyze(
     fixture_path: Path | None,
     derivatives_fixture_path: Path | None,
     as_json: bool,
+    detail: bool,
     persist: bool,
     include_mtf: bool,
     include_derivatives: bool,
@@ -271,8 +294,11 @@ def _run_analyze(
 
         repository: MarketRepository | None = None
         derivatives_repository: DerivativesRepository | None = None
+        setup_repository: SetupLogRepository | None = None
         if persist:
-            repository, derivatives_repository, engine = _build_repositories_from_env()
+            repository, derivatives_repository, setup_repository, engine = (
+                _build_repositories_from_env()
+            )
 
         if fixture_path is not None:
             snapshot = _analyze_from_fixture(
@@ -282,6 +308,7 @@ def _run_analyze(
                 derivatives_fixture_path=derivatives_fixture_path,
                 repository=repository,
                 derivatives_repository=derivatives_repository,
+                setup_repository=setup_repository,
             )
         else:
             snapshot = asyncio.run(
@@ -292,6 +319,7 @@ def _run_analyze(
                     include_derivatives=include_derivatives,
                     repository=repository,
                     derivatives_repository=derivatives_repository,
+                    setup_repository=setup_repository,
                 )
             )
     except (SymbolError, ValueError, json.JSONDecodeError) as exc:
@@ -303,8 +331,55 @@ def _run_analyze(
 
     if as_json:
         print(snapshot.model_dump_json(indent=2))
-    else:
+    elif detail:
         print(render_deterministic_snapshot(snapshot, html_mode=False))
+    else:
+        print(render_compact_snapshot(snapshot, html_mode=False))
+    return 0
+
+
+def _run_settle_setups(max_bars: int = 24) -> int:
+    database_url = os.environ.get("DATABASE_URL", "").strip()
+    if not database_url:
+        print("Error: DATABASE_URL environment variable is required", file=sys.stderr)
+        return 1
+    try:
+        engine = create_db_engine(database_url)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    updated = 0
+    try:
+        init_db(engine)
+        market_repo = PostgresMarketRepository(engine)
+        setup_repo = PostgresSetupLogRepository(engine)
+        pending = setup_repo.list_pending_setups(limit=200)
+        for rec in pending:
+            future_candles = market_repo.load_candles(
+                venue=rec.venue,
+                canonical_symbol=rec.canonical_symbol,
+                market_type=MarketType.SPOT,
+                timeframe=rec.timeframe,
+                start_open_time=rec.as_of,
+            )
+            outcome_status, settled_at, realized_r = evaluate_setup_against_candles(
+                rec,
+                future_candles,
+                max_bars=max_bars,
+            )
+            if outcome_status != rec.outcome_status or settled_at != rec.settled_at:
+                setup_repo.update_settlement(
+                    rec.snapshot_id,
+                    outcome_status=outcome_status,
+                    settled_at=settled_at,
+                    realized_r=realized_r,
+                )
+                updated += 1
+    finally:
+        engine.dispose()
+
+    print(f"Settle setups completed: checked={len(pending)}, updated={updated}")
     return 0
 
 
@@ -355,8 +430,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         "analyze",
         help="Run deterministic technical analysis from a fixture or live CCXT data.",
     )
-    analyze_parser.add_argument("symbol", help="Target symbol (e.g. BTC, BTC/USDT, ETH, SOL).")
-    analyze_parser.add_argument("timeframe", help="Timeframe (1h, 4h, 1d).")
+    analyze_parser.add_argument(
+        "symbol",
+        help="Target Binance /USDT spot symbol (e.g. BTC, ETH, SOL, DOGE, PEPE, SUI/USDT).",
+    )
+    analyze_parser.add_argument(
+        "timeframe",
+        nargs="?",
+        default="4h",
+        help="Primary timeframe (default: 4h with automatic 1d -> 4h -> 1h -> 15m top-down).",
+    )
     analyze_parser.add_argument(
         "--fixture",
         type=Path,
@@ -373,6 +456,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--json",
         action="store_true",
         help="Print raw AnalysisSnapshot JSON instead of formatted Indonesian report.",
+    )
+    analyze_parser.add_argument(
+        "--detail",
+        action="store_true",
+        help="Print full [F1..Fn] audit dump instead of compact key points.",
     )
     analyze_parser.add_argument(
         "--persist",
@@ -397,6 +485,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         "purge-expired",
         help="Delete expired messages, interactions, and snapshots per retention policy.",
     )
+    settle_parser = subcommands.add_parser(
+        "settle-setups",
+        help="Evaluate pending logged trade setups objectively against stored closed candles.",
+    )
+    settle_parser.add_argument(
+        "--max-bars",
+        type=int,
+        default=24,
+        help="Maximum closed candles horizon after setup as_of (default: 24).",
+    )
 
     args = parser.parse_args(argv)
     if args.command == "check-config":
@@ -408,6 +506,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             fixture_path=args.fixture,
             derivatives_fixture_path=args.derivatives_fixture,
             as_json=args.json,
+            detail=args.detail,
             persist=args.persist,
             include_mtf=not args.no_mtf,
             include_derivatives=not args.no_derivatives,
@@ -416,6 +515,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_bot()
     if args.command == "purge-expired":
         return _run_purge_expired()
+    if args.command == "settle-setups":
+        return _run_settle_setups(max_bars=args.max_bars)
     parser.error(f"unknown command: {args.command}")  # pragma: no cover
 
 

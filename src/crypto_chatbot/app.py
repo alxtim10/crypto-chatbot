@@ -28,6 +28,7 @@ from crypto_chatbot.storage.database import create_db_engine, init_db
 from crypto_chatbot.storage.repositories import (
     PostgresDerivativesRepository,
     PostgresMarketRepository,
+    PostgresSetupLogRepository,
     PostgresUserMemoryRepository,
 )
 
@@ -61,6 +62,7 @@ def build_telegram_application(
 
     market_repo = PostgresMarketRepository(engine)
     derivatives_repo = PostgresDerivativesRepository(engine)
+    setup_repo = PostgresSetupLogRepository(engine)
     memory_repo = PostgresUserMemoryRepository(engine)
     provider = CcxtMarketDataProvider()
     derivatives_provider = CcxtDerivativesLiquidityProvider()
@@ -69,6 +71,7 @@ def build_telegram_application(
         repository=market_repo,
         derivatives_provider=derivatives_provider,
         derivatives_repository=derivatives_repo,
+        setup_repository=setup_repo,
     )
 
     transport = GoogleGenAiTransport(

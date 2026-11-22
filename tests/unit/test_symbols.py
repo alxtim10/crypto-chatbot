@@ -22,6 +22,10 @@ from crypto_chatbot.schemas.market import MarketType
         ("BTC spot", "BTC/USDT", "BINANCE:BTCUSDT"),
         ("ETH", "ETH/USDT", "BINANCE:ETHUSDT"),
         ("SOL/USDT", "SOL/USDT", "BINANCE:SOLUSDT"),
+        ("DOGE", "DOGE/USDT", "BINANCE:DOGEUSDT"),
+        ("DOGE/USDT", "DOGE/USDT", "BINANCE:DOGEUSDT"),
+        ("sui", "SUI/USDT", "BINANCE:SUIUSDT"),
+        ("1000PEPE/USDT", "1000PEPE/USDT", "BINANCE:1000PEPEUSDT"),
     ],
 )
 def test_resolve_spot_symbols(
@@ -48,6 +52,7 @@ def test_resolve_spot_symbols(
         ("BINANCE:BTCUSDT.P", "BTC/USDT:USDT", "BINANCE:BTCUSDT.P"),
         ("ETH perpetual", "ETH/USDT:USDT", "BINANCE:ETHUSDT.P"),
         ("SOLUSDT.P", "SOL/USDT:USDT", "BINANCE:SOLUSDT.P"),
+        ("DOGE perpetual", "DOGE/USDT:USDT", "BINANCE:DOGEUSDT.P"),
     ],
 )
 def test_resolve_perpetual_symbols(
@@ -97,8 +102,8 @@ def test_explicit_spot_symbols_rejected_when_resolving_perpetual(raw: str) -> No
     [
         "",
         "   ",
-        "DOGE",
-        "DOGE/USDT",
+        "USDT",
+        "12345",
         "BTC/EUR",
         "BTC/USDT/ETH",
         "BINANCE:BTCBUSD",

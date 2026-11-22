@@ -66,10 +66,18 @@ def test_cli_analyze_fixture_ready_without_secrets(
     assert "BTC/USDT (4h)" in out
     assert "BINANCE spot" in out
     assert "Status kualitas: READY" in out
+    assert "Skenario Setup" in out
     assert "UTC (" in out
     assert "WIB)" in out
     assert "[F1]" in out
     assert "Disclaimer:" in out
+
+    # --detail produces full backend audit output longer than default compact summary
+    rc_detail = cli.main(["analyze", "BTC", "4h", "--fixture", str(FIXTURE_1000), "--detail"])
+    assert rc_detail == 0
+    detail_out = capsys.readouterr().out
+    assert len(detail_out) > len(out)
+    assert "MACD line (12/26)" in detail_out
 
 
 def test_cli_analyze_fixture_json_is_deterministic(
@@ -93,12 +101,16 @@ def test_cli_analyze_short_fixture_returns_insufficient_data(
     assert rc == 0
     assert "INSUFFICIENT_DATA" in capsys.readouterr().out
 
+    rc_alt = cli.main(["analyze", "DOGE", "15m", "--fixture", str(FIXTURE_1000)])
+    assert rc_alt == 0
+    assert "DOGE/USDT (15m)" in capsys.readouterr().out
+
 
 @pytest.mark.parametrize(
     "argv",
     [
-        ["analyze", "DOGE", "4h", "--fixture", str(FIXTURE_1000)],
-        ["analyze", "BTC", "15m", "--fixture", str(FIXTURE_1000)],
+        ["analyze", "BTC/EUR", "4h", "--fixture", str(FIXTURE_1000)],
+        ["analyze", "BTC", "5m", "--fixture", str(FIXTURE_1000)],
         ["analyze", "BTC", "4h", "--fixture", "does-not-exist.json"],
     ],
 )

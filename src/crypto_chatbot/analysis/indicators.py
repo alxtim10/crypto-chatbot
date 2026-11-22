@@ -21,7 +21,7 @@ from crypto_chatbot.schemas.market import (
     UtcDatetime,
 )
 
-CALC_VERSION = "1.1.0"
+CALC_VERSION = "1.3.0"
 
 INDICATOR_PARAMETERS: dict[str, int | float | str] = {
     "return_short": 1,

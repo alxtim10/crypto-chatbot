@@ -379,3 +379,48 @@ class LiquidationEventRow(Base):
     quote_currency: Mapped[str] = mapped_column(String(32), nullable=False)
     event_key: Mapped[str] = mapped_column(String(64), nullable=False)
     raw_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+
+
+class TradeSetupRow(Base):
+    """Deterministic setup log (`trade_setups`) with TradingAgents-style outcome settlement."""
+
+    __tablename__ = "trade_setups"
+    __table_args__ = (
+        Index(
+            "ix_trade_setups_lookup",
+            "venue",
+            "canonical_symbol",
+            "timeframe",
+            "as_of",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    snapshot_id: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
+    venue: Mapped[str] = mapped_column(String(64), nullable=False)
+    canonical_symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    timeframe: Mapped[str] = mapped_column(String(16), nullable=False)
+    as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(UTC),
+    )
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    bias: Mapped[str] = mapped_column(String(16), nullable=False)
+    entry_source: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    wait_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reference_price: Mapped[float] = mapped_column(Double, nullable=False)
+    entry_low: Mapped[float | None] = mapped_column(Double, nullable=True)
+    entry_high: Mapped[float | None] = mapped_column(Double, nullable=True)
+    entry_mid: Mapped[float | None] = mapped_column(Double, nullable=True)
+    stop_loss: Mapped[float | None] = mapped_column(Double, nullable=True)
+    tp1: Mapped[float | None] = mapped_column(Double, nullable=True)
+    tp2: Mapped[float | None] = mapped_column(Double, nullable=True)
+    tp3: Mapped[float | None] = mapped_column(Double, nullable=True)
+    rr_tp1: Mapped[float | None] = mapped_column(Double, nullable=True)
+    rr_tp2: Mapped[float | None] = mapped_column(Double, nullable=True)
+    rr_tp3: Mapped[float | None] = mapped_column(Double, nullable=True)
+    outcome_status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    realized_r: Mapped[float | None] = mapped_column(Double, nullable=True)

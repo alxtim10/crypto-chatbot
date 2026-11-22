@@ -12,7 +12,8 @@ from pathlib import Path
 
 import pytest
 
-from crypto_chatbot.analysis.service import AnalysisService
+from crypto_chatbot.analysis.service import AnalysisService, build_analysis_snapshot
+from crypto_chatbot.analysis.setup import evaluate_setup_against_candles
 from crypto_chatbot.market_data.base import DEFAULT_CANDLE_LIMIT, OhlcvBatch
 from crypto_chatbot.market_data.derivatives_quality import (
     normalize_funding_rate_payload,
@@ -28,6 +29,7 @@ from crypto_chatbot.storage.repositories import (
     LlmInteractionRecord,
     PostgresDerivativesRepository,
     PostgresMarketRepository,
+    PostgresSetupLogRepository,
     PostgresUserMemoryRepository,
     UserPreferences,
 )
@@ -379,3 +381,51 @@ def test_postgres_derivatives_repository_persistence_and_point_in_time(
         canonical_symbol=perp.canonical_symbol,
     )
     assert len(loaded_liqs) == 2
+
+
+def test_postgres_setup_log_repository_lifecycle(
+    pg_repository: PostgresMarketRepository,
+) -> None:
+    setup_repo = PostgresSetupLogRepository(pg_repository._engine)
+    data = json.loads(FIXTURE_1000.read_text(encoding="utf-8"))
+    raw = data["raw_ohlcv"]
+    last_open = datetime.fromtimestamp(float(raw[-1][0]) / 1000.0, tz=UTC)
+    received = last_open + Timeframe.H4.duration + timedelta(seconds=2)
+    batch = normalize_ohlcv_rows(
+        raw,
+        symbol=resolve_mvp_spot_symbol("BTC"),
+        timeframe=Timeframe.H4,
+        received_time=received,
+        now=received,
+    )
+    snap = build_analysis_snapshot(batch)
+    assert snap.trade_setup is not None
+
+    assert setup_repo.save_setup(snap, snap.trade_setup) is True
+    assert setup_repo.save_setup(snap, snap.trade_setup) is False
+
+    loaded = setup_repo.get_setup(snap.snapshot_id)
+    assert loaded is not None
+    assert loaded.snapshot_id == snap.snapshot_id
+
+    recent = setup_repo.list_recent_setups(canonical_symbol="BTC/USDT", limit=5)
+    assert len(recent) == 1
+
+    # Verify update_settlement transitions outcome cleanly
+    assert (
+        setup_repo.update_settlement(
+            snap.snapshot_id,
+            outcome_status="hit_tp1",
+            settled_at=received + timedelta(hours=4),
+            realized_r=1.0,
+        )
+        is True
+    )
+    updated = setup_repo.get_setup(snap.snapshot_id)
+    assert updated is not None
+    assert updated.outcome_status == "hit_tp1"
+    assert updated.realized_r == 1.0
+    assert setup_repo.list_pending_setups() == ()
+    assert evaluate_setup_against_candles(updated, ()) == ("pending", None, None) or (
+        updated.status != "ready"
+    )

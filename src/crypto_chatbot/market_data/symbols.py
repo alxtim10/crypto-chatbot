@@ -65,16 +65,56 @@ _EXPLICIT_SPOT_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^([A-Z0-9]+)(?:[-_ ]?SPOT)$"),
 )
 
-_BARE_BASE_PATTERN = re.compile(r"^([A-Z0-9]{2,10})$")
+_DISALLOWED_BASES: frozenset[str] = frozenset(
+    {
+        "USDT",
+        "USD",
+        "BUSD",
+        "FDUSD",
+        "USDC",
+        "TUSD",
+        "DAI",
+        "EUR",
+        "GBP",
+        "JPY",
+        "IDR",
+        "SPOT",
+        "PERP",
+        "PERPETUAL",
+        "FUTURES",
+    }
+)
+_VALID_BASE_RE = re.compile(r"^(?=[A-Z0-9]*[A-Z])[A-Z0-9]{2,12}$")
+
+_BARE_BASE_PATTERN = re.compile(r"^([A-Z0-9]{2,12})$")
 
 
 def _lookup(base: str, market_type: MarketType) -> SymbolMapping:
+    if base in _DISALLOWED_BASES or _VALID_BASE_RE.match(base) is None:
+        raise SymbolError(f"unsupported or invalid symbol '{base}'")
+
     table = _SPOT_MAPPINGS if market_type is MarketType.SPOT else _PERPETUAL_MAPPINGS
     mapping = table.get(base)
-    if mapping is None:
-        supported = ", ".join(SUPPORTED_MVP_BASES)
-        raise SymbolError(f"unsupported symbol '{base}' (supported bases: {supported})")
-    return mapping
+    if mapping is not None:
+        return mapping
+
+    if market_type is MarketType.SPOT:
+        return SymbolMapping(
+            base=base,
+            quote="USDT",
+            market_type=MarketType.SPOT,
+            canonical_symbol=f"{base}/USDT",
+            ccxt_symbol=f"{base}/USDT",
+            provider_symbol=f"BINANCE:{base}USDT",
+        )
+    return SymbolMapping(
+        base=base,
+        quote="USDT",
+        market_type=MarketType.PERPETUAL,
+        canonical_symbol=f"{base}/USDT:USDT",
+        ccxt_symbol=f"{base}/USDT:USDT",
+        provider_symbol=f"BINANCE:{base}USDT.P",
+    )
 
 
 def resolve_symbol(raw: str, *, market_type: MarketType = MarketType.SPOT) -> SymbolMapping:

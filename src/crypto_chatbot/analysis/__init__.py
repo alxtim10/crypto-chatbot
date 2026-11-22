@@ -53,6 +53,12 @@ from crypto_chatbot.analysis.service import (
     build_analysis_snapshot,
     compute_candles_sha256,
 )
+from crypto_chatbot.analysis.setup import (
+    SETUP_PARAMETERS,
+    build_trade_setup,
+    evaluate_setup_against_candles,
+)
+from crypto_chatbot.analysis.smc import analyze_smc
 from crypto_chatbot.analysis.structure import (
     DEFAULT_PIVOT_K,
     StructureAnalysis,
@@ -79,6 +85,7 @@ __all__ = [
     "MIN_HISTORY_RETURN_20",
     "MIN_HISTORY_RSI_14",
     "RANGING_ADX_MAX",
+    "SETUP_PARAMETERS",
     "TRENDING_ADX_MIN",
     "AnalysisService",
     "DerivativesAnalysisResult",
@@ -88,10 +95,12 @@ __all__ = [
     "StructureAnalysis",
     "adx_dmi_series",
     "analyze_market_structure",
+    "analyze_smc",
     "atr_percentile_series",
     "atr_series",
     "build_analysis_snapshot",
     "build_factors",
+    "build_trade_setup",
     "classify_regime",
     "compute_candles_sha256",
     "compute_derivatives_metrics",
@@ -101,6 +110,7 @@ __all__ = [
     "detect_confirmed_swings",
     "detect_failed_breakouts",
     "ema_series",
+    "evaluate_setup_against_candles",
     "macd_series",
     "relative_volume_series",
     "rma_series",

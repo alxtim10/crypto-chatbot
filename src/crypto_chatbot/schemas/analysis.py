@@ -52,6 +52,158 @@ class StructureEventType(StrEnum):
     SWING_LOW = "swing_low"
     FAILED_BREAKOUT_BULLISH = "failed_breakout_bullish"
     FAILED_BREAKOUT_BEARISH = "failed_breakout_bearish"
+    BOS_BULLISH = "bos_bullish"
+    BOS_BEARISH = "bos_bearish"
+    CHOCH_BULLISH = "choch_bullish"
+    CHOCH_BEARISH = "choch_bearish"
+    LIQUIDITY_SWEEP_BULLISH = "liquidity_sweep_bullish"
+    LIQUIDITY_SWEEP_BEARISH = "liquidity_sweep_bearish"
+
+
+class DealingZone(StrEnum):
+    DISCOUNT = "discount"
+    EQUILIBRIUM = "equilibrium"
+    PREMIUM = "premium"
+
+
+class PriceZone(BaseModel):
+    """Causal unmitigated FVG or Order Block price zone."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    zone_type: Literal["bullish_fvg", "bearish_fvg", "bullish_ob", "bearish_ob"]
+    zone_low: FiniteFloat = Field(gt=0)
+    zone_high: FiniteFloat = Field(gt=0)
+    event_time: UtcDatetime
+    confirmation_time: UtcDatetime
+    mitigated: bool = False
+
+    @model_validator(mode="after")
+    def _validate_zone(self) -> PriceZone:
+        if self.zone_high < self.zone_low:
+            raise ValueError("zone_high must be >= zone_low")
+        if self.confirmation_time < self.event_time:
+            raise ValueError("confirmation_time cannot be earlier than event_time")
+        return self
+
+
+class SmcSummary(BaseModel):
+    """Hybrid causal Smart Money Concepts measurements for crypto."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    latest_structure_break: StructureEvent | None = None
+    latest_sweep: StructureEvent | None = None
+    active_bullish_fvg: PriceZone | None = None
+    active_bearish_fvg: PriceZone | None = None
+    active_bullish_ob: PriceZone | None = None
+    active_bearish_ob: PriceZone | None = None
+    dealing_range_high: FiniteFloat | None = Field(default=None, gt=0)
+    dealing_range_low: FiniteFloat | None = Field(default=None, gt=0)
+    equilibrium: FiniteFloat | None = Field(default=None, gt=0)
+    position_in_range: FiniteFloat | None = None
+    dealing_zone: DealingZone | None = None
+
+
+class TimeframeOverview(BaseModel):
+    """Deterministic summary of structure, SMC, and S/R for one timeframe in the top-down chain."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    timeframe: Timeframe
+    trend_label: str | None = None
+    market_structure: MarketStructure | None = None
+    structure_break: StructureEventType | None = None
+    structure_break_level: FiniteFloat | None = Field(default=None, gt=0)
+    sweep: StructureEventType | None = None
+    dealing_zone: DealingZone | None = None
+    support_level: FiniteFloat | None = Field(default=None, gt=0)
+    resistance_level: FiniteFloat | None = Field(default=None, gt=0)
+    active_poi: str | None = None
+    rsi_14: FiniteFloat | None = Field(default=None, ge=0, le=100)
+
+
+class SetupStatus(StrEnum):
+    READY = "ready"
+    WAIT = "wait"
+
+
+class SetupBias(StrEnum):
+    LONG = "long"
+    SHORT = "short"
+    NEUTRAL = "neutral"
+
+
+class TradeSetup(BaseModel):
+    """Deterministic conditional trade scenario (Entry, SL, TP 1-3) or explicit WAIT."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    status: SetupStatus
+    bias: SetupBias
+    is_probabilistic: Literal[False] = False
+    entry_low: FiniteFloat | None = Field(default=None, gt=0)
+    entry_high: FiniteFloat | None = Field(default=None, gt=0)
+    entry_mid: FiniteFloat | None = Field(default=None, gt=0)
+    entry_source: str | None = None
+    entry_timeframe: Timeframe | None = None
+    ltf_confirmation: str | None = None
+    htf_support: FiniteFloat | None = Field(default=None, gt=0)
+    htf_resistance: FiniteFloat | None = Field(default=None, gt=0)
+    ltf_support: FiniteFloat | None = Field(default=None, gt=0)
+    ltf_resistance: FiniteFloat | None = Field(default=None, gt=0)
+    stop_loss: FiniteFloat | None = Field(default=None, gt=0)
+    invalidation_reason: str | None = None
+    tp1: FiniteFloat | None = Field(default=None, gt=0)
+    tp1_label: str | None = None
+    tp2: FiniteFloat | None = Field(default=None, gt=0)
+    tp2_label: str | None = None
+    tp3: FiniteFloat | None = Field(default=None, gt=0)
+    tp3_label: str | None = None
+    rr_tp1: FiniteFloat | None = Field(default=None, gt=0)
+    rr_tp2: FiniteFloat | None = Field(default=None, gt=0)
+    rr_tp3: FiniteFloat | None = Field(default=None, gt=0)
+    wait_reason: str | None = None
+    risk_notes: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def _validate_setup_levels(self) -> TradeSetup:
+        if self.status is SetupStatus.WAIT:
+            if not self.wait_reason or not self.wait_reason.strip():
+                raise ValueError("wait_reason is required when setup status is WAIT")
+            return self
+
+        if self.bias not in (SetupBias.LONG, SetupBias.SHORT):
+            raise ValueError("READY trade setup must have bias LONG or SHORT")
+
+        if (
+            self.entry_low is None
+            or self.entry_high is None
+            or self.entry_mid is None
+            or self.stop_loss is None
+            or self.tp1 is None
+            or self.tp2 is None
+            or self.tp3 is None
+            or self.rr_tp1 is None
+            or self.rr_tp2 is None
+            or self.rr_tp3 is None
+        ):
+            raise ValueError("READY trade setup requires all entry, SL, TP 1-3, and R:R values")
+
+        if not (self.entry_low <= self.entry_mid <= self.entry_high):
+            raise ValueError("require entry_low <= entry_mid <= entry_high")
+
+        if self.bias is SetupBias.LONG:
+            if not (self.stop_loss < self.entry_low):
+                raise ValueError("LONG setup requires stop_loss < entry_low")
+            if not (self.entry_mid < self.tp1 < self.tp2 < self.tp3):
+                raise ValueError("LONG setup requires entry_mid < tp1 < tp2 < tp3")
+        else:
+            if not (self.stop_loss > self.entry_high):
+                raise ValueError("SHORT setup requires stop_loss > entry_high")
+            if not (self.entry_mid > self.tp1 > self.tp2 > self.tp3):
+                raise ValueError("SHORT setup requires entry_mid > tp1 > tp2 > tp3")
+        return self
 
 
 class Fact(BaseModel):
@@ -221,6 +373,9 @@ class AnalysisSnapshot(BaseModel):
     indicator_parameters: dict[str, int | float | str] = Field(default_factory=dict)
     technical: TechnicalMetrics | None = None
     derivatives: DerivativesMetrics | None = None
+    smc: SmcSummary | None = None
+    mtf_overview: tuple[TimeframeOverview, ...] = ()
+    trade_setup: TradeSetup | None = None
     facts: tuple[Fact, ...] = ()
     regime: Regime | None = None
     market_structure: MarketStructure | None = None
@@ -253,6 +408,23 @@ class AnalysisSnapshot(BaseModel):
         for event in self.events:
             if event.confirmation_time > self.as_of:
                 raise ValueError("event confirmation_time cannot exceed snapshot as_of (lookahead)")
+
+        if self.smc is not None:
+            for ev in (self.smc.latest_structure_break, self.smc.latest_sweep):
+                if ev is not None and ev.confirmation_time > self.as_of:
+                    raise ValueError(
+                        "smc event confirmation_time cannot exceed snapshot as_of (lookahead)"
+                    )
+            for zone in (
+                self.smc.active_bullish_fvg,
+                self.smc.active_bearish_fvg,
+                self.smc.active_bullish_ob,
+                self.smc.active_bearish_ob,
+            ):
+                if zone is not None and zone.confirmation_time > self.as_of:
+                    raise ValueError(
+                        "smc zone confirmation_time cannot exceed snapshot as_of (lookahead)"
+                    )
 
         if self.quality_status in (QualityStatus.READY, QualityStatus.DEGRADED):
             if self.input_range is None:

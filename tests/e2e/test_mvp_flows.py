@@ -51,6 +51,7 @@ from crypto_chatbot.storage.repositories import (
 FIXTURE_1000 = Path(__file__).resolve().parents[1] / "fixtures" / "parity_1000_candles.json"
 ANCHOR_NOW = datetime(2026, 11, 21, 12, 0, tzinfo=UTC)
 _TF_DURATION_MS = {
+    "15m": 900_000,
     "1h": 3_600_000,
     "4h": 14_400_000,
     "1d": 86_400_000,
@@ -481,7 +482,7 @@ async def test_e2e_failure_malformed_symbol_and_hostile_html() -> None:
     harness, client, transport, _ = _build_stack()
 
     for cmd in (
-        "/analyze DOGE 4h",
+        "/analyze BTC/EUR 4h",
         "/analyze BTC-PERP 4h",
         "/analyze <script>alert()</script> 4h",
         "/<evil_cmd>",

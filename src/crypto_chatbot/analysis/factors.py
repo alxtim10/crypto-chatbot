@@ -12,11 +12,13 @@ from crypto_chatbot.analysis.regimes import (
 )
 from crypto_chatbot.analysis.structure import StructureAnalysis
 from crypto_chatbot.schemas.analysis import (
+    DealingZone,
     DerivativesMetrics,
     FactorDirection,
     FactorItem,
     MtfRsiAlignment,
     Regime,
+    SmcSummary,
     StructureEvent,
     StructureEventType,
     TechnicalMetrics,
@@ -54,6 +56,7 @@ def build_factors(
     recent_cutoff_time: datetime,
     fact_ids_by_key: Mapping[str, str],
     derivatives: DerivativesMetrics | None = None,
+    smc: SmcSummary | None = None,
 ) -> tuple[FactorItem, ...]:
     """Build descriptive, strictly non-probabilistic rule factors referencing snapshot facts."""
     factors: list[FactorItem] = []
@@ -348,6 +351,66 @@ def build_factors(
                 rule_id="orderbook_liquidity_imbalance",
                 description=desc,
                 direction=FactorDirection.NEUTRAL,
+            )
+
+    if smc is not None:
+        if smc.latest_structure_break is not None:
+            brk_type = smc.latest_structure_break.event_type
+            if brk_type in (StructureEventType.BOS_BULLISH, StructureEventType.CHOCH_BULLISH):
+                desc = (
+                    "SMC CHoCH bullish terkonfirmasi pada penutupan candle."
+                    if brk_type is StructureEventType.CHOCH_BULLISH
+                    else "SMC BOS bullish terkonfirmasi pada penutupan candle."
+                )
+                brk_dir = FactorDirection.SUPPORTS_BULLISH
+            else:
+                desc = (
+                    "SMC CHoCH bearish terkonfirmasi pada penutupan candle."
+                    if brk_type is StructureEventType.CHOCH_BEARISH
+                    else "SMC BOS bearish terkonfirmasi pada penutupan candle."
+                )
+                brk_dir = FactorDirection.SUPPORTS_BEARISH
+            _add_if_facts_present(
+                factors,
+                fact_ids_by_key,
+                ("smc_latest_break",),
+                rule_id="smc_structure_break",
+                description=desc,
+                direction=brk_dir,
+            )
+
+        if smc.dealing_zone is not None:
+            if smc.dealing_zone is DealingZone.DISCOUNT:
+                desc = "Harga berada di zona Discount (< 45% rentang swing terkonfirmasi)."
+            elif smc.dealing_zone is DealingZone.PREMIUM:
+                desc = "Harga berada di zona Premium (> 55% rentang swing terkonfirmasi)."
+            else:
+                desc = "Harga berada di area Equilibrium dealing range."
+            _add_if_facts_present(
+                factors,
+                fact_ids_by_key,
+                ("last_close", "smc_equilibrium"),
+                rule_id="smc_dealing_zone",
+                description=desc,
+                direction=FactorDirection.NEUTRAL,
+            )
+
+        if smc.latest_sweep is not None:
+            if smc.latest_sweep.event_type is StructureEventType.LIQUIDITY_SWEEP_BULLISH:
+                desc = "Terdeteksi Liquidity Sweep di bawah swing low lalu menutup kembali di atas."
+                sw_dir = FactorDirection.SUPPORTS_BULLISH
+            else:
+                desc = (
+                    "Terdeteksi Liquidity Sweep di atas swing high lalu menutup kembali di bawah."
+                )
+                sw_dir = FactorDirection.SUPPORTS_BEARISH
+            _add_if_facts_present(
+                factors,
+                fact_ids_by_key,
+                ("smc_latest_sweep",),
+                rule_id="smc_liquidity_sweep",
+                description=desc,
+                direction=sw_dir,
             )
 
     return tuple(factors)

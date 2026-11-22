@@ -65,10 +65,26 @@ def test_command_argument_parsers() -> None:
     a1 = parse_analyze_args(["btc", "4h"])
     assert a1.symbol == "BTC/USDT"
     assert a1.timeframe is Timeframe.H4
+    assert a1.detail is False
 
     a2 = parse_analyze_args(["ETH"], default_timeframe=Timeframe.D1)
     assert a2.symbol == "ETH/USDT"
     assert a2.timeframe is Timeframe.D1
+    assert a2.detail is False
+
+    a3 = parse_analyze_args(["btc", "4h", "detail"])
+    assert a3.symbol == "BTC/USDT"
+    assert a3.timeframe is Timeframe.H4
+    assert a3.detail is True
+
+    a4 = parse_analyze_args(["sol", "full"], default_timeframe=Timeframe.H1)
+    assert a4.symbol == "SOL/USDT"
+    assert a4.timeframe is Timeframe.H1
+    assert a4.detail is True
+
+    a5 = parse_analyze_args(["doge", "15m"])
+    assert a5.symbol == "DOGE/USDT"
+    assert a5.timeframe is Timeframe.M15
 
     c1 = parse_compare_args(["BTC", "ETH", "1d"])
     assert c1.symbols == ("BTC/USDT", "ETH/USDT")
@@ -81,9 +97,9 @@ def test_command_argument_parsers() -> None:
     w_list = parse_watchlist_args([])
     assert w_list.action is WatchlistAction.LIST
 
-    w_add = parse_watchlist_args(["add", "sol"])
+    w_add = parse_watchlist_args(["add", "sui"])
     assert w_add.action is WatchlistAction.ADD
-    assert w_add.symbol == "SOL/USDT"
+    assert w_add.symbol == "SUI/USDT"
 
     w_rm = parse_watchlist_args(["remove", "BTC/USDT"])
     assert w_rm.action is WatchlistAction.REMOVE
@@ -95,15 +111,15 @@ def test_command_argument_parsers() -> None:
     [
         (parse_analyze_args, []),
         (parse_analyze_args, ["BTC", "4h", "extra"]),
-        (parse_analyze_args, ["BTC", "15m"]),
-        (parse_analyze_args, ["DOGE", "4h"]),
+        (parse_analyze_args, ["BTC", "5m"]),
+        (parse_analyze_args, ["BTC/EUR", "4h"]),
         (parse_analyze_args, ["BTC-PERP", "4h"]),
         (parse_compare_args, ["BTC"]),
-        (parse_compare_args, ["BTC", "ETH", "15m"]),
+        (parse_compare_args, ["BTC", "ETH", "5m"]),
         (parse_compare_args, ["BTC", "BTC/USDT", "4h"]),
-        (parse_compare_args, ["BTC", "DOGE", "4h"]),
+        (parse_compare_args, ["BTC", "BTC/EUR", "4h"]),
         (parse_watchlist_args, ["add"]),
-        (parse_watchlist_args, ["add", "DOGE"]),
+        (parse_watchlist_args, ["add", "USDT"]),
         (parse_watchlist_args, ["clear"]),
     ],
 )
@@ -147,6 +163,27 @@ def test_followup_intent_resolver_scenarios() -> None:
     )
     assert explicit_intent == AnalyzeIntent(symbol="SOL/USDT", timeframe=Timeframe.D1)
 
+    m15_alt_intent = resolve_followup_intent(
+        "cek SUI pada 15m",
+        recent_messages=history,
+    )
+    assert m15_alt_intent == AnalyzeIntent(symbol="SUI/USDT", timeframe=Timeframe.M15)
+
+    single_cmd_pepe = resolve_followup_intent(
+        "analisa pepe",
+        recent_messages=history,
+    )
+    assert single_cmd_pepe == AnalyzeIntent(symbol="PEPE/USDT", timeframe=Timeframe.H4)
+
+    doge_cmp_intent = resolve_followup_intent(
+        "bandingkan dengan DOGE/USDT",
+        recent_messages=history,
+    )
+    assert doge_cmp_intent == CompareIntent(
+        symbols=("BTC/USDT", "DOGE/USDT"),
+        timeframe=Timeframe.H4,
+    )
+
     order_refusal = resolve_followup_intent(
         "tolong pasang order beli sekarang", recent_messages=history
     )
@@ -156,7 +193,7 @@ def test_followup_intent_resolver_scenarios() -> None:
     assert isinstance(perp_refusal, RefusalIntent)
 
     unsupported_refusal = resolve_followup_intent(
-        "bandingkan dengan DOGE/USDT", recent_messages=history
+        "bandingkan dengan BTC/EUR", recent_messages=history
     )
     assert isinstance(unsupported_refusal, RefusalIntent)
 

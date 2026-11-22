@@ -23,6 +23,8 @@ from crypto_chatbot.analysis.indicators import (
     compute_technical_metrics,
 )
 from crypto_chatbot.analysis.regimes import classify_regime
+from crypto_chatbot.analysis.setup import SETUP_PARAMETERS, build_trade_setup
+from crypto_chatbot.analysis.smc import analyze_smc
 from crypto_chatbot.analysis.structure import analyze_market_structure
 from crypto_chatbot.market_data.base import (
     DEFAULT_CANDLE_LIMIT,
@@ -41,9 +43,14 @@ from crypto_chatbot.schemas.analysis import (
     DerivativesMetrics,
     Fact,
     InputRange,
+    Regime,
+    SetupStatus,
+    SmcSummary,
     StructureEvent,
     StructureEventType,
     TechnicalMetrics,
+    TimeframeOverview,
+    TradeSetup,
 )
 from crypto_chatbot.schemas.derivatives import DerivativesContext
 from crypto_chatbot.schemas.market import (
@@ -54,7 +61,11 @@ from crypto_chatbot.schemas.market import (
     QualityStatus,
     Timeframe,
 )
-from crypto_chatbot.storage.repositories import DerivativesRepository, MarketRepository
+from crypto_chatbot.storage.repositories import (
+    DerivativesRepository,
+    MarketRepository,
+    SetupLogRepository,
+)
 
 _BLOCKING_BATCH_FLAGS: frozenset[QualityFlag] = frozenset(
     {
@@ -208,6 +219,8 @@ def _build_facts(
     quote_currency: str,
     timeframe_label: str,
     derivatives: DerivativesMetrics | None = None,
+    smc: SmcSummary | None = None,
+    trade_setup: TradeSetup | None = None,
 ) -> tuple[tuple[Fact, ...], dict[str, str]]:
     facts: list[Fact] = []
     fact_ids_by_key: dict[str, str] = {}
@@ -507,7 +520,243 @@ def _build_facts(
                 fact_source=derivatives.cross_source_pair or source,
             )
 
+    if smc is not None:
+        add_fact(
+            "smc_dealing_range_high",
+            "High dealing range",
+            smc.dealing_range_high,
+            quote_currency,
+            "price",
+        )
+        add_fact(
+            "smc_dealing_range_low",
+            "Low dealing range",
+            smc.dealing_range_low,
+            quote_currency,
+            "price",
+        )
+        add_fact(
+            "smc_equilibrium",
+            "Equilibrium dealing range",
+            smc.equilibrium,
+            quote_currency,
+            "price",
+        )
+        if smc.latest_structure_break is not None:
+            brk_ev = smc.latest_structure_break
+            add_fact(
+                "smc_latest_break",
+                "Level BOS/CHoCH terbaru",
+                brk_ev.level,
+                quote_currency,
+                "price",
+                fact_as_of=brk_ev.confirmation_time,
+            )
+        if smc.latest_sweep is not None:
+            swp_ev = smc.latest_sweep
+            add_fact(
+                "smc_latest_sweep",
+                "Level Liquidity Sweep terbaru",
+                swp_ev.level,
+                quote_currency,
+                "price",
+                fact_as_of=swp_ev.confirmation_time,
+            )
+        for z_key, z_label, zone in (
+            ("smc_bullish_fvg", "Bullish FVG", smc.active_bullish_fvg),
+            ("smc_bearish_fvg", "Bearish FVG", smc.active_bearish_fvg),
+            ("smc_bullish_ob", "Bullish Order Block", smc.active_bullish_ob),
+            ("smc_bearish_ob", "Bearish Order Block", smc.active_bearish_ob),
+        ):
+            if zone is not None:
+                add_fact(
+                    f"{z_key}_low",
+                    f"{z_label} (bawah)",
+                    zone.zone_low,
+                    quote_currency,
+                    "price",
+                    fact_as_of=zone.confirmation_time,
+                )
+                add_fact(
+                    f"{z_key}_high",
+                    f"{z_label} (atas)",
+                    zone.zone_high,
+                    quote_currency,
+                    "price",
+                    fact_as_of=zone.confirmation_time,
+                )
+
+    if trade_setup is not None and trade_setup.status is SetupStatus.READY:
+        add_fact(
+            "setup_entry_low",
+            "Zona entry (bawah)",
+            trade_setup.entry_low,
+            quote_currency,
+            "price",
+        )
+        add_fact(
+            "setup_entry_high",
+            "Zona entry (atas)",
+            trade_setup.entry_high,
+            quote_currency,
+            "price",
+        )
+        add_fact(
+            "setup_stop_loss",
+            "Stop loss (invalidasi)",
+            trade_setup.stop_loss,
+            quote_currency,
+            "price",
+        )
+        add_fact(
+            "setup_tp1",
+            "Target TP 1",
+            trade_setup.tp1,
+            quote_currency,
+            "price",
+        )
+        add_fact(
+            "setup_tp2",
+            "Target TP 2",
+            trade_setup.tp2,
+            quote_currency,
+            "price",
+        )
+        add_fact(
+            "setup_tp3",
+            "Target TP 3",
+            trade_setup.tp3,
+            quote_currency,
+            "price",
+        )
+        add_fact("setup_rr_tp1", "Rasio R:R TP 1", trade_setup.rr_tp1, "ratio", "rr_ratio")
+        add_fact("setup_rr_tp2", "Rasio R:R TP 2", trade_setup.rr_tp2, "ratio", "rr_ratio")
+        add_fact("setup_rr_tp3", "Rasio R:R TP 3", trade_setup.rr_tp3, "ratio", "rr_ratio")
+
+    if trade_setup is not None:
+        m15_src = f"{source.rsplit(':', 1)[0]}:15m"
+        add_fact(
+            "setup_ltf_support",
+            "Support struktur 15m",
+            trade_setup.ltf_support,
+            quote_currency,
+            "price",
+            fact_source=m15_src,
+        )
+        add_fact(
+            "setup_ltf_resistance",
+            "Resistance struktur 15m",
+            trade_setup.ltf_resistance,
+            quote_currency,
+            "price",
+            fact_source=m15_src,
+        )
+
     return tuple(facts), fact_ids_by_key
+
+
+def _build_mtf_overview(
+    batch: OhlcvBatch,
+    *,
+    mtf_batches: Mapping[Timeframe, OhlcvBatch] | None,
+    as_of: datetime,
+    use_available_time: bool,
+) -> tuple[TimeframeOverview, ...]:
+    if not mtf_batches:
+        return ()
+
+    by_tf: dict[Timeframe, Sequence[MarketCandle]] = {batch.timeframe: batch.candles}
+    for tf, mtf_b in mtf_batches.items():
+        if tf is batch.timeframe:
+            continue
+        if not mtf_b.candles or (set(mtf_b.quality_flags) & _BLOCKING_BATCH_FLAGS):
+            continue
+        filtered = [
+            c
+            for c in mtf_b.candles
+            if (c.available_time if use_available_time else c.close_time) <= as_of
+        ]
+        if len(filtered) >= 15:
+            by_tf[tf] = filtered
+
+    if len(by_tf) < 2:
+        return ()
+
+    reg_labels = {
+        Regime.HIGH_VOLATILITY: "Volatilitas Tinggi",
+        Regime.TRENDING_UP: "Tren Naik",
+        Regime.TRENDING_DOWN: "Tren Turun",
+        Regime.RANGING: "Mendatar (Ranging)",
+        Regime.TRANSITIONAL: "Transisi",
+    }
+    overviews: list[TimeframeOverview] = []
+    for tf in (Timeframe.D1, Timeframe.H4, Timeframe.H1, Timeframe.M15):
+        seq = by_tf.get(tf)
+        if not seq:
+            continue
+        struct = analyze_market_structure(seq)
+        smc_tf = analyze_smc(seq, structure=struct)
+        rsi_val: float | None = None
+        trend_label: str | None = None
+        if len(seq) >= 43:
+            ind_tf = compute_technical_metrics(seq)
+            rsi_val = ind_tf.metrics.rsi_14
+            reg_tf = classify_regime(ind_tf.metrics)
+            ref_ema = (
+                ind_tf.metrics.ema_50
+                if ind_tf.metrics.ema_50 is not None
+                else ind_tf.metrics.ema_20
+            )
+            if reg_tf is not None:
+                trend_label = reg_labels[reg_tf]
+            elif ref_ema is not None:
+                trend_label = "Tren Naik" if ind_tf.metrics.last_close > ref_ema else "Tren Turun"
+
+        sup = (
+            smc_tf.dealing_range_low
+            if smc_tf.dealing_range_low is not None
+            else (struct.last_swing_lows[-1].level if struct.last_swing_lows else None)
+        )
+        res = (
+            smc_tf.dealing_range_high
+            if smc_tf.dealing_range_high is not None
+            else (struct.last_swing_highs[-1].level if struct.last_swing_highs else None)
+        )
+        pois: list[str] = []
+        if smc_tf.active_bullish_fvg is not None:
+            pois.append("Bull FVG")
+        if smc_tf.active_bullish_ob is not None:
+            pois.append("Bull OB")
+        if smc_tf.active_bearish_fvg is not None:
+            pois.append("Bear FVG")
+        if smc_tf.active_bearish_ob is not None:
+            pois.append("Bear OB")
+
+        overviews.append(
+            TimeframeOverview(
+                timeframe=tf,
+                trend_label=trend_label,
+                market_structure=struct.market_structure,
+                structure_break=(
+                    smc_tf.latest_structure_break.event_type
+                    if smc_tf.latest_structure_break is not None
+                    else None
+                ),
+                structure_break_level=(
+                    smc_tf.latest_structure_break.level
+                    if smc_tf.latest_structure_break is not None
+                    else None
+                ),
+                sweep=(smc_tf.latest_sweep.event_type if smc_tf.latest_sweep is not None else None),
+                dealing_zone=smc_tf.dealing_zone,
+                support_level=sup,
+                resistance_level=res,
+                active_poi=", ".join(pois) if pois else None,
+                rsi_14=rsi_val,
+            )
+        )
+
+    return tuple(overviews)
 
 
 def _build_limitations(
@@ -644,17 +893,29 @@ def build_analysis_snapshot(
     mtf_candles: dict[Timeframe, tuple[MarketCandle, ...]] | None = None
     mtf_hashes: dict[str, str] = {}
     dropped_mtf: list[Timeframe] = []
+    ltf_15m_candles: tuple[MarketCandle, ...] | None = None
+    htf_candles_by_tf: dict[Timeframe, tuple[MarketCandle, ...]] = {}
 
     if mtf_batches is not None:
-        mtf_candles = {batch.timeframe: batch.candles}
+        mtf_candles = (
+            {batch.timeframe: batch.candles}
+            if batch.timeframe in (Timeframe.H1, Timeframe.H4, Timeframe.D1)
+            else {}
+        )
         for tf, mtf_batch in mtf_batches.items():
             if tf is batch.timeframe:
                 continue
             if not mtf_batch.candles or (set(mtf_batch.quality_flags) & _BLOCKING_BATCH_FLAGS):
-                dropped_mtf.append(tf)
+                if tf in (Timeframe.H1, Timeframe.H4, Timeframe.D1):
+                    dropped_mtf.append(tf)
                 continue
-            mtf_candles[tf] = mtf_batch.candles
             mtf_hashes[tf.value] = compute_candles_sha256(mtf_batch.candles)
+            if tf in (Timeframe.H1, Timeframe.H4, Timeframe.D1):
+                mtf_candles[tf] = mtf_batch.candles
+                if batch.timeframe is Timeframe.M15:
+                    htf_candles_by_tf[tf] = mtf_batch.candles
+            elif tf is Timeframe.M15 and batch.timeframe is not Timeframe.M15:
+                ltf_15m_candles = mtf_batch.candles
 
     ind_result = compute_technical_metrics(
         batch.candles,
@@ -706,6 +967,19 @@ def build_analysis_snapshot(
         structure.pivots,
         failed_breakouts,
     )
+    smc = analyze_smc(batch.candles, structure=structure)
+    trade_setup = build_trade_setup(
+        metrics=ind_result.metrics,
+        regime=regime,
+        structure=structure,
+        smc=smc,
+        derivatives=deriv_result.metrics if deriv_result is not None else None,
+        primary_timeframe=batch.timeframe,
+        ltf_candles=ltf_15m_candles,
+        htf_candles_by_tf=htf_candles_by_tf or None,
+        as_of=as_of,
+        use_available_time=use_available_time,
+    )
     source = f"{batch.metadata.venue}:{batch.canonical_symbol}:{batch.timeframe.value}"
     facts, fact_ids_by_key = _build_facts(
         metrics=ind_result.metrics,
@@ -720,6 +994,8 @@ def build_analysis_snapshot(
         quote_currency=batch.metadata.quote_currency,
         timeframe_label=batch.timeframe.value,
         derivatives=deriv_result.metrics if deriv_result is not None else None,
+        smc=smc,
+        trade_setup=trade_setup,
     )
 
     recent_cutoff = as_of - 10 * batch.timeframe.duration
@@ -731,6 +1007,7 @@ def build_analysis_snapshot(
         recent_cutoff_time=recent_cutoff,
         fact_ids_by_key=fact_ids_by_key,
         derivatives=deriv_result.metrics if deriv_result is not None else None,
+        smc=smc,
     )
 
     snap_id = _compute_snapshot_id(
@@ -748,8 +1025,15 @@ def build_analysis_snapshot(
         derivatives_digest=deriv_digest,
     )
     params = dict(INDICATOR_PARAMETERS)
+    params.update(SETUP_PARAMETERS)
     params.update(extra_params)
 
+    mtf_overview = _build_mtf_overview(
+        batch,
+        mtf_batches=mtf_batches,
+        as_of=as_of,
+        use_available_time=use_available_time,
+    )
     return AnalysisSnapshot(
         snapshot_id=snap_id,
         provider=batch.metadata.provider,
@@ -764,6 +1048,9 @@ def build_analysis_snapshot(
         indicator_parameters=params,
         technical=ind_result.metrics,
         derivatives=deriv_result.metrics if deriv_result is not None else None,
+        smc=smc,
+        mtf_overview=mtf_overview,
+        trade_setup=trade_setup,
         facts=facts,
         regime=regime,
         market_structure=structure.market_structure,
@@ -833,11 +1120,23 @@ class AnalysisService:
         *,
         derivatives_provider: DerivativesLiquidityProvider | None = None,
         derivatives_repository: DerivativesRepository | None = None,
+        setup_repository: SetupLogRepository | None = None,
     ) -> None:
         self._provider = provider
         self._repository = repository
         self._derivatives_provider = derivatives_provider
         self._derivatives_repository = derivatives_repository
+        self._setup_repository = setup_repository
+
+    async def _fetch_optional_ltf_15m(self, canonical_symbol: str) -> OhlcvBatch | None:
+        try:
+            return await self._provider.get_closed_ohlcv(
+                canonical_symbol,
+                Timeframe.M15,
+                limit=200,
+            )
+        except KeyError:
+            return None
 
     async def analyze(
         self,
@@ -875,6 +1174,10 @@ class AnalysisService:
                 )
             )
             mtf_batches = dict(zip(other_tfs, fetched, strict=True))
+            if timeframe is not Timeframe.M15:
+                m15_batch = await self._fetch_optional_ltf_15m(mapping.canonical_symbol)
+                if m15_batch is not None:
+                    mtf_batches[Timeframe.M15] = m15_batch
 
         derivatives_context: DerivativesContext | None = None
         if self._derivatives_provider is not None and include_derivatives and primary_ok:
@@ -944,6 +1247,9 @@ class AnalysisService:
                     derivatives_context.liquidations.events
                 )
 
+        if persist and self._setup_repository is not None and snapshot.trade_setup is not None:
+            self._setup_repository.save_setup(snapshot, snapshot.trade_setup)
+
         return snapshot
 
     def recompute_from_stored(self, snapshot_id: str) -> AnalysisSnapshot:
@@ -975,7 +1281,10 @@ class AnalysisService:
         )
 
         mtf_batches: dict[Timeframe, OhlcvBatch] | None = None
-        if stored.technical is not None and stored.technical.mtf_rsi_alignment is not None:
+        if stored.technical is not None and (
+            stored.technical.mtf_rsi_alignment is not None
+            or (stored.trade_setup is not None and stored.trade_setup.ltf_confirmation is not None)
+        ):
             mtf_batches = {}
             for tf in (Timeframe.H1, Timeframe.H4, Timeframe.D1):
                 if tf is stored.timeframe:
@@ -991,6 +1300,21 @@ class AnalysisService:
                 if mtf_candles:
                     mtf_batches[tf] = _batch_from_stored_candles(
                         mtf_candles,
+                        as_of=stored.as_of,
+                        is_primary=False,
+                    )
+            if stored.timeframe is not Timeframe.M15:
+                m15_candles = self._repository.load_candles(
+                    venue=stored.venue,
+                    canonical_symbol=stored.canonical_symbol,
+                    market_type=stored.market_type,
+                    timeframe=Timeframe.M15,
+                    end_close_time=stored.as_of,
+                    limit=200,
+                )
+                if m15_candles:
+                    mtf_batches[Timeframe.M15] = _batch_from_stored_candles(
+                        m15_candles,
                         as_of=stored.as_of,
                         is_primary=False,
                     )

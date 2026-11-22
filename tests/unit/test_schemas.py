@@ -224,7 +224,7 @@ def test_candle_rejects_invalid_ohlc_and_volume(overrides: dict[str, Any]) -> No
         {"market_type": MarketType.SPOT, "canonical_symbol": "BTC/USDT:USDT"},
         {"market_type": MarketType.SPOT, "provider_symbol": "BINANCE:BTCUSDT.P"},
         {"market_type": MarketType.PERPETUAL, "canonical_symbol": "BTC/USDT"},
-        {"timeframe": "15m"},
+        {"timeframe": "5m"},
         {"market_type": "futures"},
         {"quality_flags": ("UNKNOWN_FLAG",)},
     ],
@@ -387,12 +387,17 @@ def test_command_argument_schemas() -> None:
     assert wl_list.action is WatchlistAction.LIST
     assert wl_list.symbol is None
 
+    alt_m15 = AnalyzeCommandArgs(symbol="doge", timeframe="15m")  # type: ignore[arg-type]
+    assert alt_m15.symbol == "DOGE/USDT"
+    assert alt_m15.timeframe is Timeframe.M15
+
 
 @pytest.mark.parametrize(
     ("cls", "kwargs"),
     [
         (AnalyzeCommandArgs, {"symbol": "BTC perpetual", "timeframe": "4h"}),
-        (AnalyzeCommandArgs, {"symbol": "BTC", "timeframe": "15m"}),
+        (AnalyzeCommandArgs, {"symbol": "BTC", "timeframe": "5m"}),
+        (AnalyzeCommandArgs, {"symbol": "BTC/EUR", "timeframe": "4h"}),
         (CompareCommandArgs, {"symbols": ("BTC", "BTC/USDT"), "timeframe": "1d"}),
         (CompareCommandArgs, {"symbols": ("BTC",), "timeframe": "1d"}),
         (WatchlistCommandArgs, {"action": "add"}),

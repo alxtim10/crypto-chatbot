@@ -3,6 +3,8 @@
 Related documents:
 
 - `docs/decisions/0001-product-scope.md`: accepted Phase 0 product decisions (binding).
+- `docs/decisions/0002-derivatives-and-liquidity.md`: accepted Phase 9 derivatives and liquidity rules (binding).
+- `docs/decisions/0003-compact-output-smc-and-trade-setup.md`: accepted compact output, Hybrid Crypto + Causal SMC, and deterministic conditional trade setup rules (binding).
 - `AGENTS.md`: always-on agent rules and project commands.
 - `.agents/skills/crypto-research-engineer/SKILL.md`: engineering rules.
 - `.agents/skills/socratic-tutor/SKILL.md`: opt-in tutoring mode.

@@ -397,8 +397,8 @@ async def test_tool_registry_allowlist_and_argument_validation() -> None:
         ("run_sql", {"query": "SELECT * FROM users"}),
         ("exec_python", {"code": "print(1)"}),
         ("analyze_coin", {"symbol": "BTC perpetual", "timeframe": "4h"}),
-        ("analyze_coin", {"symbol": "DOGE", "timeframe": "4h"}),
-        ("analyze_coin", {"symbol": "BTC", "timeframe": "15m"}),
+        ("analyze_coin", {"symbol": "BTC/EUR", "timeframe": "4h"}),
+        ("analyze_coin", {"symbol": "BTC", "timeframe": "5m"}),
         ("analyze_coin", {"symbol": "BTC", "timeframe": "4h", "extra": "bad"}),
         ("compare_coins", {"symbols": ["BTC", "BTC/USDT"], "timeframe": "4h"}),
     ):

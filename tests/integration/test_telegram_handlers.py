@@ -358,7 +358,10 @@ async def test_ptb_command_and_followup_handlers_end_to_end() -> None:
     assert "BTC/USDT (4h)" in followup_out
     assert "ETH/USDT (4h)" in followup_out
 
-    bad_cmd_out = "\n".join(await invoke(2, "/analyze DOGE 15m", ["DOGE", "15m"]))
+    alt_m15_out = "\n".join(await invoke(2, "/analyze DOGE 15m", ["DOGE", "15m"]))
+    assert "DOGE/USDT (15m)" in alt_m15_out
+
+    bad_cmd_out = "\n".join(await invoke(2, "/analyze BTC 5m", ["BTC", "5m"]))
     assert "tidak didukung" in bad_cmd_out.lower()
 
     unknown_out = "\n".join(await invoke(7, "/tidakada"))
