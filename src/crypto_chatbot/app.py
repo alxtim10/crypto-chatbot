@@ -1,4 +1,4 @@
-"""Application composition root for closed-beta Telegram long polling (ADR 0001)."""
+"""Application composition root for closed-beta polling mode."""
 
 from __future__ import annotations
 
@@ -15,7 +15,10 @@ from crypto_chatbot.bot.handlers import (
     SecretRedactingFilter,
     register_handlers,
 )
-from crypto_chatbot.config import Settings
+from crypto_chatbot.config import (
+    Settings,
+    collect_secret_values,
+)
 from crypto_chatbot.llm.gemini import (
     DailyQuotaTracker,
     GeminiNarrator,
@@ -36,7 +39,7 @@ from crypto_chatbot.storage.repositories import (
 
 
 def configure_logging(secrets: Sequence[str] = ()) -> SecretRedactingFilter:
-    """Configure structured logging with secret redaction and suppressed httpx URL logs."""
+    """Configure text logging with secret redaction."""
     redacting_filter = SecretRedactingFilter(secrets)
     logging.basicConfig(
         level=logging.INFO,
@@ -124,14 +127,12 @@ def build_telegram_application(
 
 
 def run_polling(settings: Settings) -> None:
-    """Start closed-beta Telegram long polling with secret redaction active."""
-    secrets = [
-        settings.telegram_bot_token.get_secret_value(),
-        settings.gemini_api_key.get_secret_value(),
-        settings.database_url.get_secret_value(),
-    ]
-    if settings.tradingview_webhook_secret is not None:
-        secrets.append(settings.tradingview_webhook_secret.get_secret_value())
-    configure_logging(secrets=tuple(secrets))
+    """Start Telegram long polling with secret redaction active."""
+    configure_logging(secrets=collect_secret_values(settings))
     application = build_telegram_application(settings)
     application.run_polling(drop_pending_updates=True)
+
+
+def run_bot(settings: Settings) -> None:
+    """Start Telegram bot via long polling."""
+    run_polling(settings)

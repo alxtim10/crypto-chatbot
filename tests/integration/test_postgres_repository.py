@@ -10,6 +10,7 @@ from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import psycopg
 import pytest
 
 from crypto_chatbot.analysis.service import AnalysisService, build_analysis_snapshot
@@ -31,6 +32,12 @@ from crypto_chatbot.ml.shadow import (
     settle_shadow_prediction,
 )
 from crypto_chatbot.news.pipeline import build_sentiment_observations, deduplicate_articles
+from crypto_chatbot.ops import (
+    check_database_health,
+    dump_postgres_database,
+    restore_postgres_database,
+    to_libpq_url,
+)
 from crypto_chatbot.schemas.market import MarketType, Timeframe
 from crypto_chatbot.schemas.ml import MlExperimentConfig, MlInferenceMode
 from crypto_chatbot.schemas.news import RawNewsItem
@@ -658,3 +665,72 @@ async def test_postgres_model_prediction_repository_lifecycle(
     report = compute_shadow_monitoring_report([settled_rec], min_settled=1)
     assert report.total_predictions == 1
     assert report.settled_predictions == 1
+
+
+@pytest.mark.asyncio
+async def test_postgres_backup_and_restore_drill(
+    pg_repository: PostgresMarketRepository,
+    tmp_path: Path,
+) -> None:
+    assert check_database_health(pg_repository._engine) is True
+
+    raw = json.loads(FIXTURE_1000.read_text(encoding="utf-8"))
+    received = datetime(2026, 10, 14, 16, 0, 1, tzinfo=UTC)
+    batch = normalize_ohlcv_rows(
+        raw["raw_ohlcv"],
+        symbol=resolve_mvp_spot_symbol("BTC"),
+        timeframe=Timeframe.H4,
+        received_time=received,
+        now=received,
+    )
+    service = AnalysisService(_StaticProvider(batch), pg_repository)
+    snapshot = await service.analyze("BTC", Timeframe.H4, include_mtf=False, persist=True)
+
+    mem_repo = PostgresUserMemoryRepository(pg_repository._engine)
+    mem_repo.ensure_user(8801)
+    mem_repo.save_preferences(8801, UserPreferences(watchlist=("BTC/USDT", "SOL/USDT")))
+    mem_repo.append_message(8801, role="user", content="analisa btc 4h")
+    mem_repo.append_message(
+        8801,
+        role="assistant",
+        content="Ringkasan harga {F1}",
+        snapshot_id=snapshot.snapshot_id,
+    )
+
+    dump_path = tmp_path / "drill_backup.dump"
+    source_url = pg_repository._engine.url.render_as_string(hide_password=False)
+    backup_res = dump_postgres_database(source_url, dump_path)
+    assert backup_res.size_bytes > 0
+
+    drill_db_name = "crypto_chatbot_restore_drill_tmp"
+    admin_url = pg_repository._engine.url.set(database="postgres").render_as_string(
+        hide_password=False
+    )
+    restore_url = pg_repository._engine.url.set(database=drill_db_name).render_as_string(
+        hide_password=False
+    )
+    admin_libpq = to_libpq_url(admin_url)
+
+    with psycopg.connect(admin_libpq, autocommit=True) as conn:
+        conn.execute(f"DROP DATABASE IF EXISTS {drill_db_name}")
+        conn.execute(f"CREATE DATABASE {drill_db_name}")
+
+    try:
+        restore_postgres_database(restore_url, dump_path)
+        restore_engine = create_db_engine(restore_url)
+        try:
+            assert check_database_health(restore_engine) is True
+            restored_market = PostgresMarketRepository(restore_engine)
+            restored_mem = PostgresUserMemoryRepository(restore_engine)
+            assert restored_market.get_snapshot(snapshot.snapshot_id) == snapshot
+            recomputed = AnalysisService(
+                _StaticProvider(batch), restored_market
+            ).recompute_from_stored(snapshot.snapshot_id)
+            assert recomputed == snapshot
+            assert restored_mem.get_preferences(8801).watchlist == ("BTC/USDT", "SOL/USDT")
+            assert len(restored_mem.get_recent_messages(8801)) == 2
+        finally:
+            restore_engine.dispose()
+    finally:
+        with psycopg.connect(admin_libpq, autocommit=True) as conn:
+            conn.execute(f"DROP DATABASE IF EXISTS {drill_db_name}")

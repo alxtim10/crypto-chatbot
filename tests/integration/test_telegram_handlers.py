@@ -345,7 +345,7 @@ async def test_ptb_command_and_followup_handlers_end_to_end() -> None:
         assert all(len(chunk) <= TELEGRAM_MAX_MESSAGE_LENGTH for chunk, _ in replies)
         return [chunk for chunk, _ in replies]
 
-    # 0=start, 1=help, 2=analyze, 3=compare, 4=watchlist, 5=memory, 6=forget, 7=unknown, 8=text
+    # 0=start..6=forget, 7=unknown, 8=text
     start_out = "\n".join(await invoke(0, "/start"))
     assert "Selamat datang" in start_out
 

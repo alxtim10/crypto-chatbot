@@ -14,7 +14,7 @@ from typing import Any
 
 from crypto_chatbot.analysis.service import AnalysisService, build_analysis_snapshot
 from crypto_chatbot.analysis.setup import evaluate_setup_against_candles
-from crypto_chatbot.app import run_polling
+from crypto_chatbot.app import run_bot
 from crypto_chatbot.bot.templates import render_compact_snapshot, render_deterministic_snapshot
 from crypto_chatbot.config import ConfigError, load_settings
 from crypto_chatbot.market_data.ccxt_provider import CcxtMarketDataProvider
@@ -35,6 +35,12 @@ from crypto_chatbot.market_data.symbols import (
 from crypto_chatbot.market_data.tradingview import parse_ai_agent_lens_packet
 from crypto_chatbot.ml.experiment import run_offline_experiment
 from crypto_chatbot.news.pipeline import build_sentiment_observations, deduplicate_articles
+from crypto_chatbot.ops import (
+    BackupError,
+    check_database_health,
+    dump_postgres_database,
+    restore_postgres_database,
+)
 from crypto_chatbot.schemas.analysis import AnalysisSnapshot
 from crypto_chatbot.schemas.derivatives import DerivativesContext
 from crypto_chatbot.schemas.market import MarketType, Timeframe
@@ -495,14 +501,86 @@ def _run_purge_expired() -> int:
     return 0
 
 
+def _resolve_database_url(explicit_url: str | None = None) -> str:
+    if explicit_url is not None and explicit_url.strip():
+        return explicit_url.strip()
+    env_url = os.environ.get("DATABASE_URL", "").strip()
+    if env_url:
+        return env_url
+    try:
+        return load_settings().database_url.get_secret_value()
+    except ConfigError as exc:
+        raise ValueError("DATABASE_URL (or configured Settings database_url) is required") from exc
+
+
 def _run_bot() -> int:
     try:
         settings = load_settings()
     except ConfigError as exc:
         print(exc, file=sys.stderr)
         return 1
-    run_polling(settings)
+    run_bot(settings)
     return 0
+
+
+def _run_backup_db(*, output_path: Path, database_url: str | None) -> int:
+    try:
+        resolved_url = _resolve_database_url(database_url)
+        res = dump_postgres_database(resolved_url, output_path)
+    except (ValueError, BackupError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    print(
+        f"Backup completed: path={res.output_path}, bytes={res.size_bytes}, "
+        f"duration_ms={res.duration_ms}"
+    )
+    return 0
+
+
+def _run_restore_db(*, backup_path: Path, database_url: str | None) -> int:
+    try:
+        resolved_url = _resolve_database_url(database_url)
+        res = restore_postgres_database(resolved_url, backup_path)
+    except (ValueError, BackupError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    print(f"Restore completed: path={res.backup_path}, duration_ms={res.duration_ms}")
+    return 0
+
+
+def _run_health_check(*, database_url: str | None) -> int:
+    config_ok = True
+    try:
+        settings = load_settings()
+    except ConfigError as exc:
+        config_ok = False
+        print(exc, file=sys.stderr)
+        settings = None
+
+    engine: Any = None
+    db_ok = False
+    try:
+        if database_url is not None and database_url.strip():
+            resolved_url = database_url.strip()
+        elif settings is not None:
+            resolved_url = settings.database_url.get_secret_value()
+        else:
+            resolved_url = os.environ.get("DATABASE_URL", "").strip()
+        if resolved_url:
+            engine = create_db_engine(resolved_url)
+            db_ok = check_database_health(engine)
+    except ValueError:
+        db_ok = False
+    finally:
+        if engine is not None:
+            engine.dispose()
+
+    payload = {
+        "config_ok": config_ok,
+        "db_healthy": db_ok,
+    }
+    print(json.dumps(payload, indent=2))
+    return 0 if (config_ok and db_ok) else 1
 
 
 def _load_news_observations_from_fixture(
@@ -734,6 +812,38 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Persist experiment report to PostgreSQL ml_experiments via DATABASE_URL.",
     )
 
+    backup_parser = subcommands.add_parser(
+        "backup-db",
+        help="Create a custom-format PostgreSQL backup using pg_dump.",
+    )
+    backup_parser.add_argument("output_path", type=Path, help="Destination dump file path.")
+    backup_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Optional PostgreSQL URL override (falls back to DATABASE_URL / Settings).",
+    )
+
+    restore_parser = subcommands.add_parser(
+        "restore-db",
+        help="Restore a PostgreSQL custom-format backup using pg_restore.",
+    )
+    restore_parser.add_argument("backup_path", type=Path, help="Source dump file path.")
+    restore_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Optional PostgreSQL URL override (falls back to DATABASE_URL / Settings).",
+    )
+
+    health_parser = subcommands.add_parser(
+        "health-check",
+        help="Run configuration + PostgreSQL connectivity probe and evaluate operational alerts.",
+    )
+    health_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Optional PostgreSQL URL override for DB health probe.",
+    )
+
     args = parser.parse_args(argv)
     if args.command == "check-config":
         return _check_config()
@@ -766,6 +876,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             as_json=args.json,
             persist=args.persist,
         )
+    if args.command == "backup-db":
+        return _run_backup_db(
+            output_path=args.output_path,
+            database_url=args.database_url,
+        )
+    if args.command == "restore-db":
+        return _run_restore_db(
+            backup_path=args.backup_path,
+            database_url=args.database_url,
+        )
+    if args.command == "health-check":
+        return _run_health_check(database_url=args.database_url)
     parser.error(f"unknown command: {args.command}")  # pragma: no cover
 
 

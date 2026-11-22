@@ -1,8 +1,9 @@
-# Closed-beta deployment using Telegram long polling (ADR 0001).
-# No inbound ports are exposed.
+# Deployment configuration (ADR 0001 & ADR 0009 personal polling mode; hardened container runtime).
 #
-# Run periodic retention cleanup via host cron or systemd timer:
+# Periodic retention cleanup via host cron or systemd timer:
 #   docker compose exec -T bot crypto-chatbot purge-expired
+# Logical PostgreSQL backup:
+#   docker compose exec -T bot crypto-chatbot backup-db /tmp/backup.dump
 
 services:
   postgres:
@@ -25,6 +26,11 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
     depends_on:
       postgres:
         condition: service_healthy

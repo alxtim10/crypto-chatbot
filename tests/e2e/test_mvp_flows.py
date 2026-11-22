@@ -731,7 +731,7 @@ async def test_e2e_mvp_flow_with_real_postgres(pg_engine_url: str) -> None:
         assert market_repo.get_snapshot(btc_snap_id) is not None
 
         # Retention purge runs cleanly
-        purge_res = memory_repo.purge_expired(now=ANCHOR_NOW + timedelta(days=91))
+        purge_res = memory_repo.purge_expired(now=datetime.now(UTC) + timedelta(days=91))
         assert purge_res.deleted_snapshots >= 1
     finally:
         engine.dispose()

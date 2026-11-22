@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import html
 import logging
-import re
-import traceback
 import uuid
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from typing import Any
 
 from sqlalchemy.exc import SQLAlchemyError
@@ -39,68 +37,12 @@ from crypto_chatbot.bot.templates import (
 from crypto_chatbot.llm.gemini import GeminiNarrator
 from crypto_chatbot.llm.render import render_analysis_response, render_comparison_response
 from crypto_chatbot.memory.service import MemoryService
+from crypto_chatbot.ops.logging import SecretRedactingFilter as SecretRedactingFilter
 from crypto_chatbot.schemas.commands import WatchlistAction
 from crypto_chatbot.schemas.llm import AnalysisResponse
 from crypto_chatbot.schemas.market import Timeframe
 
 logger = logging.getLogger(__name__)
-
-_SECRET_LOG_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
-    (re.compile(r"\bbot\d{6,12}:[A-Za-z0-9_-]{25,}\b"), "bot[REDACTED]"),
-    (re.compile(r"\b\d{8,12}:[A-Za-z0-9_-]{35}\b"), "[REDACTED_TOKEN]"),
-    (re.compile(r"AIza[0-9A-Za-z_-]{20,}"), "[REDACTED_KEY]"),
-    (re.compile(r"(postgresql[^\s]*://[^:\s]+:)([^@\s]+)(@)"), r"\1[REDACTED]\3"),
-    (
-        re.compile(
-            r'(["\']?(?:secret|webhook_secret|token|api_key|password)["\']?\s*[:=]\s*["\']?)([^"\'\s,}]+)(["\']?)',
-            re.IGNORECASE,
-        ),
-        r"\1[REDACTED]\3",
-    ),
-    (
-        re.compile(
-            r"([?&](?:secret|webhook_secret|token|api_key|password)=)([^&\s\"']+)",
-            re.IGNORECASE,
-        ),
-        r"\1[REDACTED]",
-    ),
-)
-
-
-class SecretRedactingFilter(logging.Filter):
-    """Redacts known secrets and credential-shaped tokens from all log records."""
-
-    def __init__(self, secrets: Iterable[str] = ()) -> None:
-        super().__init__()
-        self._literals = tuple(
-            sorted({s for s in secrets if len(s.strip()) >= 4}, key=len, reverse=True)
-        )
-
-    def redact_text(self, text: str) -> str:
-        masked = text
-        for literal in self._literals:
-            if literal in masked:
-                masked = masked.replace(literal, "[REDACTED]")
-        for pattern, replacement in _SECRET_LOG_PATTERNS:
-            masked = pattern.sub(replacement, masked)
-        return masked
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        try:
-            formatted = record.getMessage()
-        except Exception:
-            formatted = str(record.msg)
-        redacted = self.redact_text(formatted)
-        if redacted != formatted or record.args:
-            record.msg = redacted
-            record.args = ()
-        if record.exc_info:
-            formatted_exc = "".join(traceback.format_exception(*record.exc_info))
-            record.exc_text = self.redact_text(formatted_exc).rstrip("\n")
-            record.exc_info = None
-        elif record.exc_text:
-            record.exc_text = self.redact_text(record.exc_text)
-        return True
 
 
 def _deny_chunks(reason: str | None) -> tuple[str, ...]:
@@ -152,12 +94,12 @@ class BotService:
         denied = self._authorize(user_id, request_id, "start")
         if denied is not None or user_id is None:
             return denied or _deny_chunks("not_allowlisted")
-
         try:
             self._memory.ensure_user(user_id)
         except SQLAlchemyError:
             logger.exception("request_id=%s user_id=%s action=start db_error", request_id, user_id)
             return ("Layanan database sedang bermasalah. Coba beberapa saat lagi.",)
+        logger.info("request_id=%s user_id=%s action=start", request_id, user_id)
         return split_telegram_message(render_start_message(), TELEGRAM_MAX_MESSAGE_LENGTH)
 
     async def handle_help(self, user_id: int | None) -> tuple[str, ...]:
@@ -165,6 +107,7 @@ class BotService:
         denied = self._authorize(user_id, request_id, "help")
         if denied is not None or user_id is None:
             return denied or _deny_chunks("not_allowlisted")
+        logger.info("request_id=%s user_id=%s action=help", request_id, user_id)
         return split_telegram_message(render_help_message(), TELEGRAM_MAX_MESSAGE_LENGTH)
 
     async def handle_analyze(
@@ -180,12 +123,13 @@ class BotService:
         try:
             default_tf = self._safe_default_timeframe(user_id)
             parsed = parse_analyze_args(args, default_timeframe=default_tf)
+            user_text = "/analyze " + " ".join(args)
             return await self._execute_single_analysis(
                 user_id=user_id,
                 request_id=request_id,
                 symbol=parsed.symbol,
                 timeframe=parsed.timeframe,
-                user_text=f"/analyze {' '.join(args)}".strip(),
+                user_text=user_text,
                 compact=not parsed.detail,
             )
         except CommandParseError as exc:
@@ -197,7 +141,7 @@ class BotService:
             logger.exception(
                 "request_id=%s user_id=%s action=analyze db_error", request_id, user_id
             )
-            return ("Gagal mengakses database. Analisis tidak dapat disimpan saat ini.",)
+            return ("Gagal mengakses database. Analisis tidak dapat diselesaikan saat ini.",)
 
     async def handle_compare(
         self,
@@ -212,12 +156,13 @@ class BotService:
         try:
             default_tf = self._safe_default_timeframe(user_id)
             parsed = parse_compare_args(args, default_timeframe=default_tf)
+            user_text = "/compare " + " ".join(args)
             return await self._execute_comparison(
                 user_id=user_id,
                 request_id=request_id,
                 symbols=parsed.symbols,
                 timeframe=parsed.timeframe,
-                user_text=f"/compare {' '.join(args)}".strip(),
+                user_text=user_text,
             )
         except CommandParseError as exc:
             return split_telegram_message(
@@ -283,11 +228,14 @@ class BotService:
         try:
             prefs = self._memory.get_preferences(user_id)
             recent = self._memory.get_recent_messages(user_id)
-            rendered = render_memory_message(prefs, recent, html_mode=True)
-            return split_telegram_message(rendered, TELEGRAM_MAX_MESSAGE_LENGTH)
+            logger.info("request_id=%s user_id=%s action=memory", request_id, user_id)
+            return split_telegram_message(
+                render_memory_message(prefs, recent, html_mode=True),
+                TELEGRAM_MAX_MESSAGE_LENGTH,
+            )
         except SQLAlchemyError:
             logger.exception("request_id=%s user_id=%s action=memory db_error", request_id, user_id)
-            return ("Gagal membaca memori dari database.",)
+            return ("Gagal mengakses memori di database.",)
 
     async def handle_forget(self, user_id: int | None) -> tuple[str, ...]:
         request_id = f"req-{uuid.uuid4().hex[:12]}"
@@ -341,10 +289,7 @@ class BotService:
                 default_timeframe=prefs.default_timeframe,
             )
             if isinstance(intent, RefusalIntent):
-                return split_telegram_message(
-                    html.escape(intent.message, quote=False),
-                    TELEGRAM_MAX_MESSAGE_LENGTH,
-                )
+                return (html.escape(intent.message, quote=False),)
             if isinstance(intent, AnalyzeIntent):
                 return await self._execute_single_analysis(
                     user_id=user_id,

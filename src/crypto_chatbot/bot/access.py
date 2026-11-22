@@ -1,4 +1,4 @@
-"""Closed-beta user allowlist and per-user sliding-window rate limiter."""
+"""Closed-beta allowlist and sliding-window per-user rate limit."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ class AccessDecision(BaseModel):
 
 
 class AccessController:
-    """Enforces closed-beta Telegram ID allowlist and per-user request limits."""
+    """Enforces closed allowlist and per-user sliding-window rate limit."""
 
     def __init__(
         self,
@@ -45,7 +45,7 @@ class AccessController:
         self._buckets: dict[int, deque[float]] = {}
 
     def check_access(self, user_id: int | None) -> AccessDecision:
-        """Check whether `user_id` is allowlisted and within rate limits."""
+        """Check allowlist and sliding-window rate limit."""
         if user_id is None or user_id not in self._allowed_ids:
             return AccessDecision(allowed=False, reason="not_allowlisted")
 

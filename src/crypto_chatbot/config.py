@@ -1,4 +1,4 @@
-"""Application settings loaded from environment variables (and an optional `.env` file).
+"""Application settings loaded from environment variables or optional `.env`.
 
 Secrets are typed as `SecretStr` so they never appear in `repr()`, `str()`, or logs.
 """
@@ -8,7 +8,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Annotated
 
-from pydantic import Field, SecretStr, ValidationError, field_validator
+from pydantic import (
+    Field,
+    SecretStr,
+    ValidationError,
+    field_validator,
+)
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from crypto_chatbot.schemas.ml import MlInferenceMode
@@ -35,8 +40,13 @@ class Settings(BaseSettings):
     gemini_user_daily_cap: int = Field(default=30, ge=1)
     gemini_global_daily_cap: int = Field(default=200, ge=1)
     database_url: SecretStr
-    allowed_telegram_user_ids: Annotated[tuple[int, ...], NoDecode] = Field(min_length=1)
+
+    allowed_telegram_user_ids: Annotated[tuple[int, ...], NoDecode] = Field(
+        default=(),
+        validate_default=True,
+    )
     rate_limit_per_minute: int = Field(default=10, ge=1)
+
     tradingview_webhook_secret: SecretStr | None = None
     tradingview_webhook_port: int = Field(default=443, ge=1, le=65535)
     tradingview_allowed_ips: Annotated[tuple[str, ...], NoDecode] = (
@@ -76,22 +86,43 @@ class Settings(BaseSettings):
     @field_validator("allowed_telegram_user_ids", mode="before")
     @classmethod
     def _parse_user_ids(cls, value: object) -> object:
+        parsed: tuple[int, ...]
         if isinstance(value, str):
             parts = [part.strip() for part in value.split(",") if part.strip()]
             try:
-                return tuple(int(part) for part in parts)
+                parsed = tuple(int(part) for part in parts)
             except ValueError:
                 raise ValueError("must be comma-separated integer Telegram user IDs") from None
-        return value
+        elif isinstance(value, (tuple, list)):
+            parsed = tuple(int(v) for v in value)
+        else:
+            parsed = ()
+
+        if not parsed:
+            raise ValueError("must contain at least one Telegram user ID")
+        return parsed
+
+
+def collect_secret_values(settings: Settings) -> tuple[str, ...]:
+    """Return all configured secret values for log redaction filters."""
+    secrets = [
+        settings.telegram_bot_token.get_secret_value(),
+        settings.gemini_api_key.get_secret_value(),
+        settings.database_url.get_secret_value(),
+    ]
+    if settings.tradingview_webhook_secret is not None:
+        secrets.append(settings.tradingview_webhook_secret.get_secret_value())
+    return tuple(secrets)
 
 
 def load_settings(env_file: Path | None = Path(".env")) -> Settings:
-    """Load settings, converting validation errors into a `ConfigError` without input values."""
+    """Load settings from env or optional `.env` file without leaking secrets."""
     try:
         return Settings(_env_file=env_file)
     except ValidationError as exc:
         problems = []
         for error in exc.errors(include_input=False, include_url=False):
-            field = ".".join(str(part) for part in error["loc"])
-            problems.append(f"{field.upper()}: {error['msg']}")
+            loc = ".".join(str(part) for part in error["loc"])
+            label = loc.upper() if loc else "SETTINGS"
+            problems.append(f"{label}: {error['msg']}")
         raise ConfigError("Invalid configuration:\n  " + "\n  ".join(problems)) from None

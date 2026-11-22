@@ -9,6 +9,8 @@ Related documents:
 - `docs/decisions/0005-news-and-sentiment.md`: accepted Phase 11 traceable news & non-probabilistic sentiment pipeline rules (binding).
 - `docs/decisions/0006-offline-ml-validation.md`: accepted Phase 12 offline ML target, purged walk-forward validation, and promotion gate rules (binding).
 - `docs/decisions/0007-shadow-inference-and-release.md`: accepted Phase 13 shadow inference, parity, monitoring, abstention, and rollback rules (binding).
+- `docs/decisions/0008-production-hardening.md`: production hardening decisions (superseded by ADR 0009 for personal-only scope).
+- `docs/decisions/0009-personal-mode-simplification.md`: accepted personal-only scope, single-owner allowlist, and overhead pruning (binding).
 - `AGENTS.md`: always-on agent rules and project commands.
 - `.agents/skills/crypto-research-engineer/SKILL.md`: engineering rules.
 - `.agents/skills/socratic-tutor/SKILL.md`: opt-in tutoring mode.
@@ -33,7 +35,7 @@ Update this table in the completion report of every phase. Status values: `Not s
 | 11 | News and sentiment | Done |
 | 12 | Offline ML | Done |
 | 13 | Shadow inference and optional release | Done |
-| 14 | Production hardening | Not started |
+| 14 | Production hardening | Done (simplified to personal-only scope per ADR 0009; public-launch hardening deferred) |
 
 ## 1. Product definition
 

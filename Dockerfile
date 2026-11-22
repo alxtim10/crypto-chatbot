@@ -14,4 +14,7 @@ RUN pip install --no-cache-dir . && \
 
 USER appuser
 
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD ["crypto-chatbot", "check-config"]
+
 CMD ["crypto-chatbot", "run-bot"]
