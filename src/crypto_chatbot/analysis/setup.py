@@ -24,6 +24,7 @@ from crypto_chatbot.schemas.analysis import (
     TradeSetup,
 )
 from crypto_chatbot.schemas.market import MarketCandle, Timeframe
+from crypto_chatbot.schemas.ml import CostAssumptions
 from crypto_chatbot.schemas.news import SentimentLabel, SentimentMetrics
 from crypto_chatbot.storage.repositories import TradeSetupRecord
 
@@ -42,6 +43,30 @@ SETUP_PARAMETERS: dict[str, int | float | str] = {
     "trade_setup_sl_atr_buffer": SL_ATR_BUFFER,
     "trade_setup_tp_levels": 3,
 }
+
+
+def _net_reward_risk(
+    *,
+    entry_mid: float,
+    target: float,
+    stop_loss: float,
+    cost_rate: float,
+) -> float | None:
+    """Reward:risk after subtracting round-trip execution cost from both reward and risk.
+
+    Cost is applied in price terms as `cost_rate * entry_mid` on each of the reward (gross
+    distance to the target) and the risk (gross distance to the stop). Returns `None` when
+    the net risk is non-positive (cost dominates the stop distance).
+    """
+    cost_price = cost_rate * entry_mid
+    gross_reward = abs(target - entry_mid)
+    gross_risk = abs(entry_mid - stop_loss)
+    net_reward = gross_reward - cost_price
+    net_risk = gross_risk + cost_price
+    if net_risk <= 0.0:
+        return None
+    net_rr = net_reward / net_risk
+    return net_rr if net_rr > 0.0 else 0.0
 
 
 class _LtfRefinement(NamedTuple):
@@ -584,6 +609,7 @@ def build_trade_setup(
     htf_candles_by_tf: Mapping[Timeframe, Sequence[MarketCandle]] | None = None,
     as_of: datetime | None = None,
     use_available_time: bool = False,
+    cost_assumptions: CostAssumptions | None = None,
 ) -> TradeSetup:
     """Compute 1 deterministic conditional trade setup (Entry, SL, TP1-3) or honest WAIT."""
     htf_sup, htf_res = _extract_sr_levels(structure, smc)
@@ -809,6 +835,23 @@ def build_trade_setup(
             ltf_resistance=ltf_res,
         )
 
+    costs = cost_assumptions or CostAssumptions()
+    cost_rate = costs.round_trip_cost_rate
+    net_rr_tp1 = _net_reward_risk(
+        entry_mid=entry_mid, target=tp1, stop_loss=stop_loss, cost_rate=cost_rate
+    )
+    net_rr_tp2 = _net_reward_risk(
+        entry_mid=entry_mid, target=tp2, stop_loss=stop_loss, cost_rate=cost_rate
+    )
+    net_rr_tp3 = _net_reward_risk(
+        entry_mid=entry_mid, target=tp3, stop_loss=stop_loss, cost_rate=cost_rate
+    )
+    if net_rr_tp2 is not None and net_rr_tp2 < MIN_RR_TP2:
+        risk_notes.append(
+            "Rasio Risk:Reward ke TP 2 setelah biaya (fee + spread + slippage) turun di bawah "
+            "1:1,5; perkecil ukuran posisi atau tunggu zona entry lebih presisi."
+        )
+
     return TradeSetup(
         status=SetupStatus.READY,
         bias=bias,
@@ -833,6 +876,10 @@ def build_trade_setup(
         rr_tp1=rr_tp1,
         rr_tp2=rr_tp2,
         rr_tp3=rr_tp3,
+        net_rr_tp1=net_rr_tp1,
+        net_rr_tp2=net_rr_tp2,
+        net_rr_tp3=net_rr_tp3,
+        cost_rate_round_trip=cost_rate,
         risk_notes=tuple(dict.fromkeys(risk_notes)),
     )
 

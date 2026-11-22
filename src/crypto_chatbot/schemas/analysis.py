@@ -42,6 +42,12 @@ class MarketStructure(StrEnum):
     MIXED = "mixed"
 
 
+class VolatilityRegime(StrEnum):
+    LOW = "low"
+    NORMAL = "normal"
+    HIGH = "high"
+
+
 class MtfRsiAlignment(StrEnum):
     ALIGNED_BULLISH = "aligned_bullish"
     ALIGNED_BEARISH = "aligned_bearish"
@@ -170,6 +176,10 @@ class TradeSetup(BaseModel):
     rr_tp1: FiniteFloat | None = Field(default=None, gt=0)
     rr_tp2: FiniteFloat | None = Field(default=None, gt=0)
     rr_tp3: FiniteFloat | None = Field(default=None, gt=0)
+    net_rr_tp1: FiniteFloat | None = None
+    net_rr_tp2: FiniteFloat | None = None
+    net_rr_tp3: FiniteFloat | None = None
+    cost_rate_round_trip: FiniteFloat | None = Field(default=None, ge=0)
     wait_reason: str | None = None
     risk_notes: tuple[str, ...] = ()
 
@@ -287,6 +297,18 @@ class TechnicalMetrics(BaseModel):
     minus_di_14: FiniteFloat | None = Field(default=None, ge=0, le=100)
     relative_volume_20: FiniteFloat | None = Field(default=None, ge=0)
     atr_percentile_100: FiniteFloat | None = Field(default=None, ge=0, le=100)
+    bollinger_mid_20: FiniteFloat | None = Field(default=None, gt=0)
+    bollinger_upper_20: FiniteFloat | None = Field(default=None, gt=0)
+    bollinger_lower_20: FiniteFloat | None = Field(default=None, gt=0)
+    bollinger_percent_b: FiniteFloat | None = None
+    bollinger_bandwidth: FiniteFloat | None = Field(default=None, ge=0)
+    donchian_upper_20: FiniteFloat | None = Field(default=None, gt=0)
+    donchian_lower_20: FiniteFloat | None = Field(default=None, gt=0)
+    donchian_mid_20: FiniteFloat | None = Field(default=None, gt=0)
+    vwap_rolling_20: FiniteFloat | None = Field(default=None, gt=0)
+    vwap_upper_20: FiniteFloat | None = Field(default=None, gt=0)
+    vwap_lower_20: FiniteFloat | None = Field(default=None, gt=0)
+    vwap_z_score: FiniteFloat | None = None
     mtf_rsi_alignment: MtfRsiAlignment | None = None
     prev_day_high: FiniteFloat | None = Field(default=None, gt=0)
     prev_day_low: FiniteFloat | None = Field(default=None, gt=0)

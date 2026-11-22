@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -15,6 +16,16 @@ class PurgedSplit:
     fold_index: int
     train_indices: tuple[int, ...]
     val_indices: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class CpcvPath:
+    """One combinatorial purged cross-validation path (a set of test groups)."""
+
+    path_index: int
+    test_group_indices: tuple[int, ...]
+    train_indices: tuple[int, ...]
+    test_indices: tuple[int, ...]
 
 
 def split_dev_and_holdout(
@@ -126,3 +137,80 @@ def assert_no_fold_leakage(
                 raise ValueError(
                     f"fold {split.fold_index} train label_end_time overlaps validation start"
                 )
+
+
+def generate_cpcv_paths(
+    rows: Sequence[FeatureRow],
+    *,
+    n_groups: int = 6,
+    test_groups_per_path: int = 2,
+    embargo_bars: int = 3,
+) -> tuple[CpcvPath, ...]:
+    """Build Combinatorial Purged CV paths (Lopez de Prado).
+
+    Splits rows into `n_groups` contiguous chronological groups and, for each combination of
+    `test_groups_per_path` test groups, trains on the remaining groups. Training rows are
+    purged so their label window never overlaps a test group and an `embargo_bars` buffer is
+    removed immediately after each test group. Produces `C(n_groups, test_groups_per_path)`
+    paths, giving many out-of-sample sequences rather than a single walk-forward path.
+    """
+    if n_groups < 3:
+        raise ValueError("n_groups must be >= 3")
+    if not (1 <= test_groups_per_path < n_groups):
+        raise ValueError("test_groups_per_path must satisfy 1 <= k < n_groups")
+    if embargo_bars < 0:
+        raise ValueError("embargo_bars must be >= 0")
+
+    n = len(rows)
+    if n < n_groups * 4:
+        raise ValueError("insufficient rows for the requested number of CPCV groups")
+
+    assert_no_fold_leakage(rows, ())
+
+    # Contiguous group index boundaries.
+    bounds: list[tuple[int, int]] = []
+    base = n // n_groups
+    remainder = n % n_groups
+    start = 0
+    for g in range(n_groups):
+        size = base + (1 if g < remainder else 0)
+        bounds.append((start, start + size))
+        start += size
+
+    paths: list[CpcvPath] = []
+    combos = list(itertools.combinations(range(n_groups), test_groups_per_path))
+    for path_idx, test_groups in enumerate(combos):
+        test_indices: list[int] = []
+        test_spans: list[tuple[int, int]] = []
+        for g in test_groups:
+            lo, hi = bounds[g]
+            test_indices.extend(range(lo, hi))
+            test_spans.append((lo, hi))
+
+        test_set = set(test_indices)
+        min_test_time = min(rows[i].prediction_time for i in test_indices)
+        embargo_blocked: set[int] = set()
+        for _lo, hi in test_spans:
+            embargo_blocked.update(range(hi, min(n, hi + embargo_bars)))
+
+        train_indices = tuple(
+            i
+            for i in range(n)
+            if i not in test_set
+            and i not in embargo_blocked
+            and rows[i].label_end_time <= min_test_time
+        )
+        if not train_indices:
+            continue
+        paths.append(
+            CpcvPath(
+                path_index=path_idx,
+                test_group_indices=tuple(test_groups),
+                train_indices=train_indices,
+                test_indices=tuple(sorted(test_set)),
+            )
+        )
+
+    if not paths:
+        raise ValueError("no CPCV path produced non-empty purged training data")
+    return tuple(paths)

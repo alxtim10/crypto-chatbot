@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import itertools
+import math
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 
@@ -21,7 +22,7 @@ from crypto_chatbot.schemas.market import (
     UtcDatetime,
 )
 
-CALC_VERSION = "1.4.0"
+CALC_VERSION = "1.5.0"
 
 INDICATOR_PARAMETERS: dict[str, int | float | str] = {
     "return_short": 1,
@@ -37,6 +38,11 @@ INDICATOR_PARAMETERS: dict[str, int | float | str] = {
     "adx_period": 14,
     "relative_volume_period": 20,
     "atr_percentile_window": 100,
+    "bollinger_period": 20,
+    "bollinger_std_mult": 2.0,
+    "donchian_period": 20,
+    "vwap_period": 20,
+    "vwap_band_std_mult": 2.0,
     "swing_pivot_k": 3,
     "failed_breakout_window": 3,
     "regime_atr_pct_high_vol": 80.0,
@@ -56,6 +62,9 @@ MIN_HISTORY_ATR_14 = 42
 MIN_HISTORY_ADX_14 = 56
 MIN_HISTORY_REL_VOL_20 = 21
 MIN_HISTORY_ATR_PCT_100 = 113
+MIN_HISTORY_BOLLINGER_20 = 20
+MIN_HISTORY_DONCHIAN_20 = 20
+MIN_HISTORY_VWAP_20 = 20
 
 _BOUND_EPS = 1e-12
 
@@ -406,6 +415,155 @@ def atr_percentile_series(
     return out
 
 
+def bollinger_bands_series(
+    closes: ArrayLike,
+    period: int = 20,
+    std_mult: float = 2.0,
+) -> tuple[
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+]:
+    """Bollinger Bands on an SMA basis with population std (TradingView `ta.stdev`).
+
+    Returns `(mid, upper, lower, percent_b, bandwidth)`. `%B = (close - lower) / (upper - lower)`
+    and `bandwidth = (upper - lower) / mid`. When the band width is zero (flat window),
+    `%B` is set to 0.5 and `bandwidth` to 0.0.
+    """
+    if period < 2:
+        raise ValueError("period must be >= 2")
+    if std_mult <= 0.0:
+        raise ValueError("std_mult must be > 0")
+    arr = _as_1d_float64(closes, "closes")
+    n = len(arr)
+    mid = np.full(n, np.nan, dtype=np.float64)
+    upper = np.full(n, np.nan, dtype=np.float64)
+    lower = np.full(n, np.nan, dtype=np.float64)
+    percent_b = np.full(n, np.nan, dtype=np.float64)
+    bandwidth = np.full(n, np.nan, dtype=np.float64)
+
+    for t in range(period - 1, n):
+        window = arr[t - period + 1 : t + 1]
+        if not np.all(np.isfinite(window)):
+            continue
+        basis = float(np.mean(window))
+        std = float(np.std(window))  # population std (ddof=0), matches ta.stdev
+        up = basis + std_mult * std
+        lo = basis - std_mult * std
+        mid[t] = basis
+        upper[t] = up
+        lower[t] = lo
+        width = up - lo
+        if width <= _BOUND_EPS:
+            percent_b[t] = 0.5
+            bandwidth[t] = 0.0
+        else:
+            percent_b[t] = (float(arr[t]) - lo) / width
+            bandwidth[t] = width / basis if basis != 0.0 else np.nan
+
+    return mid, upper, lower, percent_b, bandwidth
+
+
+def donchian_channel_series(
+    highs: ArrayLike,
+    lows: ArrayLike,
+    period: int = 20,
+) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
+    """Donchian channel over the prior `period` closed bars (inclusive of current bar).
+
+    Returns `(upper, lower, mid)` where `upper = max(high)`, `lower = min(low)`,
+    `mid = (upper + lower) / 2` over the trailing window.
+    """
+    if period < 1:
+        raise ValueError("period must be >= 1")
+    h = _as_1d_float64(highs, "highs")
+    low_arr = _as_1d_float64(lows, "lows")
+    if len(h) != len(low_arr):
+        raise ValueError("highs and lows must have equal length")
+    n = len(h)
+    upper = np.full(n, np.nan, dtype=np.float64)
+    lower = np.full(n, np.nan, dtype=np.float64)
+    mid = np.full(n, np.nan, dtype=np.float64)
+
+    for t in range(period - 1, n):
+        h_win = h[t - period + 1 : t + 1]
+        low_win = low_arr[t - period + 1 : t + 1]
+        if not (np.all(np.isfinite(h_win)) and np.all(np.isfinite(low_win))):
+            continue
+        up = float(np.max(h_win))
+        lo = float(np.min(low_win))
+        upper[t] = up
+        lower[t] = lo
+        mid[t] = (up + lo) / 2.0
+
+    return upper, lower, mid
+
+
+def rolling_vwap_series(
+    highs: ArrayLike,
+    lows: ArrayLike,
+    closes: ArrayLike,
+    volumes: ArrayLike,
+    period: int = 20,
+    band_std_mult: float = 2.0,
+) -> tuple[
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+]:
+    """Rolling volume-weighted average price with volume-weighted standard-deviation bands.
+
+    Typical price `tp = (high + low + close) / 3`. VWAP over the trailing `period` bars is
+    `sum(tp*vol) / sum(vol)`. Bands use the volume-weighted std of `tp` around VWAP.
+    Returns `(vwap, upper, lower, z_score)` where `z_score = (close - vwap) / vw_std`.
+    Unavailable (NaN) when the window's total volume is zero.
+    """
+    if period < 1:
+        raise ValueError("period must be >= 1")
+    if band_std_mult <= 0.0:
+        raise ValueError("band_std_mult must be > 0")
+    h = _as_1d_float64(highs, "highs")
+    low_arr = _as_1d_float64(lows, "lows")
+    c = _as_1d_float64(closes, "closes")
+    v = _as_1d_float64(volumes, "volumes")
+    if not (len(h) == len(low_arr) == len(c) == len(v)):
+        raise ValueError("highs, lows, closes, and volumes must have equal length")
+    n = len(h)
+    typical = (h + low_arr + c) / 3.0
+
+    vwap = np.full(n, np.nan, dtype=np.float64)
+    upper = np.full(n, np.nan, dtype=np.float64)
+    lower = np.full(n, np.nan, dtype=np.float64)
+    z_score = np.full(n, np.nan, dtype=np.float64)
+
+    for t in range(period - 1, n):
+        tp_win = typical[t - period + 1 : t + 1]
+        vol_win = v[t - period + 1 : t + 1]
+        if not (np.all(np.isfinite(tp_win)) and np.all(np.isfinite(vol_win))):
+            continue
+        if np.any(vol_win < 0.0):
+            continue
+        total_vol = float(np.sum(vol_win))
+        if total_vol <= _BOUND_EPS:
+            continue
+        weights = vol_win / total_vol
+        mean_tp = float(np.sum(weights * tp_win))
+        var_tp = float(np.sum(weights * (tp_win - mean_tp) ** 2))
+        std_tp = math.sqrt(var_tp) if var_tp > 0.0 else 0.0
+        vwap[t] = mean_tp
+        upper[t] = mean_tp + band_std_mult * std_tp
+        lower[t] = mean_tp - band_std_mult * std_tp
+        if std_tp > _BOUND_EPS:
+            z_score[t] = (float(c[t]) - mean_tp) / std_tp
+        else:
+            z_score[t] = 0.0
+
+    return vwap, upper, lower, z_score
+
+
 def _aggregate_complete_period(
     candles: Sequence[MarketCandle],
     period_start: datetime,
@@ -553,6 +711,9 @@ def compute_technical_metrics(
     adx_14, plus_di_14, minus_di_14 = adx_dmi_series(highs, lows, closes, 14)
     rel_vol_20, zero_vol_mask = relative_volume_series(volumes, 20)
     atr_pct_100 = atr_percentile_series(atr_pct, 100)
+    bb_mid, bb_upper, bb_lower, bb_pct_b, bb_bandwidth = bollinger_bands_series(closes, 20, 2.0)
+    dc_upper, dc_lower, dc_mid = donchian_channel_series(highs, lows, 20)
+    vwap_mid, vwap_up, vwap_lo, vwap_z = rolling_vwap_series(highs, lows, closes, volumes, 20, 2.0)
 
     flags: list[QualityFlag] = []
     if n < MIN_HISTORY_EMA_200:
@@ -606,6 +767,18 @@ def compute_technical_metrics(
         minus_di_14=_clamp_pct_scalar(mdi_val) if mdi_val is not None else None,
         relative_volume_20=rel_vol_val,
         atr_percentile_100=_clamp_pct_scalar(atr_pct_rank) if atr_pct_rank is not None else None,
+        bollinger_mid_20=_finite_last(bb_mid, n, MIN_HISTORY_BOLLINGER_20),
+        bollinger_upper_20=_finite_last(bb_upper, n, MIN_HISTORY_BOLLINGER_20),
+        bollinger_lower_20=_finite_last(bb_lower, n, MIN_HISTORY_BOLLINGER_20),
+        bollinger_percent_b=_finite_last(bb_pct_b, n, MIN_HISTORY_BOLLINGER_20),
+        bollinger_bandwidth=_finite_last(bb_bandwidth, n, MIN_HISTORY_BOLLINGER_20),
+        donchian_upper_20=_finite_last(dc_upper, n, MIN_HISTORY_DONCHIAN_20),
+        donchian_lower_20=_finite_last(dc_lower, n, MIN_HISTORY_DONCHIAN_20),
+        donchian_mid_20=_finite_last(dc_mid, n, MIN_HISTORY_DONCHIAN_20),
+        vwap_rolling_20=_finite_last(vwap_mid, n, MIN_HISTORY_VWAP_20),
+        vwap_upper_20=_finite_last(vwap_up, n, MIN_HISTORY_VWAP_20),
+        vwap_lower_20=_finite_last(vwap_lo, n, MIN_HISTORY_VWAP_20),
+        vwap_z_score=_finite_last(vwap_z, n, MIN_HISTORY_VWAP_20),
         mtf_rsi_alignment=mtf_result.alignment if mtf_result is not None else None,
         prev_day_high=levels.prev_day_high,
         prev_day_low=levels.prev_day_low,

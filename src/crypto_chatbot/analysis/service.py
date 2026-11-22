@@ -24,9 +24,14 @@ from crypto_chatbot.analysis.indicators import (
     compute_technical_metrics,
 )
 from crypto_chatbot.analysis.orderflow import compute_closed_candle_orderflow
-from crypto_chatbot.analysis.regimes import classify_regime
+from crypto_chatbot.analysis.regimes import classify_regime, classify_volatility_regime
 from crypto_chatbot.analysis.setup import SETUP_PARAMETERS, build_trade_setup
 from crypto_chatbot.analysis.smc import analyze_smc
+from crypto_chatbot.analysis.statistics import (
+    STATISTICS_PARAMETERS,
+    StatisticalMetrics,
+    compute_statistical_metrics,
+)
 from crypto_chatbot.analysis.structure import analyze_market_structure
 from crypto_chatbot.market_data.base import (
     DEFAULT_CANDLE_LIMIT,
@@ -266,6 +271,8 @@ def _build_facts(
     sentiment: SentimentMetrics | None = None,
     order_flow: OrderFlowMetrics | None = None,
     cross_venue_derivatives: CrossVenueDerivativesSummary | None = None,
+    statistics: StatisticalMetrics | None = None,
+    volatility_percentile: float | None = None,
 ) -> tuple[tuple[Fact, ...], dict[str, str]]:
     facts: list[Fact] = []
     fact_ids_by_key: dict[str, str] = {}
@@ -346,6 +353,113 @@ def _build_facts(
         "ratio",
         "ratio_2",
     )
+    add_fact(
+        "bollinger_upper_20",
+        "Bollinger upper (20)",
+        metrics.bollinger_upper_20,
+        quote_currency,
+        "price",
+    )
+    add_fact(
+        "bollinger_mid_20",
+        "Bollinger basis (20)",
+        metrics.bollinger_mid_20,
+        quote_currency,
+        "price",
+    )
+    add_fact(
+        "bollinger_lower_20",
+        "Bollinger lower (20)",
+        metrics.bollinger_lower_20,
+        quote_currency,
+        "price",
+    )
+    add_fact(
+        "bollinger_percent_b",
+        "Bollinger %B",
+        metrics.bollinger_percent_b,
+        "ratio",
+        "signed_decimal_2",
+    )
+    add_fact(
+        "bollinger_bandwidth",
+        "Bollinger bandwidth",
+        metrics.bollinger_bandwidth * 100.0 if metrics.bollinger_bandwidth is not None else None,
+        "%",
+        "percent",
+    )
+    add_fact(
+        "donchian_upper_20",
+        "Donchian upper (20)",
+        metrics.donchian_upper_20,
+        quote_currency,
+        "price",
+    )
+    add_fact(
+        "donchian_lower_20",
+        "Donchian lower (20)",
+        metrics.donchian_lower_20,
+        quote_currency,
+        "price",
+    )
+    add_fact(
+        "vwap_rolling_20", "VWAP rolling (20)", metrics.vwap_rolling_20, quote_currency, "price"
+    )
+    add_fact(
+        "vwap_z_score",
+        "Deviasi harga vs VWAP (z-score)",
+        metrics.vwap_z_score,
+        "sigma",
+        "signed_decimal_2",
+    )
+
+    if statistics is not None:
+        add_fact(
+            "realized_vol_cc",
+            "Volatilitas terealisasi (20 bar)",
+            statistics.realized_vol_cc * 100.0 if statistics.realized_vol_cc is not None else None,
+            "%",
+            "percent",
+        )
+        add_fact(
+            "parkinson_vol",
+            "Volatilitas Parkinson (20 bar)",
+            statistics.parkinson_vol * 100.0 if statistics.parkinson_vol is not None else None,
+            "%",
+            "percent",
+        )
+        add_fact(
+            "garman_klass_vol",
+            "Volatilitas Garman-Klass (20 bar)",
+            statistics.garman_klass_vol * 100.0
+            if statistics.garman_klass_vol is not None
+            else None,
+            "%",
+            "percent",
+        )
+        add_fact(
+            "hurst_exponent",
+            "Eksponen Hurst (persistensi)",
+            statistics.hurst_exponent,
+            "index",
+            "decimal_2",
+        )
+        add_fact(
+            "ou_half_life",
+            "Half-life mean reversion",
+            statistics.ou_half_life,
+            "bar",
+            "decimal_1",
+        )
+
+    if volatility_percentile is not None:
+        add_fact(
+            "realized_vol_percentile",
+            "Persentil volatilitas terealisasi",
+            volatility_percentile,
+            "percentile",
+            "decimal_1",
+        )
 
     for tf, key in (
         (Timeframe.H1, "mtf_rsi_1h"),
@@ -1079,6 +1193,8 @@ def build_analysis_snapshot(
     regime = classify_regime(ind_result.metrics)
     structure = analyze_market_structure(batch.candles)
     failed_breakouts = detect_failed_breakouts(batch.candles)
+    statistical_metrics = compute_statistical_metrics(batch.candles)
+    volatility_regime_result = classify_volatility_regime(batch.candles)
 
     deriv_result: DerivativesAnalysisResult | None = None
     extra_params: dict[str, int | float | str] = {}
@@ -1227,6 +1343,8 @@ def build_analysis_snapshot(
         sentiment=sent_metrics,
         order_flow=actual_order_flow,
         cross_venue_derivatives=cross_venue_derivatives,
+        statistics=statistical_metrics,
+        volatility_percentile=volatility_regime_result.percentile,
     )
 
     recent_cutoff = as_of - 10 * batch.timeframe.duration
@@ -1260,6 +1378,7 @@ def build_analysis_snapshot(
         sentiment_digest=sent_digest,
     )
     params = dict(INDICATOR_PARAMETERS)
+    params.update(STATISTICS_PARAMETERS)
     params.update(SETUP_PARAMETERS)
     params.update(extra_params)
 
