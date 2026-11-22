@@ -33,10 +33,12 @@ from crypto_chatbot.market_data.symbols import (
     resolve_symbol,
 )
 from crypto_chatbot.market_data.tradingview import parse_ai_agent_lens_packet
+from crypto_chatbot.ml.experiment import run_offline_experiment
 from crypto_chatbot.news.pipeline import build_sentiment_observations, deduplicate_articles
 from crypto_chatbot.schemas.analysis import AnalysisSnapshot
 from crypto_chatbot.schemas.derivatives import DerivativesContext
 from crypto_chatbot.schemas.market import MarketType, Timeframe
+from crypto_chatbot.schemas.ml import MlExperimentConfig
 from crypto_chatbot.schemas.news import RawNewsItem, SentimentObservation
 from crypto_chatbot.schemas.tradingview import TradingViewPacket
 from crypto_chatbot.storage.database import create_db_engine, init_db
@@ -46,6 +48,7 @@ from crypto_chatbot.storage.repositories import (
     NewsRepository,
     PostgresDerivativesRepository,
     PostgresMarketRepository,
+    PostgresMlExperimentRepository,
     PostgresNewsRepository,
     PostgresSetupLogRepository,
     PostgresTradingViewRepository,
@@ -502,6 +505,123 @@ def _run_bot() -> int:
     return 0
 
 
+def _load_news_observations_from_fixture(
+    news_fixture_path: Path | None,
+) -> tuple[SentimentObservation, ...] | None:
+    if news_fixture_path is None:
+        return None
+    if not news_fixture_path.is_file():
+        raise ValueError(f"news fixture file not found: {news_fixture_path}")
+    raw_news_json = json.loads(news_fixture_path.read_text(encoding="utf-8"))
+    raw_items_list = (
+        raw_news_json.get("articles") if isinstance(raw_news_json, dict) else raw_news_json
+    )
+    if not isinstance(raw_items_list, list):
+        raise ValueError("news fixture must be a JSON array or object containing 'articles'")
+    raw_items = [RawNewsItem.model_validate(item) for item in raw_items_list]
+    articles, _ = deduplicate_articles(raw_items)
+    return build_sentiment_observations(articles)
+
+
+def _run_ml_experiment(
+    *,
+    symbol_raw: str,
+    timeframe_raw: str,
+    fixture_path: Path | None,
+    news_fixture_path: Path | None,
+    as_json: bool,
+    persist: bool,
+) -> int:
+    engine: Any = None
+    try:
+        mapping = resolve_mvp_spot_symbol(symbol_raw)
+        try:
+            timeframe = Timeframe(timeframe_raw.strip().lower())
+        except ValueError:
+            supported = ", ".join(tf.value for tf in Timeframe)
+            raise ValueError(
+                f"unsupported timeframe '{timeframe_raw}' (supported: {supported})"
+            ) from None
+
+        if fixture_path is None:
+            raise ValueError("--fixture is required for offline ml-experiment")
+        if not fixture_path.is_file():
+            raise ValueError(f"fixture file not found: {fixture_path}")
+
+        raw_data = json.loads(fixture_path.read_text(encoding="utf-8"))
+        raw_rows = raw_data.get("raw_ohlcv") if isinstance(raw_data, dict) else raw_data
+        received_str = raw_data.get("received_time") if isinstance(raw_data, dict) else None
+        if not isinstance(raw_rows, list) or not raw_rows:
+            raise ValueError("fixture contains no OHLCV rows")
+
+        if isinstance(received_str, str) and received_str.strip():
+            received_time = datetime.fromisoformat(received_str)
+        else:
+            last_ts_ms = max(float(row[0]) for row in raw_rows if isinstance(row, list) and row)
+            last_open = datetime.fromtimestamp(last_ts_ms / 1000.0, tz=UTC)
+            received_time = last_open + timeframe.duration + timedelta(seconds=1)
+
+        batch = normalize_ohlcv_rows(
+            raw_rows,
+            symbol=mapping,
+            timeframe=timeframe,
+            received_time=received_time,
+            now=received_time,
+        )
+        news_obs = _load_news_observations_from_fixture(news_fixture_path)
+        config = MlExperimentConfig(
+            canonical_symbol=mapping.canonical_symbol,
+            timeframe=timeframe,
+        )
+        report = run_offline_experiment(
+            batch.candles,
+            config=config,
+            sentiment_observations=news_obs,
+        )
+
+        if persist:
+            database_url = os.environ.get("DATABASE_URL", "").strip()
+            if not database_url:
+                raise ValueError(
+                    "DATABASE_URL environment variable is required when --persist is set"
+                )
+            engine = create_db_engine(database_url)
+            init_db(engine)
+            PostgresMlExperimentRepository(engine).save_experiment(report)
+    except (SymbolError, ValueError, json.JSONDecodeError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        if engine is not None:
+            engine.dispose()
+
+    if as_json:
+        print(report.model_dump_json(indent=2))
+    else:
+        status_lbl = "ACCEPTED" if report.accepted else "REJECTED"
+        print(
+            f"ML Experiment {report.experiment_id} ({report.config.canonical_symbol} "
+            f"{report.config.timeframe.value}) [{status_lbl}]"
+        )
+        print(
+            f"  Target: {report.config.target_name} | Rows: {report.total_rows} "
+            f"(dev={report.dev_rows}, holdout={report.holdout_rows})"
+        )
+        print(
+            f"  OOS Brier: {report.oof_summary.model_brier:.4f} "
+            f"(naive {report.oof_summary.naive_brier:.4f}) | "
+            f"OOS Net After Costs: {report.oof_summary.net_return_after_costs * 100.0:.2f}%"
+        )
+        print(
+            f"  Holdout Brier: {report.holdout_summary.model_brier:.4f} "
+            f"(naive {report.holdout_summary.naive_brier:.4f}) | "
+            f"Holdout Net After Costs: {report.holdout_summary.net_return_after_costs * 100.0:.2f}%"
+        )
+        for reason in report.rejection_reasons:
+            print(f"  Rejected because: {reason}")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="crypto-chatbot")
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -588,6 +708,31 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=24,
         help="Maximum closed candles horizon after setup as_of (default: 24).",
     )
+    ml_parser = subcommands.add_parser(
+        "ml-experiment",
+        help="Run offline Phase 12 ML validation experiment on recorded candle fixtures.",
+    )
+    ml_parser.add_argument("symbol", help="Target spot symbol (e.g. BTC, ETH).")
+    ml_parser.add_argument(
+        "timeframe", nargs="?", default="4h", help="Candle timeframe (default 4h)."
+    )
+    ml_parser.add_argument(
+        "--fixture", type=Path, required=True, help="Recorded OHLCV JSON fixture."
+    )
+    ml_parser.add_argument(
+        "--news-fixture",
+        type=Path,
+        default=None,
+        help="Optional Phase 11 news JSON fixture.",
+    )
+    ml_parser.add_argument(
+        "--json", action="store_true", help="Print full MlExperimentReport JSON."
+    )
+    ml_parser.add_argument(
+        "--persist",
+        action="store_true",
+        help="Persist experiment report to PostgreSQL ml_experiments via DATABASE_URL.",
+    )
 
     args = parser.parse_args(argv)
     if args.command == "check-config":
@@ -612,6 +757,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_purge_expired()
     if args.command == "settle-setups":
         return _run_settle_setups(max_bars=args.max_bars)
+    if args.command == "ml-experiment":
+        return _run_ml_experiment(
+            symbol_raw=args.symbol,
+            timeframe_raw=args.timeframe,
+            fixture_path=args.fixture,
+            news_fixture_path=args.news_fixture,
+            as_json=args.json,
+            persist=args.persist,
+        )
     parser.error(f"unknown command: {args.command}")  # pragma: no cover
 
 

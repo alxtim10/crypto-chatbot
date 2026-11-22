@@ -7,6 +7,7 @@ Related documents:
 - `docs/decisions/0003-compact-output-smc-and-trade-setup.md`: accepted compact output, Hybrid Crypto + Causal SMC, and deterministic conditional trade setup rules (binding).
 - `docs/decisions/0004-tradingview-ai-agent-lens.md`: accepted Phase 10 TradingView AI Agent Lens webhook and cross-source rules (binding).
 - `docs/decisions/0005-news-and-sentiment.md`: accepted Phase 11 traceable news & non-probabilistic sentiment pipeline rules (binding).
+- `docs/decisions/0006-offline-ml-validation.md`: accepted Phase 12 offline ML target, purged walk-forward validation, and promotion gate rules (binding).
 - `AGENTS.md`: always-on agent rules and project commands.
 - `.agents/skills/crypto-research-engineer/SKILL.md`: engineering rules.
 - `.agents/skills/socratic-tutor/SKILL.md`: opt-in tutoring mode.
@@ -29,7 +30,7 @@ Update this table in the completion report of every phase. Status values: `Not s
 | 9 | Derivatives and liquidity data | Done |
 | 10 | TradingView AI Agent Lens | Done |
 | 11 | News and sentiment | Done |
-| 12 | Offline ML | Not started |
+| 12 | Offline ML | Done |
 | 13 | Shadow inference and optional release | Not started |
 | 14 | Production hardening | Not started |
 

@@ -532,3 +532,36 @@ class SentimentObservationRow(Base):
     is_probabilistic: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     published_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     available_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class MlExperimentRow(Base):
+    """Offline ML experiment tracking (`ml_experiments`); no user data or secrets."""
+
+    __tablename__ = "ml_experiments"
+    __table_args__ = (
+        UniqueConstraint("experiment_id", name="uq_ml_experiments_id"),
+        Index(
+            "ix_ml_experiments_lookup",
+            "canonical_symbol",
+            "timeframe",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    experiment_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    canonical_symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    venue: Mapped[str] = mapped_column(String(64), nullable=False)
+    timeframe: Mapped[str] = mapped_column(String(16), nullable=False)
+    target_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    feature_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    model_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    config_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    dataset_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    accepted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    oof_brier: Mapped[float] = mapped_column(Double, nullable=False)
+    holdout_brier: Mapped[float] = mapped_column(Double, nullable=False)
+    oof_net_return: Mapped[float] = mapped_column(Double, nullable=False)
+    holdout_net_return: Mapped[float] = mapped_column(Double, nullable=False)
+    report_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)

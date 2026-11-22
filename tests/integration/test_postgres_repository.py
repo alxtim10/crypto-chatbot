@@ -24,8 +24,10 @@ from crypto_chatbot.market_data.orderbook import normalize_order_book_payload
 from crypto_chatbot.market_data.quality import normalize_ohlcv_rows
 from crypto_chatbot.market_data.symbols import resolve_mvp_spot_symbol, resolve_symbol
 from crypto_chatbot.market_data.tradingview import parse_ai_agent_lens_packet
+from crypto_chatbot.ml.experiment import run_offline_experiment
 from crypto_chatbot.news.pipeline import build_sentiment_observations, deduplicate_articles
 from crypto_chatbot.schemas.market import MarketType, Timeframe
+from crypto_chatbot.schemas.ml import MlExperimentConfig
 from crypto_chatbot.schemas.news import RawNewsItem
 from crypto_chatbot.storage.database import create_db_engine, init_db
 from crypto_chatbot.storage.models import Base
@@ -33,6 +35,7 @@ from crypto_chatbot.storage.repositories import (
     LlmInteractionRecord,
     PostgresDerivativesRepository,
     PostgresMarketRepository,
+    PostgresMlExperimentRepository,
     PostgresNewsRepository,
     PostgresSetupLogRepository,
     PostgresTradingViewRepository,
@@ -523,3 +526,29 @@ def test_postgres_news_sentiment_repository_dedup_and_point_in_time(
     )
     assert len(later_btc) == 4
     assert news_repo.load_observations(canonical_symbol="SOL/USDT") == ()
+
+
+def test_postgres_ml_experiment_repository_round_trip(
+    pg_repository: PostgresMarketRepository,
+) -> None:
+    raw = json.loads(FIXTURE_1000.read_text(encoding="utf-8"))
+    received = datetime(2026, 10, 14, 16, 0, 1, tzinfo=UTC)
+    batch = normalize_ohlcv_rows(
+        raw["raw_ohlcv"],
+        symbol=resolve_mvp_spot_symbol("BTC"),
+        timeframe=Timeframe.H4,
+        received_time=received,
+        now=received,
+    )
+    config = MlExperimentConfig(canonical_symbol="BTC/USDT", timeframe=Timeframe.H4)
+    report = run_offline_experiment(batch.candles, config=config)
+
+    ml_repo = PostgresMlExperimentRepository(pg_repository._engine)
+    assert ml_repo.save_experiment(report) is True
+    assert ml_repo.save_experiment(report) is False
+
+    loaded = ml_repo.get_experiment(report.experiment_id)
+    assert loaded == report
+    listed = ml_repo.list_experiments(canonical_symbol="BTC/USDT", timeframe=Timeframe.H4)
+    assert len(listed) == 1
+    assert listed[0].experiment_id == report.experiment_id

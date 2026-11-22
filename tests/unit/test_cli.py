@@ -228,3 +228,38 @@ def test_cli_analyze_with_news_fixture(
     out = capsys.readouterr().out
     assert "Sentimen Berita 24h" in out
     assert "https://" in out
+
+
+def test_cli_ml_experiment_from_fixture(
+    isolated_cwd: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from crypto_chatbot.schemas.ml import MlExperimentReport
+
+    rc = cli.main(
+        [
+            "ml-experiment",
+            "BTC",
+            "4h",
+            "--fixture",
+            str(FIXTURE_1000),
+            "--json",
+        ]
+    )
+    assert rc == 0
+    report = MlExperimentReport.model_validate_json(capsys.readouterr().out)
+    assert report.experiment_id.startswith("exp-")
+    assert report.holdout_rows > 0
+    assert report.dev_rows > 0
+
+    rc_text = cli.main(
+        [
+            "ml-experiment",
+            "BTC",
+            "4h",
+            "--fixture",
+            str(FIXTURE_1000),
+        ]
+    )
+    assert rc_text == 0
+    assert "ML Experiment" in capsys.readouterr().out

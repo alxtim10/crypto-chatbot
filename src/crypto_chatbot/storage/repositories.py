@@ -28,6 +28,7 @@ from crypto_chatbot.schemas.market import (
     Timeframe,
     UtcDatetime,
 )
+from crypto_chatbot.schemas.ml import MlExperimentReport
 from crypto_chatbot.schemas.news import (
     MIN_ENTITY_MATCH_CONFIDENCE,
     NormalizedNewsArticle,
@@ -47,6 +48,7 @@ from crypto_chatbot.storage.models import (
     LlmInteractionRow,
     MarketCandleRow,
     MessageRow,
+    MlExperimentRow,
     NewsArticleRow,
     OpenInterestRow,
     OrderBookSnapshotRow,
@@ -1513,3 +1515,83 @@ class PostgresNewsRepository:
         if limit is not None:
             db_rows.reverse()
         return tuple(_row_to_sentiment_observation(row) for row in db_rows)
+
+
+class MlExperimentRepository(Protocol):
+    """Repository interface for persisted offline ML experiment reports."""
+
+    def save_experiment(self, report: MlExperimentReport) -> bool: ...
+
+    def get_experiment(self, experiment_id: str) -> MlExperimentReport | None: ...
+
+    def list_experiments(
+        self,
+        *,
+        canonical_symbol: str | None = None,
+        timeframe: Timeframe | None = None,
+        limit: int = 20,
+    ) -> tuple[MlExperimentReport, ...]: ...
+
+
+class PostgresMlExperimentRepository:
+    """Synchronous PostgreSQL repository for `ml_experiments`."""
+
+    def __init__(self, engine: Engine) -> None:
+        self._engine = engine
+
+    def save_experiment(self, report: MlExperimentReport) -> bool:
+        payload = {
+            "experiment_id": report.experiment_id,
+            "canonical_symbol": report.config.canonical_symbol,
+            "venue": report.config.venue,
+            "timeframe": report.config.timeframe.value,
+            "target_name": report.config.target_name,
+            "feature_version": report.config.feature_version,
+            "model_version": report.config.model_version,
+            "config_sha256": report.config_sha256,
+            "dataset_sha256": report.dataset_sha256,
+            "created_at": report.created_at,
+            "accepted": report.accepted,
+            "oof_brier": report.oof_summary.model_brier,
+            "holdout_brier": report.holdout_summary.model_brier,
+            "oof_net_return": report.oof_summary.net_return_after_costs,
+            "holdout_net_return": report.holdout_summary.net_return_after_costs,
+            "report_payload": report.model_dump(mode="json"),
+        }
+        stmt = (
+            insert(MlExperimentRow)
+            .values(payload)
+            .on_conflict_do_nothing(constraint="uq_ml_experiments_id")
+            .returning(MlExperimentRow.id)
+        )
+        with Session(self._engine) as session, session.begin():
+            return bool(session.scalars(stmt).all())
+
+    def get_experiment(self, experiment_id: str) -> MlExperimentReport | None:
+        stmt = select(MlExperimentRow).where(MlExperimentRow.experiment_id == experiment_id)
+        with Session(self._engine) as session:
+            row = session.scalar(stmt)
+        if row is None:
+            return None
+        return MlExperimentReport.model_validate(row.report_payload)
+
+    def list_experiments(
+        self,
+        *,
+        canonical_symbol: str | None = None,
+        timeframe: Timeframe | None = None,
+        limit: int = 20,
+    ) -> tuple[MlExperimentReport, ...]:
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        stmt = select(MlExperimentRow)
+        if canonical_symbol is not None:
+            stmt = stmt.where(MlExperimentRow.canonical_symbol == canonical_symbol)
+        if timeframe is not None:
+            stmt = stmt.where(MlExperimentRow.timeframe == timeframe.value)
+        stmt = stmt.order_by(MlExperimentRow.created_at.desc(), MlExperimentRow.id.desc()).limit(
+            limit
+        )
+        with Session(self._engine) as session:
+            rows = list(session.scalars(stmt))
+        return tuple(MlExperimentReport.model_validate(r.report_payload) for r in rows)
