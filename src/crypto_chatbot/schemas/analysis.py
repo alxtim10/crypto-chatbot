@@ -17,6 +17,8 @@ from crypto_chatbot.schemas.market import (
     UtcDatetime,
     validate_symbol_market_type,
 )
+from crypto_chatbot.schemas.news import SentimentMetrics
+from crypto_chatbot.schemas.tradingview import TradingViewMetrics
 
 FACT_ID_PATTERN = r"^F[1-9][0-9]*$"
 
@@ -375,6 +377,8 @@ class AnalysisSnapshot(BaseModel):
     derivatives: DerivativesMetrics | None = None
     smc: SmcSummary | None = None
     mtf_overview: tuple[TimeframeOverview, ...] = ()
+    tradingview: TradingViewMetrics | None = None
+    sentiment: SentimentMetrics | None = None
     trade_setup: TradeSetup | None = None
     facts: tuple[Fact, ...] = ()
     regime: Regime | None = None
@@ -408,6 +412,20 @@ class AnalysisSnapshot(BaseModel):
         for event in self.events:
             if event.confirmation_time > self.as_of:
                 raise ValueError("event confirmation_time cannot exceed snapshot as_of (lookahead)")
+
+        if self.tradingview is not None and self.tradingview.candle_close_time > self.as_of:
+            raise ValueError(
+                "tradingview candle_close_time cannot exceed snapshot as_of (lookahead)"
+            )
+
+        if (
+            self.sentiment is not None
+            and self.sentiment.latest_available_time is not None
+            and self.sentiment.latest_available_time > self.as_of
+        ):
+            raise ValueError(
+                "sentiment latest_available_time cannot exceed snapshot as_of (lookahead)"
+            )
 
         if self.smc is not None:
             for ev in (self.smc.latest_structure_break, self.smc.latest_sweep):

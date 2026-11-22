@@ -139,6 +139,18 @@ def build_narration_user_payload(
             "wait_reason": snapshot.trade_setup.wait_reason,
             "risk_notes": list(snapshot.trade_setup.risk_notes),
         }
+    if snapshot.sentiment is not None:
+        snapshot_payload["sentiment_provenance"] = {
+            "window_hours": snapshot.sentiment.window_hours,
+            "model_version": snapshot.sentiment.model_version,
+            "is_probabilistic": False,
+            "dominant_label": snapshot.sentiment.dominant_label.value,
+            "article_count": snapshot.sentiment.article_count,
+            "positive_count": snapshot.sentiment.positive_count,
+            "negative_count": snapshot.sentiment.negative_count,
+            "neutral_count": snapshot.sentiment.neutral_count,
+            "publishers": list(dict.fromkeys(src.publisher for src in snapshot.sentiment.sources)),
+        }
 
     sections = [
         "Validated AnalysisSnapshot facts (source of truth):",
@@ -148,6 +160,11 @@ def build_narration_user_payload(
     untrusted_items: list[str] = []
     if user_context is not None and user_context.strip():
         untrusted_items.append(f"user_context: {sanitize_untrusted_text(user_context.strip())}")
+    if snapshot.sentiment is not None:
+        for idx, src in enumerate(snapshot.sentiment.sources, start=1):
+            untrusted_items.append(
+                f"news_headline_{idx}: {sanitize_untrusted_text(f'[{src.publisher}] {src.title}')}"
+            )
     for idx, item in enumerate(external_data, start=1):
         if item.strip():
             untrusted_items.append(f"external_{idx}: {sanitize_untrusted_text(item.strip())}")

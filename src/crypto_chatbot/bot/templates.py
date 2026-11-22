@@ -105,6 +105,8 @@ def format_fact_value(fact: Fact) -> str:
         return f"1:{format_indonesian_number(val, 2)}"
     if fmt == "decimal_1":
         return format_indonesian_number(val, 1)
+    if fmt == "integer":
+        return format_indonesian_number(val, 0)
     if fmt == "ratio_2":
         return f"{format_indonesian_number(val, 2)}x"
     return format_indonesian_number(val, 2)
@@ -117,6 +119,64 @@ def _esc(text: str, html_mode: bool) -> str:
 def _bold(text: str, html_mode: bool) -> str:
     escaped = _esc(text, html_mode)
     return f"<b>{escaped}</b>" if html_mode else escaped
+
+
+def _append_sentiment_lines(
+    lines: list[str],
+    snapshot: AnalysisSnapshot,
+    *,
+    html_mode: bool,
+    max_sources: int = 3,
+) -> None:
+    sent = snapshot.sentiment
+    if sent is None:
+        return
+    lbl_map = {
+        "positive": "Positif",
+        "negative": "Negatif",
+        "neutral": "Netral",
+    }
+    dom = lbl_map.get(sent.dominant_label.value, sent.dominant_label.value)
+    score_fact = next(
+        (f for f in snapshot.facts if f.label == "Skor sentimen berita 24h (bukan probabilitas)"),
+        None,
+    )
+    conf_fact = next(
+        (f for f in snapshot.facts if f.label == "Confidence sentimen berita 24h"),
+        None,
+    )
+    score_tok = _fmt_fact(score_fact) or format_indonesian_number(
+        sent.net_sentiment_score, 2, signed=True
+    )
+    conf_tok = _fmt_fact(conf_fact) or (
+        f"{format_indonesian_number(sent.mean_confidence * 100.0, 1)}%"
+    )
+    lines.append("")
+    lines.append(
+        _bold(
+            f"Sentimen Berita {sent.window_hours}h (Bukan Probabilitas — {sent.model_version})",
+            html_mode,
+        )
+    )
+    lines.append(
+        _esc(
+            f"- Ringkasan: {dom} | skor: {score_tok} | confidence: {conf_tok} "
+            f"| artikel unik: {sent.article_count} "
+            f"(+{sent.positive_count}/-{sent.negative_count}/={sent.neutral_count})",
+            html_mode,
+        )
+    )
+    for src in sent.sources[:max_sources]:
+        pub_esc = _esc(src.publisher, html_mode)
+        title_esc = _esc(src.title, html_mode)
+        if html_mode:
+            href = html.escape(src.canonical_url, quote=True)
+            lines.append(
+                f'- Sumber: <a href="{href}">{pub_esc}</a> — {title_esc} '
+                f"({src.sentiment_label.value})"
+            )
+        else:
+            lines.append(f"- Sumber: {src.publisher} — {src.title} ({src.canonical_url})")
 
 
 def render_deterministic_snapshot(
@@ -250,6 +310,28 @@ def render_deterministic_snapshot(
                 lines.append(
                     f"- Pemeriksaan harga lintas sumber: {_esc(deriv.cross_source_pair, html_mode)}"
                 )
+
+        if snapshot.tradingview is not None:
+            tv = snapshot.tradingview
+            lines.append("")
+            lines.append(
+                _bold(
+                    "TradingView AI Agent Lens (ai-agent-lens/v1 — Bukan Probabilitas)", html_mode
+                )
+            )
+            lines.append(
+                f"- Sumber: TradingView {_esc(tv.provider_symbol, html_mode)} "
+                f"({tv.timeframe.value}) | event: {_esc(tv.event_type, html_mode)} "
+                f"| key: {_esc(tv.idempotency_key, html_mode)}"
+            )
+            if tv.rule_label or tv.rule_score is not None:
+                lbl = _esc(tv.rule_label or "-", html_mode)
+                lines.append(
+                    f"- Label aturan: {lbl} (commit {_esc(tv.attribution_commit[:12], html_mode)})"
+                )
+
+        if snapshot.sentiment is not None:
+            _append_sentiment_lines(lines, snapshot, html_mode=html_mode, max_sources=3)
 
         if snapshot.smc is not None or snapshot.trade_setup is not None:
             lines.append("")
@@ -432,6 +514,23 @@ def render_compact_snapshot(
             lines.append(
                 _esc(f"Derivatif ({venue_tag.upper()}): " + " | ".join(deriv_parts), html_mode)
             )
+
+    if snapshot.tradingview is not None:
+        tv = snapshot.tradingview
+        tv_parts = [f"Event: {tv.event_type}"]
+        score_tok = _fmt_fact(by_label.get("Skor aturan TradingView (bukan probabilitas)"))
+        dev_tok = _fmt_fact(by_label.get("Deviasi harga TradingView vs bursa"))
+        if score_tok:
+            lbl = f" ({tv.rule_label})" if tv.rule_label else ""
+            tv_parts.append(f"Skor aturan: {score_tok}{lbl}")
+        if dev_tok:
+            tv_parts.append(f"Deviasi: {dev_tok}")
+        lines.append(
+            _esc("TradingView Lens (Bukan Probabilitas): " + " | ".join(tv_parts), html_mode)
+        )
+
+    if snapshot.sentiment is not None:
+        _append_sentiment_lines(lines, snapshot, html_mode=html_mode, max_sources=2)
 
     if len(snapshot.mtf_overview) >= 2:
         lines.append("")

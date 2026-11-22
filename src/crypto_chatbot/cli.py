@@ -32,18 +32,26 @@ from crypto_chatbot.market_data.symbols import (
     resolve_mvp_spot_symbol,
     resolve_symbol,
 )
+from crypto_chatbot.market_data.tradingview import parse_ai_agent_lens_packet
+from crypto_chatbot.news.pipeline import build_sentiment_observations, deduplicate_articles
 from crypto_chatbot.schemas.analysis import AnalysisSnapshot
 from crypto_chatbot.schemas.derivatives import DerivativesContext
 from crypto_chatbot.schemas.market import MarketType, Timeframe
+from crypto_chatbot.schemas.news import RawNewsItem, SentimentObservation
+from crypto_chatbot.schemas.tradingview import TradingViewPacket
 from crypto_chatbot.storage.database import create_db_engine, init_db
 from crypto_chatbot.storage.repositories import (
     DerivativesRepository,
     MarketRepository,
+    NewsRepository,
     PostgresDerivativesRepository,
     PostgresMarketRepository,
+    PostgresNewsRepository,
     PostgresSetupLogRepository,
+    PostgresTradingViewRepository,
     PostgresUserMemoryRepository,
     SetupLogRepository,
+    TradingViewRepository,
 )
 
 
@@ -63,6 +71,8 @@ def _build_repositories_from_env() -> tuple[
     MarketRepository,
     DerivativesRepository,
     SetupLogRepository,
+    TradingViewRepository,
+    NewsRepository,
     Any,
 ]:
     database_url = os.environ.get("DATABASE_URL", "").strip()
@@ -74,6 +84,8 @@ def _build_repositories_from_env() -> tuple[
         PostgresMarketRepository(engine),
         PostgresDerivativesRepository(engine),
         PostgresSetupLogRepository(engine),
+        PostgresTradingViewRepository(engine),
+        PostgresNewsRepository(engine),
         engine,
     )
 
@@ -172,9 +184,13 @@ def _analyze_from_fixture(
     timeframe: Timeframe,
     fixture_path: Path,
     derivatives_fixture_path: Path | None,
+    tradingview_fixture_path: Path | None,
+    news_fixture_path: Path | None,
     repository: MarketRepository | None,
     derivatives_repository: DerivativesRepository | None,
     setup_repository: SetupLogRepository | None = None,
+    tradingview_repository: TradingViewRepository | None = None,
+    news_repository: NewsRepository | None = None,
 ) -> AnalysisSnapshot:
     mapping = resolve_mvp_spot_symbol(symbol)
     if not fixture_path.is_file():
@@ -218,11 +234,55 @@ def _analyze_from_fixture(
         if derivatives_fixture_path is not None
         else None
     )
-    snapshot = build_analysis_snapshot(batch, derivatives_context=derivatives_context)
+    tv_packet: TradingViewPacket | None = None
+    if tradingview_fixture_path is not None:
+        if not tradingview_fixture_path.is_file():
+            raise ValueError(f"tradingview fixture file not found: {tradingview_fixture_path}")
+        tv_raw = json.loads(tradingview_fixture_path.read_text(encoding="utf-8"))
+        if not isinstance(tv_raw, dict):
+            raise ValueError("tradingview fixture must be a JSON object")
+        tv_received_raw = tv_raw.get("received_time")
+        tv_received = (
+            datetime.fromisoformat(tv_received_raw)
+            if isinstance(tv_received_raw, str) and tv_received_raw.strip()
+            else received_time
+        )
+        tv_packet = parse_ai_agent_lens_packet(
+            tv_raw,
+            received_time=tv_received,
+            now=tv_received,
+        )
+    news_observations: tuple[SentimentObservation, ...] | None = None
+    if news_fixture_path is not None:
+        if not news_fixture_path.is_file():
+            raise ValueError(f"news fixture file not found: {news_fixture_path}")
+        raw_news_json = json.loads(news_fixture_path.read_text(encoding="utf-8"))
+        raw_items_list = (
+            raw_news_json.get("articles") if isinstance(raw_news_json, dict) else raw_news_json
+        )
+        if not isinstance(raw_items_list, list):
+            raise ValueError("news fixture must be a JSON array or object containing 'articles'")
+        raw_items = [RawNewsItem.model_validate(item) for item in raw_items_list]
+        articles, _ = deduplicate_articles(raw_items)
+        news_observations = build_sentiment_observations(articles)
+        if news_repository is not None:
+            if articles:
+                news_repository.save_articles(articles)
+            if news_observations:
+                news_repository.save_observations(news_observations)
+
+    snapshot = build_analysis_snapshot(
+        batch,
+        derivatives_context=derivatives_context,
+        tradingview_packet=tv_packet,
+        news_observations=news_observations,
+    )
     if repository is not None:
         if batch.candles:
             repository.save_candles(batch.candles)
         repository.save_snapshot(snapshot)
+    if tradingview_repository is not None and tv_packet is not None:
+        tradingview_repository.save_packet(tv_packet)
     if setup_repository is not None and snapshot.trade_setup is not None:
         setup_repository.save_setup(snapshot, snapshot.trade_setup)
     return snapshot
@@ -237,6 +297,8 @@ async def _analyze_live(
     repository: MarketRepository | None,
     derivatives_repository: DerivativesRepository | None,
     setup_repository: SetupLogRepository | None = None,
+    tradingview_repository: TradingViewRepository | None = None,
+    news_repository: NewsRepository | None = None,
 ) -> AnalysisSnapshot:
     async with CcxtMarketDataProvider() as provider:
         if include_derivatives:
@@ -247,6 +309,8 @@ async def _analyze_live(
                     derivatives_provider=deriv_provider,
                     derivatives_repository=derivatives_repository,
                     setup_repository=setup_repository,
+                    tradingview_repository=tradingview_repository,
+                    news_repository=news_repository,
                 )
                 return await service.analyze(
                     symbol,
@@ -259,6 +323,8 @@ async def _analyze_live(
             provider=provider,
             repository=repository,
             setup_repository=setup_repository,
+            tradingview_repository=tradingview_repository,
+            news_repository=news_repository,
         )
         return await service.analyze(
             symbol,
@@ -275,6 +341,8 @@ def _run_analyze(
     timeframe_raw: str,
     fixture_path: Path | None,
     derivatives_fixture_path: Path | None,
+    tradingview_fixture_path: Path | None,
+    news_fixture_path: Path | None,
     as_json: bool,
     detail: bool,
     persist: bool,
@@ -295,10 +363,17 @@ def _run_analyze(
         repository: MarketRepository | None = None
         derivatives_repository: DerivativesRepository | None = None
         setup_repository: SetupLogRepository | None = None
+        tradingview_repository: TradingViewRepository | None = None
+        news_repository: NewsRepository | None = None
         if persist:
-            repository, derivatives_repository, setup_repository, engine = (
-                _build_repositories_from_env()
-            )
+            (
+                repository,
+                derivatives_repository,
+                setup_repository,
+                tradingview_repository,
+                news_repository,
+                engine,
+            ) = _build_repositories_from_env()
 
         if fixture_path is not None:
             snapshot = _analyze_from_fixture(
@@ -306,9 +381,13 @@ def _run_analyze(
                 timeframe=timeframe,
                 fixture_path=fixture_path,
                 derivatives_fixture_path=derivatives_fixture_path,
+                tradingview_fixture_path=tradingview_fixture_path,
+                news_fixture_path=news_fixture_path,
                 repository=repository,
                 derivatives_repository=derivatives_repository,
                 setup_repository=setup_repository,
+                tradingview_repository=tradingview_repository,
+                news_repository=news_repository,
             )
         else:
             snapshot = asyncio.run(
@@ -320,6 +399,8 @@ def _run_analyze(
                     repository=repository,
                     derivatives_repository=derivatives_repository,
                     setup_repository=setup_repository,
+                    tradingview_repository=tradingview_repository,
+                    news_repository=news_repository,
                 )
             )
     except (SymbolError, ValueError, json.JSONDecodeError) as exc:
@@ -453,6 +534,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Optional path to recorded Phase 9 derivatives/order-book JSON fixture.",
     )
     analyze_parser.add_argument(
+        "--tradingview-fixture",
+        type=Path,
+        default=None,
+        help="Optional path to recorded TradingView ai-agent-lens/v1 JSON fixture.",
+    )
+    analyze_parser.add_argument(
+        "--news-fixture",
+        type=Path,
+        default=None,
+        help="Optional path to recorded Phase 11 news JSON fixture.",
+    )
+    analyze_parser.add_argument(
         "--json",
         action="store_true",
         help="Print raw AnalysisSnapshot JSON instead of formatted Indonesian report.",
@@ -505,6 +598,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             timeframe_raw=args.timeframe,
             fixture_path=args.fixture,
             derivatives_fixture_path=args.derivatives_fixture,
+            tradingview_fixture_path=args.tradingview_fixture,
+            news_fixture_path=args.news_fixture,
             as_json=args.json,
             detail=args.detail,
             persist=args.persist,

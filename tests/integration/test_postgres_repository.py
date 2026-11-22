@@ -23,13 +23,19 @@ from crypto_chatbot.market_data.derivatives_quality import (
 from crypto_chatbot.market_data.orderbook import normalize_order_book_payload
 from crypto_chatbot.market_data.quality import normalize_ohlcv_rows
 from crypto_chatbot.market_data.symbols import resolve_mvp_spot_symbol, resolve_symbol
+from crypto_chatbot.market_data.tradingview import parse_ai_agent_lens_packet
+from crypto_chatbot.news.pipeline import build_sentiment_observations, deduplicate_articles
 from crypto_chatbot.schemas.market import MarketType, Timeframe
+from crypto_chatbot.schemas.news import RawNewsItem
 from crypto_chatbot.storage.database import create_db_engine, init_db
+from crypto_chatbot.storage.models import Base
 from crypto_chatbot.storage.repositories import (
     LlmInteractionRecord,
     PostgresDerivativesRepository,
     PostgresMarketRepository,
+    PostgresNewsRepository,
     PostgresSetupLogRepository,
+    PostgresTradingViewRepository,
     PostgresUserMemoryRepository,
     UserPreferences,
 )
@@ -55,6 +61,7 @@ def pg_repository(tmp_path: Path) -> Iterator[PostgresMarketRepository]:
     configured_url = os.environ.get("TEST_DATABASE_URL", "").strip()
     if configured_url:
         engine = create_db_engine(configured_url)
+        Base.metadata.drop_all(engine)
         init_db(engine)
         yield PostgresMarketRepository(engine)
         engine.dispose()
@@ -429,3 +436,90 @@ def test_postgres_setup_log_repository_lifecycle(
     assert evaluate_setup_against_candles(updated, ()) == ("pending", None, None) or (
         updated.status != "ready"
     )
+
+
+def test_postgres_tradingview_repository_persistence_and_dedup(
+    pg_repository: PostgresMarketRepository,
+) -> None:
+    fixture_path = (
+        Path(__file__).resolve().parents[1] / "fixtures" / "tradingview_ai_agent_lens_sample.json"
+    )
+    raw = json.loads(fixture_path.read_text(encoding="utf-8"))
+    raw["secret"] = "tv-secret-never-store"
+    received = datetime(2026, 10, 14, 16, 0, 5, tzinfo=UTC)
+    packet = parse_ai_agent_lens_packet(raw, received_time=received, now=received)
+
+    tv_repo = PostgresTradingViewRepository(pg_repository._engine)
+    assert tv_repo.save_packet(packet) is True
+    assert tv_repo.save_packet(packet) is False
+
+    # Point-in-time query excludes packets not yet available.
+    before = tv_repo.load_latest_packet(
+        venue="binance",
+        canonical_symbol="BTC/USDT",
+        timeframe=packet.timeframe,
+        end_available_time=packet.available_time - timedelta(seconds=1),
+    )
+    assert before is None
+
+    loaded = tv_repo.load_latest_packet(
+        venue="binance",
+        canonical_symbol="BTC/USDT",
+        timeframe=packet.timeframe,
+        end_available_time=packet.available_time,
+    )
+    assert loaded is not None
+    assert loaded.idempotency_key == packet.idempotency_key
+    assert loaded.is_probabilistic is False
+    assert "secret" not in loaded.sanitized_payload
+    assert "tv-secret-never-store" not in loaded.model_dump_json()
+
+    packets = tv_repo.load_packets(
+        venue="binance",
+        canonical_symbol="BTC/USDT",
+        timeframe=packet.timeframe,
+        end_available_time=packet.available_time,
+    )
+    assert len(packets) == 1
+    assert packets[0].idempotency_key == packet.idempotency_key
+
+
+def test_postgres_news_sentiment_repository_dedup_and_point_in_time(
+    pg_repository: PostgresMarketRepository,
+) -> None:
+    fixture_path = Path(__file__).resolve().parents[1] / "fixtures" / "news_sentiment_sample.json"
+    raw_items = [
+        RawNewsItem.model_validate(item)
+        for item in json.loads(fixture_path.read_text(encoding="utf-8"))
+    ]
+    articles, dropped = deduplicate_articles(raw_items)
+    assert len(articles) == 5
+    assert dropped == 2
+
+    observations = build_sentiment_observations(articles)
+    news_repo = PostgresNewsRepository(pg_repository._engine)
+
+    assert news_repo.save_articles(articles) == 5
+    assert news_repo.save_articles(articles) == 0
+
+    inserted_obs = news_repo.save_observations(observations)
+    assert inserted_obs == len(observations)
+    assert news_repo.save_observations(observations) == 0
+
+    anchor = datetime(2026, 10, 14, 16, 0, 0, tzinfo=UTC)
+    causal_btc = news_repo.load_observations(
+        canonical_symbol="BTC/USDT",
+        start_available_time=anchor - timedelta(hours=24),
+        end_available_time=anchor,
+    )
+    assert len(causal_btc) == 3
+    assert all(obs.available_time <= anchor for obs in causal_btc)
+    assert all(obs.is_probabilistic is False for obs in causal_btc)
+
+    later_btc = news_repo.load_observations(
+        canonical_symbol="BTC/USDT",
+        start_available_time=anchor - timedelta(hours=24),
+        end_available_time=anchor + timedelta(minutes=10),
+    )
+    assert len(later_btc) == 4
+    assert news_repo.load_observations(canonical_symbol="SOL/USDT") == ()

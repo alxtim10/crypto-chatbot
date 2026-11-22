@@ -23,6 +23,8 @@ from crypto_chatbot.schemas.analysis import (
     StructureEventType,
     TechnicalMetrics,
 )
+from crypto_chatbot.schemas.news import SentimentLabel, SentimentMetrics
+from crypto_chatbot.schemas.tradingview import TradingViewMetrics
 
 
 def _add_if_facts_present(
@@ -57,6 +59,8 @@ def build_factors(
     fact_ids_by_key: Mapping[str, str],
     derivatives: DerivativesMetrics | None = None,
     smc: SmcSummary | None = None,
+    tradingview: TradingViewMetrics | None = None,
+    sentiment: SentimentMetrics | None = None,
 ) -> tuple[FactorItem, ...]:
     """Build descriptive, strictly non-probabilistic rule factors referencing snapshot facts."""
     factors: list[FactorItem] = []
@@ -412,5 +416,49 @@ def build_factors(
                 description=desc,
                 direction=sw_dir,
             )
+
+    if tradingview is not None and tradingview.rule_score is not None:
+        if tradingview.rule_score > 0:
+            tv_dir = FactorDirection.SUPPORTS_BULLISH
+        elif tradingview.rule_score < 0:
+            tv_dir = FactorDirection.SUPPORTS_BEARISH
+        else:
+            tv_dir = FactorDirection.NEUTRAL
+        label_note = f" ({tradingview.rule_label})" if tradingview.rule_label else ""
+        desc = (
+            f"Skor aturan TradingView AI Agent Lens{label_note} berasal dari indikator "
+            "eksternal dan bukan probabilitas ML."
+        )
+        _add_if_facts_present(
+            factors,
+            fact_ids_by_key,
+            ("tv_rule_score",),
+            rule_id="tv_ai_agent_lens_score",
+            description=desc,
+            direction=tv_dir,
+        )
+
+    if sentiment is not None and sentiment.article_count > 0:
+        if sentiment.dominant_label is SentimentLabel.POSITIVE:
+            s_dir = FactorDirection.SUPPORTS_BULLISH
+            s_lbl = "positif"
+        elif sentiment.dominant_label is SentimentLabel.NEGATIVE:
+            s_dir = FactorDirection.SUPPORTS_BEARISH
+            s_lbl = "negatif"
+        else:
+            s_dir = FactorDirection.NEUTRAL
+            s_lbl = "netral"
+        s_desc = (
+            f"Sentimen berita 24h {sentiment.canonical_symbol} cenderung {s_lbl} "
+            f"({sentiment.model_version}; bukan probabilitas ML)."
+        )
+        _add_if_facts_present(
+            factors,
+            fact_ids_by_key,
+            ("sentiment_net_score",),
+            rule_id="news_sentiment_24h",
+            description=s_desc,
+            direction=s_dir,
+        )
 
     return tuple(factors)

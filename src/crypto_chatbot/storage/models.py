@@ -424,3 +424,111 @@ class TradeSetupRow(Base):
     outcome_status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
     settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     realized_r: Mapped[float | None] = mapped_column(Double, nullable=True)
+
+
+class TradingViewPacketRow(Base):
+    """Sanitized TradingView AI Agent Lens packets (`tradingview_packets`); never stores secrets."""
+
+    __tablename__ = "tradingview_packets"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_tradingview_packet_idempotency"),
+        Index(
+            "ix_tradingview_packets_lookup",
+            "venue",
+            "canonical_symbol",
+            "market_type",
+            "timeframe",
+            "available_time",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    idempotency_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    schema_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    attribution_commit: Mapped[str] = mapped_column(String(64), nullable=False)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    venue: Mapped[str] = mapped_column(String(64), nullable=False)
+    canonical_symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    provider_symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    market_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    timeframe: Mapped[str] = mapped_column(String(16), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    candle_open_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    candle_close_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    received_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    available_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    open: Mapped[float] = mapped_column(Double, nullable=False)
+    high: Mapped[float] = mapped_column(Double, nullable=False)
+    low: Mapped[float] = mapped_column(Double, nullable=False)
+    close: Mapped[float] = mapped_column(Double, nullable=False)
+    volume: Mapped[float | None] = mapped_column(Double, nullable=True)
+    rule_score: Mapped[float | None] = mapped_column(Double, nullable=True)
+    rule_label: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    is_probabilistic: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    quality_flags: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    sanitized_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+
+
+class NewsArticleRow(Base):
+    """Deduplicated canonical news article metadata (`news_articles`); no secrets."""
+
+    __tablename__ = "news_articles"
+    __table_args__ = (
+        UniqueConstraint("article_id", name="uq_news_articles_article_id"),
+        UniqueConstraint("canonical_url", name="uq_news_articles_canonical_url"),
+        UniqueConstraint("content_fingerprint", name="uq_news_articles_fingerprint"),
+        Index("ix_news_articles_available", "available_time"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    article_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    canonical_url: Mapped[str] = mapped_column(Text, nullable=False)
+    content_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    publisher: Mapped[str] = mapped_column(String(128), nullable=False)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    summary: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    published_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    first_seen_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    available_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    source_provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    affected_entities: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, nullable=False, default=list
+    )
+    raw_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+
+
+class SentimentObservationRow(Base):
+    """Point-in-time non-probabilistic sentiment observations (`sentiment_observations`)."""
+
+    __tablename__ = "sentiment_observations"
+    __table_args__ = (
+        UniqueConstraint("observation_id", name="uq_sentiment_obs_id"),
+        UniqueConstraint(
+            "article_id",
+            "canonical_symbol",
+            "model_version",
+            name="uq_sentiment_obs_identity",
+        ),
+        Index(
+            "ix_sentiment_obs_lookup",
+            "canonical_symbol",
+            "available_time",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    observation_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    article_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    canonical_url: Mapped[str] = mapped_column(Text, nullable=False)
+    publisher: Mapped[str] = mapped_column(String(128), nullable=False)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    canonical_symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    base_asset: Mapped[str] = mapped_column(String(32), nullable=False)
+    entity_confidence: Mapped[float] = mapped_column(Double, nullable=False)
+    sentiment_label: Mapped[str] = mapped_column(String(16), nullable=False)
+    sentiment_score: Mapped[float] = mapped_column(Double, nullable=False)
+    sentiment_confidence: Mapped[float] = mapped_column(Double, nullable=False)
+    model_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    is_probabilistic: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    published_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    available_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

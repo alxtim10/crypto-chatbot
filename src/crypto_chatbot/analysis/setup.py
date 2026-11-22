@@ -24,6 +24,7 @@ from crypto_chatbot.schemas.analysis import (
     TradeSetup,
 )
 from crypto_chatbot.schemas.market import MarketCandle, Timeframe
+from crypto_chatbot.schemas.news import SentimentLabel, SentimentMetrics
 from crypto_chatbot.storage.repositories import TradeSetupRecord
 
 SL_ATR_BUFFER = 0.5
@@ -382,6 +383,7 @@ def _collect_risk_notes(
     bias: SetupBias,
     smc: SmcSummary,
     derivatives: DerivativesMetrics | None,
+    sentiment: SentimentMetrics | None = None,
 ) -> list[str]:
     notes: list[str] = []
     if bias is SetupBias.LONG and smc.dealing_zone is DealingZone.PREMIUM:
@@ -416,6 +418,17 @@ def _collect_risk_notes(
                 notes.append(
                     "Order book 10 bps condong tebal di sisi bid (dukungan beli jangka pendek)."
                 )
+    if sentiment is not None and sentiment.article_count >= 1 and sentiment.mean_confidence >= 0.50:
+        if bias is SetupBias.LONG and sentiment.dominant_label is SentimentLabel.NEGATIVE:
+            notes.append(
+                "Sentimen berita 24h cenderung negatif (faktor pendukung non-probabilistik; "
+                "waspadai headline berlawanan)."
+            )
+        elif bias is SetupBias.SHORT and sentiment.dominant_label is SentimentLabel.POSITIVE:
+            notes.append(
+                "Sentimen berita 24h cenderung positif (faktor pendukung non-probabilistik; "
+                "waspadai headline berlawanan)."
+            )
     return notes
 
 
@@ -565,6 +578,7 @@ def build_trade_setup(
     structure: StructureAnalysis,
     smc: SmcSummary,
     derivatives: DerivativesMetrics | None = None,
+    sentiment: SentimentMetrics | None = None,
     primary_timeframe: Timeframe = Timeframe.H4,
     ltf_candles: Sequence[MarketCandle] | None = None,
     htf_candles_by_tf: Mapping[Timeframe, Sequence[MarketCandle]] | None = None,
@@ -615,7 +629,12 @@ def build_trade_setup(
         )
 
     last = metrics.last_close
-    risk_notes = _collect_risk_notes(bias=bias, smc=smc, derivatives=derivatives)
+    risk_notes = _collect_risk_notes(
+        bias=bias,
+        smc=smc,
+        derivatives=derivatives,
+        sentiment=sentiment,
+    )
     htf_conf_note: str | None = None
     if primary_timeframe is Timeframe.M15:
         htf_wait, htf_conf_note = _evaluate_htf_filter_for_15m(

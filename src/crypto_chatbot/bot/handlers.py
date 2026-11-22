@@ -50,6 +50,20 @@ _SECRET_LOG_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\b\d{8,12}:[A-Za-z0-9_-]{35}\b"), "[REDACTED_TOKEN]"),
     (re.compile(r"AIza[0-9A-Za-z_-]{20,}"), "[REDACTED_KEY]"),
     (re.compile(r"(postgresql[^\s]*://[^:\s]+:)([^@\s]+)(@)"), r"\1[REDACTED]\3"),
+    (
+        re.compile(
+            r'(["\']?(?:secret|webhook_secret|token|api_key|password)["\']?\s*[:=]\s*["\']?)([^"\'\s,}]+)(["\']?)',
+            re.IGNORECASE,
+        ),
+        r"\1[REDACTED]\3",
+    ),
+    (
+        re.compile(
+            r"([?&](?:secret|webhook_secret|token|api_key|password)=)([^&\s\"']+)",
+            re.IGNORECASE,
+        ),
+        r"\1[REDACTED]",
+    ),
 )
 
 

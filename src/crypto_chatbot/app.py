@@ -28,7 +28,9 @@ from crypto_chatbot.storage.database import create_db_engine, init_db
 from crypto_chatbot.storage.repositories import (
     PostgresDerivativesRepository,
     PostgresMarketRepository,
+    PostgresNewsRepository,
     PostgresSetupLogRepository,
+    PostgresTradingViewRepository,
     PostgresUserMemoryRepository,
 )
 
@@ -63,6 +65,8 @@ def build_telegram_application(
     market_repo = PostgresMarketRepository(engine)
     derivatives_repo = PostgresDerivativesRepository(engine)
     setup_repo = PostgresSetupLogRepository(engine)
+    tradingview_repo = PostgresTradingViewRepository(engine)
+    news_repo = PostgresNewsRepository(engine)
     memory_repo = PostgresUserMemoryRepository(engine)
     provider = CcxtMarketDataProvider()
     derivatives_provider = CcxtDerivativesLiquidityProvider()
@@ -72,6 +76,8 @@ def build_telegram_application(
         derivatives_provider=derivatives_provider,
         derivatives_repository=derivatives_repo,
         setup_repository=setup_repo,
+        tradingview_repository=tradingview_repo,
+        news_repository=news_repo,
     )
 
     transport = GoogleGenAiTransport(
@@ -119,12 +125,13 @@ def build_telegram_application(
 
 def run_polling(settings: Settings) -> None:
     """Start closed-beta Telegram long polling with secret redaction active."""
-    configure_logging(
-        secrets=(
-            settings.telegram_bot_token.get_secret_value(),
-            settings.gemini_api_key.get_secret_value(),
-            settings.database_url.get_secret_value(),
-        )
-    )
+    secrets = [
+        settings.telegram_bot_token.get_secret_value(),
+        settings.gemini_api_key.get_secret_value(),
+        settings.database_url.get_secret_value(),
+    ]
+    if settings.tradingview_webhook_secret is not None:
+        secrets.append(settings.tradingview_webhook_secret.get_secret_value())
+    configure_logging(secrets=tuple(secrets))
     application = build_telegram_application(settings)
     application.run_polling(drop_pending_updates=True)

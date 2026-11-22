@@ -7,7 +7,7 @@ import hashlib
 import itertools
 import json
 from collections.abc import Mapping, Sequence
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from crypto_chatbot.analysis.derivatives import (
@@ -38,6 +38,8 @@ from crypto_chatbot.market_data.quality import (
     is_candle_stale,
 )
 from crypto_chatbot.market_data.symbols import resolve_mvp_spot_symbol
+from crypto_chatbot.market_data.tradingview import compare_packet_with_exchange_candles
+from crypto_chatbot.news.pipeline import aggregate_sentiment
 from crypto_chatbot.schemas.analysis import (
     AnalysisSnapshot,
     DerivativesMetrics,
@@ -61,10 +63,14 @@ from crypto_chatbot.schemas.market import (
     QualityStatus,
     Timeframe,
 )
+from crypto_chatbot.schemas.news import SentimentMetrics, SentimentObservation
+from crypto_chatbot.schemas.tradingview import TradingViewMetrics, TradingViewPacket
 from crypto_chatbot.storage.repositories import (
     DerivativesRepository,
     MarketRepository,
+    NewsRepository,
     SetupLogRepository,
+    TradingViewRepository,
 )
 
 _BLOCKING_BATCH_FLAGS: frozenset[QualityFlag] = frozenset(
@@ -145,6 +151,26 @@ def _compute_derivatives_digest(metrics: DerivativesMetrics) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _compute_tradingview_digest(metrics: TradingViewMetrics) -> str:
+    encoded = json.dumps(
+        metrics.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _compute_sentiment_digest(metrics: SentimentMetrics) -> str:
+    encoded = json.dumps(
+        metrics.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _compute_snapshot_id(
     *,
     provider: str,
@@ -159,6 +185,8 @@ def _compute_snapshot_id(
     quality_status: QualityStatus,
     quality_flags: Sequence[QualityFlag],
     derivatives_digest: str | None = None,
+    tradingview_digest: str | None = None,
+    sentiment_digest: str | None = None,
 ) -> str:
     payload: dict[str, Any] = {
         "as_of": as_of.isoformat(),
@@ -175,6 +203,10 @@ def _compute_snapshot_id(
     }
     if derivatives_digest is not None:
         payload["derivatives_digest"] = derivatives_digest
+    if tradingview_digest is not None:
+        payload["tradingview_digest"] = tradingview_digest
+    if sentiment_digest is not None:
+        payload["sentiment_digest"] = sentiment_digest
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(
         "utf-8"
     )
@@ -221,6 +253,8 @@ def _build_facts(
     derivatives: DerivativesMetrics | None = None,
     smc: SmcSummary | None = None,
     trade_setup: TradeSetup | None = None,
+    tradingview: TradingViewMetrics | None = None,
+    sentiment: SentimentMetrics | None = None,
 ) -> tuple[tuple[Fact, ...], dict[str, str]]:
     facts: list[Fact] = []
     fact_ids_by_key: dict[str, str] = {}
@@ -652,6 +686,70 @@ def _build_facts(
             fact_source=m15_src,
         )
 
+    if tradingview is not None:
+        tv_src = (
+            f"tradingview:{tradingview.venue}:{tradingview.provider_symbol}:"
+            f"{tradingview.timeframe.value}"
+        )
+        add_fact(
+            "tv_close",
+            "Harga close TradingView",
+            tradingview.tv_close,
+            quote_currency,
+            "price",
+            fact_as_of=tradingview.candle_close_time,
+            fact_source=tv_src,
+        )
+        add_fact(
+            "tv_exchange_deviation_bps",
+            "Deviasi harga TradingView vs bursa",
+            tradingview.max_deviation_bps,
+            "bps",
+            "bps",
+            fact_as_of=tradingview.candle_close_time,
+            fact_source=tv_src,
+        )
+        add_fact(
+            "tv_rule_score",
+            "Skor aturan TradingView (bukan probabilitas)",
+            tradingview.rule_score,
+            "score",
+            "signed_decimal_2",
+            fact_as_of=tradingview.candle_close_time,
+            fact_source=tv_src,
+        )
+
+    if sentiment is not None and sentiment.article_count > 0:
+        sent_src = f"news:{sentiment.model_version}:{sentiment.canonical_symbol}"
+        sent_time = sentiment.latest_available_time or as_of
+        add_fact(
+            "sentiment_net_score",
+            "Skor sentimen berita 24h (bukan probabilitas)",
+            sentiment.net_sentiment_score,
+            "score",
+            "signed_decimal_2",
+            fact_as_of=sent_time,
+            fact_source=sent_src,
+        )
+        add_fact(
+            "sentiment_confidence",
+            "Confidence sentimen berita 24h",
+            sentiment.mean_confidence * 100.0,
+            "%",
+            "percent",
+            fact_as_of=sent_time,
+            fact_source=sent_src,
+        )
+        add_fact(
+            "sentiment_article_count",
+            "Artikel berita unik (24h)",
+            float(sentiment.article_count),
+            "artikel",
+            "integer",
+            fact_as_of=sent_time,
+            fact_source=sent_src,
+        )
+
     return tuple(facts), fact_ids_by_key
 
 
@@ -805,6 +903,8 @@ def _insufficient_snapshot(
     extra_notes: Sequence[str] = (),
     extra_params: Mapping[str, int | float | str] | None = None,
     derivatives_digest: str | None = None,
+    tradingview_digest: str | None = None,
+    sentiment_digest: str | None = None,
 ) -> AnalysisSnapshot:
     snap_id = _compute_snapshot_id(
         provider=batch.metadata.provider,
@@ -819,6 +919,8 @@ def _insufficient_snapshot(
         quality_status=QualityStatus.INSUFFICIENT_DATA,
         quality_flags=flags,
         derivatives_digest=derivatives_digest,
+        tradingview_digest=tradingview_digest,
+        sentiment_digest=sentiment_digest,
     )
     params = dict(INDICATOR_PARAMETERS)
     if extra_params:
@@ -859,9 +961,11 @@ def build_analysis_snapshot(
     *,
     mtf_batches: Mapping[Timeframe, OhlcvBatch] | None = None,
     derivatives_context: DerivativesContext | None = None,
+    tradingview_packet: TradingViewPacket | None = None,
+    news_observations: Sequence[SentimentObservation] | None = None,
     use_available_time: bool = False,
 ) -> AnalysisSnapshot:
-    """Assemble a complete deterministic `AnalysisSnapshot` from spot and optional derivatives."""
+    """Assemble a complete deterministic `AnalysisSnapshot` from spot and optional inputs."""
     if batch.has_provider_error or not batch.candles:
         flags = tuple(dict.fromkeys(batch.quality_flags))
         return _insufficient_snapshot(
@@ -941,12 +1045,81 @@ def build_analysis_snapshot(
         if deriv_result.metrics is not None:
             deriv_digest = _compute_derivatives_digest(deriv_result.metrics)
 
+    tv_metrics: TradingViewMetrics | None = None
+    tv_digest: str | None = None
+    tv_flags: tuple[QualityFlag, ...] = ()
+    tv_notes: list[str] = []
+    if tradingview_packet is not None:
+        tv_avail = (
+            tradingview_packet.available_time
+            if use_available_time
+            else tradingview_packet.candle_close_time
+        )
+        if tradingview_packet.candle_close_time > as_of or tv_avail > as_of:
+            tv_notes.append(
+                "Paket TradingView ai-agent-lens/v1 diabaikan karena melampaui as_of "
+                "(anti-lookahead)."
+            )
+        elif (
+            tradingview_packet.canonical_symbol != batch.canonical_symbol
+            or tradingview_packet.market_type is not batch.metadata.market_type
+        ):
+            tv_flags = (QualityFlag.SYMBOL_MISMATCH,)
+            tv_notes.append(
+                "Simbol atau tipe pasar paket TradingView tidak cocok dengan batch bursa."
+            )
+        else:
+            tv_cmp = compare_packet_with_exchange_candles(
+                tradingview_packet,
+                batch.candles,
+                as_of=as_of,
+                use_available_time=use_available_time,
+            )
+            tv_flags = tv_cmp.quality_flags
+            tv_notes.extend(tv_cmp.limitations)
+            tv_metrics = TradingViewMetrics(
+                schema_version=tradingview_packet.schema_version,
+                attribution_commit=tradingview_packet.attribution_commit,
+                idempotency_key=tradingview_packet.idempotency_key,
+                venue=tradingview_packet.venue,
+                canonical_symbol=tradingview_packet.canonical_symbol,
+                provider_symbol=tradingview_packet.provider_symbol,
+                market_type=tradingview_packet.market_type,
+                timeframe=tradingview_packet.timeframe,
+                event_type=tradingview_packet.event_type.value,
+                candle_close_time=tradingview_packet.candle_close_time,
+                tv_close=tradingview_packet.close,
+                exchange_close=tv_cmp.exchange_close,
+                max_deviation_bps=tv_cmp.max_deviation_bps,
+                rule_score=tradingview_packet.rule_score,
+                rule_label=tradingview_packet.rule_label,
+                is_probabilistic=False,
+            )
+            tv_digest = _compute_tradingview_digest(tv_metrics)
+
+    sent_metrics: SentimentMetrics | None = None
+    sent_digest: str | None = None
+    if news_observations:
+        sent_metrics = aggregate_sentiment(
+            news_observations,
+            canonical_symbol=batch.canonical_symbol,
+            as_of=as_of,
+        )
+        if sent_metrics is not None:
+            sent_digest = _compute_sentiment_digest(sent_metrics)
+            extra_params["sentiment_window_hours"] = sent_metrics.window_hours
+
+    combined_notes = (
+        *(deriv_result.limitations if deriv_result is not None else ()),
+        *tv_notes,
+    )
     merged_flags = tuple(
         dict.fromkeys(
             [
                 *batch.quality_flags,
                 *ind_result.quality_flags,
                 *(deriv_result.quality_flags if deriv_result is not None else ()),
+                *tv_flags,
             ]
         )
     )
@@ -958,9 +1131,11 @@ def build_analysis_snapshot(
             as_of=as_of,
             flags=merged_flags,
             dropped_mtf=dropped_mtf,
-            extra_notes=deriv_result.limitations if deriv_result is not None else (),
+            extra_notes=combined_notes,
             extra_params=extra_params,
             derivatives_digest=deriv_digest,
+            tradingview_digest=tv_digest,
+            sentiment_digest=sent_digest,
         )
 
     recent_events, latest_sh, latest_sl, latest_fb = _select_recent_events(
@@ -974,6 +1149,7 @@ def build_analysis_snapshot(
         structure=structure,
         smc=smc,
         derivatives=deriv_result.metrics if deriv_result is not None else None,
+        sentiment=sent_metrics,
         primary_timeframe=batch.timeframe,
         ltf_candles=ltf_15m_candles,
         htf_candles_by_tf=htf_candles_by_tf or None,
@@ -996,6 +1172,8 @@ def build_analysis_snapshot(
         derivatives=deriv_result.metrics if deriv_result is not None else None,
         smc=smc,
         trade_setup=trade_setup,
+        tradingview=tv_metrics,
+        sentiment=sent_metrics,
     )
 
     recent_cutoff = as_of - 10 * batch.timeframe.duration
@@ -1008,6 +1186,8 @@ def build_analysis_snapshot(
         fact_ids_by_key=fact_ids_by_key,
         derivatives=deriv_result.metrics if deriv_result is not None else None,
         smc=smc,
+        tradingview=tv_metrics,
+        sentiment=sent_metrics,
     )
 
     snap_id = _compute_snapshot_id(
@@ -1023,6 +1203,8 @@ def build_analysis_snapshot(
         quality_status=final_status,
         quality_flags=merged_flags,
         derivatives_digest=deriv_digest,
+        tradingview_digest=tv_digest,
+        sentiment_digest=sent_digest,
     )
     params = dict(INDICATOR_PARAMETERS)
     params.update(SETUP_PARAMETERS)
@@ -1050,6 +1232,8 @@ def build_analysis_snapshot(
         derivatives=deriv_result.metrics if deriv_result is not None else None,
         smc=smc,
         mtf_overview=mtf_overview,
+        tradingview=tv_metrics,
+        sentiment=sent_metrics,
         trade_setup=trade_setup,
         facts=facts,
         regime=regime,
@@ -1063,7 +1247,7 @@ def build_analysis_snapshot(
             merged_flags=merged_flags,
             status=final_status,
             dropped_mtf=dropped_mtf,
-            extra_notes=deriv_result.limitations if deriv_result is not None else (),
+            extra_notes=combined_notes,
         ),
     )
 
@@ -1121,12 +1305,16 @@ class AnalysisService:
         derivatives_provider: DerivativesLiquidityProvider | None = None,
         derivatives_repository: DerivativesRepository | None = None,
         setup_repository: SetupLogRepository | None = None,
+        tradingview_repository: TradingViewRepository | None = None,
+        news_repository: NewsRepository | None = None,
     ) -> None:
         self._provider = provider
         self._repository = repository
         self._derivatives_provider = derivatives_provider
         self._derivatives_repository = derivatives_repository
         self._setup_repository = setup_repository
+        self._tradingview_repository = tradingview_repository
+        self._news_repository = news_repository
 
     async def _fetch_optional_ltf_15m(self, canonical_symbol: str) -> OhlcvBatch | None:
         try:
@@ -1197,10 +1385,31 @@ class AnalysisService:
                 liquidations=liq_batch,
             )
 
+        tv_packet: TradingViewPacket | None = None
+        if self._tradingview_repository is not None and primary_ok and primary.candles:
+            tv_packet = self._tradingview_repository.load_latest_packet(
+                venue=primary.metadata.venue,
+                canonical_symbol=mapping.canonical_symbol,
+                market_type=primary.metadata.market_type,
+                timeframe=timeframe,
+                end_available_time=primary.candles[-1].close_time,
+            )
+
+        news_observations: tuple[SentimentObservation, ...] | None = None
+        if self._news_repository is not None and primary_ok and primary.candles:
+            primary_as_of = primary.candles[-1].close_time
+            news_observations = self._news_repository.load_observations(
+                canonical_symbol=mapping.canonical_symbol,
+                start_available_time=primary_as_of - timedelta(hours=24),
+                end_available_time=primary_as_of,
+            )
+
         snapshot = build_analysis_snapshot(
             primary,
             mtf_batches=mtf_batches,
             derivatives_context=derivatives_context,
+            tradingview_packet=tv_packet,
+            news_observations=news_observations,
         )
 
         if persist and self._repository is not None:
@@ -1319,4 +1528,36 @@ class AnalysisService:
                         is_primary=False,
                     )
 
-        return build_analysis_snapshot(primary_batch, mtf_batches=mtf_batches)
+        tv_packet: TradingViewPacket | None = None
+        if self._tradingview_repository is not None and stored.tradingview is not None:
+            candidates = self._tradingview_repository.load_packets(
+                venue=stored.tradingview.venue,
+                canonical_symbol=stored.tradingview.canonical_symbol,
+                market_type=stored.tradingview.market_type,
+                timeframe=stored.tradingview.timeframe,
+                end_available_time=stored.as_of,
+                limit=50,
+            )
+            tv_packet = next(
+                (
+                    pkt
+                    for pkt in candidates
+                    if pkt.idempotency_key == stored.tradingview.idempotency_key
+                ),
+                None,
+            )
+
+        news_observations: tuple[SentimentObservation, ...] | None = None
+        if self._news_repository is not None and stored.sentiment is not None:
+            news_observations = self._news_repository.load_observations(
+                canonical_symbol=stored.canonical_symbol,
+                start_available_time=stored.as_of - timedelta(hours=stored.sentiment.window_hours),
+                end_available_time=stored.as_of,
+            )
+
+        return build_analysis_snapshot(
+            primary_batch,
+            mtf_batches=mtf_batches,
+            tradingview_packet=tv_packet,
+            news_observations=news_observations,
+        )

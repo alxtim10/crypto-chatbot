@@ -1,0 +1,17 @@
+{
+  "schema_version": "ai-agent-lens/v1",
+  "attribution_commit": "7f3c9a2e1d8b4056c2a91e4f7b8d3c1a5e6f9012",
+  "venue": "binance",
+  "symbol": "BINANCE:BTCUSDT",
+  "timeframe": "4h",
+  "event_type": "structure_break",
+  "candle_open_time": "2026-10-14T12:00:00Z",
+  "candle_close_time": "2026-10-14T16:00:00Z",
+  "open": 64371.21,
+  "high": 65930.0,
+  "low": 64109.0,
+  "close": 65577.38,
+  "volume": 12450.5,
+  "rule_score": 42.5,
+  "rule_label": "bullish_lens_rule"
+}

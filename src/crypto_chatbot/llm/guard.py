@@ -125,6 +125,10 @@ def _build_allowlist_patterns(
     if funding_hours is not None:
         patterns.append(re.compile(rf"\b{funding_hours}h\b", re.IGNORECASE))
 
+    sentiment_hours = _int_param(indicator_parameters, "sentiment_window_hours")
+    if sentiment_hours is not None:
+        patterns.append(re.compile(rf"\b{sentiment_hours}h\b", re.IGNORECASE))
+
     for band_key in ("orderbook_depth_band_tight_bps", "orderbook_depth_band_wide_bps"):
         band_bps = _int_param(indicator_parameters, band_key)
         if band_bps is not None:

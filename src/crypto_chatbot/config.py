@@ -11,6 +11,8 @@ from typing import Annotated
 from pydantic import Field, SecretStr, ValidationError, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+from crypto_chatbot.schemas.tradingview import TRADINGVIEW_PUBLISHED_WEBHOOK_IPS
+
 
 class ConfigError(Exception):
     """Raised when required configuration is missing or invalid. Never contains secret values."""
@@ -34,6 +36,26 @@ class Settings(BaseSettings):
     database_url: SecretStr
     allowed_telegram_user_ids: Annotated[tuple[int, ...], NoDecode] = Field(min_length=1)
     rate_limit_per_minute: int = Field(default=10, ge=1)
+    tradingview_webhook_secret: SecretStr | None = None
+    tradingview_webhook_port: int = Field(default=443, ge=1, le=65535)
+    tradingview_allowed_ips: Annotated[tuple[str, ...], NoDecode] = (
+        TRADINGVIEW_PUBLISHED_WEBHOOK_IPS
+    )
+
+    @field_validator("tradingview_webhook_secret", mode="before")
+    @classmethod
+    def _blank_optional_secret_to_none(cls, value: object) -> object:
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @field_validator("tradingview_allowed_ips", mode="before")
+    @classmethod
+    def _parse_allowed_ips(cls, value: object) -> object:
+        if isinstance(value, str):
+            parts = tuple(part.strip() for part in value.split(",") if part.strip())
+            return parts or TRADINGVIEW_PUBLISHED_WEBHOOK_IPS
+        return value
 
     @field_validator("telegram_bot_token", "gemini_api_key")
     @classmethod

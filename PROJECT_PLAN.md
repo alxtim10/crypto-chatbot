@@ -5,6 +5,8 @@ Related documents:
 - `docs/decisions/0001-product-scope.md`: accepted Phase 0 product decisions (binding).
 - `docs/decisions/0002-derivatives-and-liquidity.md`: accepted Phase 9 derivatives and liquidity rules (binding).
 - `docs/decisions/0003-compact-output-smc-and-trade-setup.md`: accepted compact output, Hybrid Crypto + Causal SMC, and deterministic conditional trade setup rules (binding).
+- `docs/decisions/0004-tradingview-ai-agent-lens.md`: accepted Phase 10 TradingView AI Agent Lens webhook and cross-source rules (binding).
+- `docs/decisions/0005-news-and-sentiment.md`: accepted Phase 11 traceable news & non-probabilistic sentiment pipeline rules (binding).
 - `AGENTS.md`: always-on agent rules and project commands.
 - `.agents/skills/crypto-research-engineer/SKILL.md`: engineering rules.
 - `.agents/skills/socratic-tutor/SKILL.md`: opt-in tutoring mode.
@@ -25,8 +27,8 @@ Update this table in the completion report of every phase. Status values: `Not s
 | 7 | Telegram commands and bounded memory | Done |
 | 8 | End-to-end MVP validation (Milestone B) | Done (VPS live check pending per ADR 0001) |
 | 9 | Derivatives and liquidity data | Done |
-| 10 | TradingView AI Agent Lens | Not started |
-| 11 | News and sentiment | Not started |
+| 10 | TradingView AI Agent Lens | Done |
+| 11 | News and sentiment | Done |
 | 12 | Offline ML | Not started |
 | 13 | Shadow inference and optional release | Not started |
 | 14 | Production hardening | Not started |

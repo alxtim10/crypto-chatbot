@@ -146,3 +146,85 @@ def test_cli_analyze_with_derivatives_fixture(
     assert snap.derivatives.orderbook_symbol == "BTC/USDT"
     assert snap.derivatives.liquidation_source_available is True
     assert snap.derivatives.liquidation_count == 2
+
+
+def test_cli_analyze_with_tradingview_fixture(
+    isolated_cwd: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    tv_fixture = (
+        Path(__file__).resolve().parents[1] / "fixtures" / "tradingview_ai_agent_lens_sample.json"
+    )
+    rc = cli.main(
+        [
+            "analyze",
+            "BTC",
+            "4h",
+            "--fixture",
+            str(FIXTURE_1000),
+            "--tradingview-fixture",
+            str(tv_fixture),
+            "--json",
+        ]
+    )
+    assert rc == 0
+    snap = AnalysisSnapshot.model_validate_json(capsys.readouterr().out)
+    assert snap.tradingview is not None
+    assert snap.tradingview.is_probabilistic is False
+    assert snap.tradingview.rule_score == pytest.approx(42.5)
+
+    rc_detail = cli.main(
+        [
+            "analyze",
+            "BTC",
+            "4h",
+            "--fixture",
+            str(FIXTURE_1000),
+            "--tradingview-fixture",
+            str(tv_fixture),
+            "--detail",
+        ]
+    )
+    assert rc_detail == 0
+    out = capsys.readouterr().out
+    assert "TradingView AI Agent Lens" in out
+
+
+def test_cli_analyze_with_news_fixture(
+    isolated_cwd: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    news_fixture = Path(__file__).resolve().parents[1] / "fixtures" / "news_sentiment_sample.json"
+    rc = cli.main(
+        [
+            "analyze",
+            "BTC",
+            "4h",
+            "--fixture",
+            str(FIXTURE_1000),
+            "--news-fixture",
+            str(news_fixture),
+            "--json",
+        ]
+    )
+    assert rc == 0
+    snap = AnalysisSnapshot.model_validate_json(capsys.readouterr().out)
+    assert snap.sentiment is not None
+    assert snap.sentiment.is_probabilistic is False
+    assert snap.sentiment.article_count == 3
+
+    rc_compact = cli.main(
+        [
+            "analyze",
+            "BTC",
+            "4h",
+            "--fixture",
+            str(FIXTURE_1000),
+            "--news-fixture",
+            str(news_fixture),
+        ]
+    )
+    assert rc_compact == 0
+    out = capsys.readouterr().out
+    assert "Sentimen Berita 24h" in out
+    assert "https://" in out

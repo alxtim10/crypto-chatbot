@@ -28,6 +28,17 @@ from crypto_chatbot.schemas.market import (
     Timeframe,
     UtcDatetime,
 )
+from crypto_chatbot.schemas.news import (
+    MIN_ENTITY_MATCH_CONFIDENCE,
+    NormalizedNewsArticle,
+    SentimentLabel,
+    SentimentObservation,
+)
+from crypto_chatbot.schemas.tradingview import (
+    FORBIDDEN_SECRET_PAYLOAD_KEYS,
+    TradingViewEventType,
+    TradingViewPacket,
+)
 from crypto_chatbot.storage.models import (
     AnalysisSnapshotRow,
     ConversationRow,
@@ -36,9 +47,12 @@ from crypto_chatbot.storage.models import (
     LlmInteractionRow,
     MarketCandleRow,
     MessageRow,
+    NewsArticleRow,
     OpenInterestRow,
     OrderBookSnapshotRow,
+    SentimentObservationRow,
     TradeSetupRow,
+    TradingViewPacketRow,
     UserPreferenceRow,
     UserRow,
 )
@@ -1190,3 +1204,312 @@ class PostgresSetupLogRepository:
             row.settled_at = _to_utc(settled_at) if settled_at is not None else None
             row.realized_r = realized_r
             return True
+
+
+class TradingViewRepository(Protocol):
+    """Repository interface for sanitized `ai-agent-lens/v1` TradingView webhook packets."""
+
+    def save_packet(self, packet: TradingViewPacket) -> bool: ...
+
+    def load_latest_packet(
+        self,
+        *,
+        venue: str,
+        canonical_symbol: str,
+        market_type: MarketType = MarketType.SPOT,
+        timeframe: Timeframe,
+        end_available_time: datetime | None = None,
+    ) -> TradingViewPacket | None: ...
+
+    def load_packets(
+        self,
+        *,
+        venue: str,
+        canonical_symbol: str,
+        market_type: MarketType | None = None,
+        timeframe: Timeframe | None = None,
+        end_available_time: datetime | None = None,
+        limit: int | None = None,
+    ) -> tuple[TradingViewPacket, ...]: ...
+
+
+def _strip_forbidden_secrets(payload: Any) -> Any:
+    if isinstance(payload, dict):
+        return {
+            str(k): _strip_forbidden_secrets(v)
+            for k, v in payload.items()
+            if str(k).strip().lower() not in FORBIDDEN_SECRET_PAYLOAD_KEYS
+        }
+    if isinstance(payload, list):
+        return [_strip_forbidden_secrets(item) for item in payload]
+    return payload
+
+
+def _row_to_tv_packet(row: TradingViewPacketRow) -> TradingViewPacket:
+    return TradingViewPacket(
+        idempotency_key=row.idempotency_key,
+        schema_version="ai-agent-lens/v1",
+        attribution_commit=row.attribution_commit,
+        provider=row.provider,
+        venue=row.venue,
+        canonical_symbol=row.canonical_symbol,
+        provider_symbol=row.provider_symbol,
+        market_type=MarketType(row.market_type),
+        timeframe=Timeframe(row.timeframe),
+        event_type=TradingViewEventType(row.event_type),
+        candle_open_time=_to_utc(row.candle_open_time),
+        candle_close_time=_to_utc(row.candle_close_time),
+        received_time=_to_utc(row.received_time),
+        available_time=_to_utc(row.available_time),
+        open=row.open,
+        high=row.high,
+        low=row.low,
+        close=row.close,
+        volume=row.volume,
+        rule_score=row.rule_score,
+        rule_label=row.rule_label,
+        quality_flags=tuple(QualityFlag(flag) for flag in row.quality_flags),
+        sanitized_payload=_strip_forbidden_secrets(dict(row.sanitized_payload)),
+    )
+
+
+class PostgresTradingViewRepository:
+    """Synchronous PostgreSQL persistence and point-in-time queries for `tradingview_packets`."""
+
+    def __init__(self, engine: Engine) -> None:
+        self._engine = engine
+
+    def save_packet(self, packet: TradingViewPacket) -> bool:
+        clean_payload = _strip_forbidden_secrets(packet.sanitized_payload)
+        payload = {
+            "idempotency_key": packet.idempotency_key,
+            "schema_version": packet.schema_version,
+            "attribution_commit": packet.attribution_commit,
+            "provider": packet.provider,
+            "venue": packet.venue,
+            "canonical_symbol": packet.canonical_symbol,
+            "provider_symbol": packet.provider_symbol,
+            "market_type": packet.market_type.value,
+            "timeframe": packet.timeframe.value,
+            "event_type": packet.event_type.value,
+            "candle_open_time": packet.candle_open_time,
+            "candle_close_time": packet.candle_close_time,
+            "received_time": packet.received_time,
+            "available_time": packet.available_time,
+            "open": packet.open,
+            "high": packet.high,
+            "low": packet.low,
+            "close": packet.close,
+            "volume": packet.volume,
+            "rule_score": packet.rule_score,
+            "rule_label": packet.rule_label,
+            "is_probabilistic": False,
+            "quality_flags": [flag.value for flag in packet.quality_flags],
+            "sanitized_payload": clean_payload,
+        }
+        stmt = (
+            insert(TradingViewPacketRow)
+            .values(payload)
+            .on_conflict_do_nothing(constraint="uq_tradingview_packet_idempotency")
+            .returning(TradingViewPacketRow.id)
+        )
+        with Session(self._engine) as session, session.begin():
+            return bool(session.scalars(stmt).all())
+
+    def load_latest_packet(
+        self,
+        *,
+        venue: str,
+        canonical_symbol: str,
+        market_type: MarketType = MarketType.SPOT,
+        timeframe: Timeframe,
+        end_available_time: datetime | None = None,
+    ) -> TradingViewPacket | None:
+        packets = self.load_packets(
+            venue=venue,
+            canonical_symbol=canonical_symbol,
+            market_type=market_type,
+            timeframe=timeframe,
+            end_available_time=end_available_time,
+            limit=1,
+        )
+        return packets[-1] if packets else None
+
+    def load_packets(
+        self,
+        *,
+        venue: str,
+        canonical_symbol: str,
+        market_type: MarketType | None = None,
+        timeframe: Timeframe | None = None,
+        end_available_time: datetime | None = None,
+        limit: int | None = None,
+    ) -> tuple[TradingViewPacket, ...]:
+        stmt = select(TradingViewPacketRow).where(
+            TradingViewPacketRow.venue == venue,
+            TradingViewPacketRow.canonical_symbol == canonical_symbol,
+        )
+        if market_type is not None:
+            stmt = stmt.where(TradingViewPacketRow.market_type == market_type.value)
+        if timeframe is not None:
+            stmt = stmt.where(TradingViewPacketRow.timeframe == timeframe.value)
+        if end_available_time is not None:
+            stmt = stmt.where(TradingViewPacketRow.available_time <= _to_utc(end_available_time))
+        if limit is not None:
+            if limit < 1:
+                raise ValueError("limit must be >= 1")
+            stmt = stmt.order_by(TradingViewPacketRow.candle_close_time.desc()).limit(limit)
+        else:
+            stmt = stmt.order_by(TradingViewPacketRow.candle_close_time.asc())
+        with Session(self._engine) as session:
+            db_rows = list(session.scalars(stmt))
+        if limit is not None:
+            db_rows.reverse()
+        return tuple(_row_to_tv_packet(row) for row in db_rows)
+
+
+class NewsRepository(Protocol):
+    """Repository interface for canonical news articles and point-in-time sentiment."""
+
+    def save_articles(self, articles: Sequence[NormalizedNewsArticle]) -> int: ...
+
+    def save_observations(self, observations: Sequence[SentimentObservation]) -> int: ...
+
+    def load_observations(
+        self,
+        *,
+        canonical_symbol: str,
+        start_available_time: datetime | None = None,
+        end_available_time: datetime | None = None,
+        min_entity_confidence: float = MIN_ENTITY_MATCH_CONFIDENCE,
+        limit: int | None = None,
+    ) -> tuple[SentimentObservation, ...]: ...
+
+
+def _row_to_sentiment_observation(row: SentimentObservationRow) -> SentimentObservation:
+    return SentimentObservation(
+        observation_id=row.observation_id,
+        article_id=row.article_id,
+        canonical_url=row.canonical_url,
+        publisher=row.publisher,
+        title=row.title,
+        canonical_symbol=row.canonical_symbol,
+        base_asset=row.base_asset,
+        entity_confidence=row.entity_confidence,
+        sentiment_label=SentimentLabel(row.sentiment_label),
+        sentiment_score=row.sentiment_score,
+        sentiment_confidence=row.sentiment_confidence,
+        model_version=row.model_version,
+        is_probabilistic=False,
+        published_time=_to_utc(row.published_time),
+        available_time=_to_utc(row.available_time),
+    )
+
+
+class PostgresNewsRepository:
+    """Synchronous PostgreSQL persistence and causal reads for news & sentiment."""
+
+    def __init__(self, engine: Engine) -> None:
+        self._engine = engine
+
+    def save_articles(self, articles: Sequence[NormalizedNewsArticle]) -> int:
+        items = list(articles)
+        if not items:
+            return 0
+        payloads = [
+            {
+                "article_id": art.article_id,
+                "canonical_url": art.canonical_url,
+                "content_fingerprint": art.content_fingerprint,
+                "publisher": art.publisher,
+                "title": art.title,
+                "summary": art.summary,
+                "published_time": art.published_time,
+                "first_seen_time": art.first_seen_time,
+                "available_time": art.available_time,
+                "source_provider": art.source_provider,
+                "affected_entities": [e.model_dump(mode="json") for e in art.affected_entities],
+                "raw_payload": dict(art.raw_payload),
+            }
+            for art in items
+        ]
+        stmt = (
+            insert(NewsArticleRow)
+            .values(payloads)
+            .on_conflict_do_nothing()
+            .returning(NewsArticleRow.id)
+        )
+        with Session(self._engine) as session, session.begin():
+            inserted_ids = session.scalars(stmt).all()
+            return len(inserted_ids)
+
+    def save_observations(self, observations: Sequence[SentimentObservation]) -> int:
+        items = list(observations)
+        if not items:
+            return 0
+        payloads = [
+            {
+                "observation_id": obs.observation_id,
+                "article_id": obs.article_id,
+                "canonical_url": obs.canonical_url,
+                "publisher": obs.publisher,
+                "title": obs.title,
+                "canonical_symbol": obs.canonical_symbol,
+                "base_asset": obs.base_asset,
+                "entity_confidence": obs.entity_confidence,
+                "sentiment_label": obs.sentiment_label.value,
+                "sentiment_score": obs.sentiment_score,
+                "sentiment_confidence": obs.sentiment_confidence,
+                "model_version": obs.model_version,
+                "is_probabilistic": False,
+                "published_time": obs.published_time,
+                "available_time": obs.available_time,
+            }
+            for obs in items
+        ]
+        stmt = (
+            insert(SentimentObservationRow)
+            .values(payloads)
+            .on_conflict_do_nothing()
+            .returning(SentimentObservationRow.id)
+        )
+        with Session(self._engine) as session, session.begin():
+            inserted_ids = session.scalars(stmt).all()
+            return len(inserted_ids)
+
+    def load_observations(
+        self,
+        *,
+        canonical_symbol: str,
+        start_available_time: datetime | None = None,
+        end_available_time: datetime | None = None,
+        min_entity_confidence: float = MIN_ENTITY_MATCH_CONFIDENCE,
+        limit: int | None = None,
+    ) -> tuple[SentimentObservation, ...]:
+        stmt = select(SentimentObservationRow).where(
+            SentimentObservationRow.canonical_symbol == canonical_symbol,
+            SentimentObservationRow.entity_confidence >= min_entity_confidence,
+        )
+        if start_available_time is not None:
+            stmt = stmt.where(
+                SentimentObservationRow.available_time >= _to_utc(start_available_time)
+            )
+        if end_available_time is not None:
+            stmt = stmt.where(SentimentObservationRow.available_time <= _to_utc(end_available_time))
+        if limit is not None:
+            if limit < 1:
+                raise ValueError("limit must be >= 1")
+            stmt = stmt.order_by(
+                SentimentObservationRow.available_time.desc(),
+                SentimentObservationRow.id.desc(),
+            ).limit(limit)
+        else:
+            stmt = stmt.order_by(
+                SentimentObservationRow.available_time.asc(),
+                SentimentObservationRow.id.asc(),
+            )
+        with Session(self._engine) as session:
+            db_rows = list(session.scalars(stmt))
+        if limit is not None:
+            db_rows.reverse()
+        return tuple(_row_to_sentiment_observation(row) for row in db_rows)

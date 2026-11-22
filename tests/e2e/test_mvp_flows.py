@@ -37,6 +37,7 @@ from crypto_chatbot.llm.gemini import (
 from crypto_chatbot.market_data.ccxt_provider import CcxtMarketDataProvider
 from crypto_chatbot.memory.service import MemoryService
 from crypto_chatbot.storage.database import create_db_engine, init_db
+from crypto_chatbot.storage.models import Base
 from crypto_chatbot.storage.repositories import (
     ForgetResult,
     LlmInteractionRecord,
@@ -592,6 +593,9 @@ def _free_port() -> int:
 def pg_engine_url(tmp_path: Path) -> Iterator[str]:
     configured = os.environ.get("TEST_DATABASE_URL", "").strip()
     if configured:
+        engine = create_db_engine(configured)
+        Base.metadata.drop_all(engine)
+        engine.dispose()
         yield configured
         return
 
