@@ -36,6 +36,7 @@ from crypto_chatbot.schemas.ml import (
     FoldMetrics,
     MlExperimentConfig,
     MlExperimentReport,
+    MlModelArtifact,
 )
 from crypto_chatbot.schemas.news import SentimentObservation
 
@@ -326,3 +327,91 @@ def run_offline_experiment(
         has_sentiment=has_sentiment,
         created_at=created_at,
     )
+
+
+def build_model_artifact(
+    candles: Sequence[MarketCandle],
+    *,
+    config: MlExperimentConfig,
+    sentiment_observations: Sequence[SentimentObservation] | None = None,
+    use_available_time: bool = False,
+    created_at: datetime | None = None,
+) -> tuple[MlModelArtifact, MlExperimentReport]:
+    """Fit calibrated pipeline on dev split only and export immutable model artifact + report."""
+    rows, dataset_sha256 = build_point_in_time_dataset(
+        candles,
+        config=config,
+        sentiment_observations=sentiment_observations,
+        use_available_time=use_available_time,
+    )
+    has_sentiment = bool(sentiment_observations) and any(
+        abs(r.features["sentiment_net_score"]) > 0.0
+        or r.features["sentiment_article_count_log"] > 0.0
+        for r in rows
+    )
+    report = evaluate_feature_rows_experiment(
+        rows,
+        dataset_sha256=dataset_sha256,
+        config=config,
+        has_sentiment=has_sentiment,
+        created_at=created_at,
+    )
+    dev_rows, _ = split_dev_and_holdout(
+        rows,
+        holdout_fraction=config.holdout_fraction,
+        embargo_bars=config.embargo_bars,
+    )
+    active_features = (
+        ALL_FEATURE_NAMES
+        if has_sentiment
+        else (
+            *FEATURE_FAMILIES[FeatureFamily.TECHNICAL],
+            *FEATURE_FAMILIES[FeatureFamily.STRUCTURE_PIVOT],
+        )
+    )
+    x_dev, y_dev, _ = _extract_matrix(dev_rows, active_features)
+    final_pipeline = CalibratedLogisticPipeline(
+        feature_names=active_features,
+        l2_reg=config.l2_reg,
+    ).fit(
+        x_dev,
+        y_dev,
+        pred_times_train=[r.prediction_time for r in dev_rows],
+        label_end_times_train=[r.label_end_time for r in dev_rows],
+    )
+    medians = final_pipeline.preprocessor.medians_
+    means = final_pipeline.preprocessor.means_
+    stds = final_pipeline.preprocessor.stds_
+    if medians is None or means is None or stds is None:
+        raise RuntimeError("CalibratedLogisticPipeline preprocessor was not fitted")
+
+    seen_regimes = tuple(sorted({r.regime.value for r in dev_rows if r.regime is not None}))
+    art_raw = (
+        f"{report.experiment_id}|{config.model_version}|{config.feature_version}|"
+        f"{','.join(active_features)}"
+    )
+    artifact_id = "art-" + hashlib.sha256(art_raw.encode()).hexdigest()[:20]
+    artifact = MlModelArtifact(
+        artifact_id=artifact_id,
+        experiment_id=report.experiment_id,
+        canonical_symbol=config.canonical_symbol,
+        timeframe=config.timeframe,
+        target_name=config.target_name,
+        horizon_hours=config.horizon_hours,
+        noise_buffer_bps=config.noise_buffer_bps,
+        cost_assumptions=config.cost_assumptions,
+        feature_version=config.feature_version,
+        model_version=config.model_version,
+        feature_names=tuple(active_features),
+        medians=tuple(float(v) for v in medians),
+        means=tuple(float(v) for v in means),
+        stds=tuple(float(v) for v in stds),
+        weights=tuple(float(v) for v in final_pipeline.model.weights_),
+        bias=float(final_pipeline.model.bias_),
+        platt_a=float(final_pipeline.calibrator.a),
+        platt_b=float(final_pipeline.calibrator.b),
+        seen_regimes=seen_regimes,
+        accepted=report.accepted,
+        created_at=report.created_at,
+    )
+    return artifact, report

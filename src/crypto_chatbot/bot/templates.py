@@ -179,6 +179,47 @@ def _append_sentiment_lines(
             lines.append(f"- Sumber: {src.publisher} — {src.title} ({src.canonical_url})")
 
 
+def _append_ml_prediction_lines(
+    lines: list[str],
+    snapshot: AnalysisSnapshot,
+    *,
+    html_mode: bool,
+) -> None:
+    pred = snapshot.ml_prediction
+    if pred is None:
+        return
+    lines.append("")
+    lines.append(_bold("Estimasi Model ML (Eksperimental — Terpisah dari Fakta)", html_mode))
+    lines.append(
+        _esc(
+            f"- Horizon & target: {pred.horizon_hours}h ({pred.target_name})",
+            html_mode,
+        )
+    )
+    if pred.abstained or pred.calibrated_probability is None:
+        reason = pred.abstention_reason or "insufficient_confidence"
+        lines.append(_esc(f"- Status probabilitas: ABSTAIN ({reason})", html_mode))
+    else:
+        pct = format_indonesian_number(pred.calibrated_probability * 100.0, 1)
+        lines.append(_esc(f"- Probabilitas terkalibrasi: {pct}%", html_mode))
+    lines.append(
+        _esc(
+            f"- Confidence & kualitas data: confidence={pred.confidence_label} "
+            f"| kualitas={pred.data_quality_status.value}",
+            html_mode,
+        )
+    )
+    lines.append(
+        _esc(
+            f"- Versi model & fitur: {pred.model_version} / {pred.feature_version}",
+            html_mode,
+        )
+    )
+    for note in pred.limitations:
+        lines.append(f"- Keterbatasan model: {_esc(note, html_mode)}")
+    lines.append(f"- Peringatan: {_esc(pred.non_guarantee_notice, html_mode)}")
+
+
 def render_deterministic_snapshot(
     snapshot: AnalysisSnapshot,
     *,
@@ -380,6 +421,8 @@ def render_deterministic_snapshot(
                 for item in items:
                     refs = ", ".join(item.fact_ids)
                     lines.append(f"- {_esc(item.description, html_mode)} [{_esc(refs, html_mode)}]")
+
+    _append_ml_prediction_lines(lines, snapshot, html_mode=html_mode)
 
     if snapshot.limitations:
         lines.append("")
@@ -665,6 +708,8 @@ def render_compact_snapshot(
         lines.append(f"• Risiko: {_esc(setup.risk_notes[0], html_mode)}")
     elif snapshot.derivatives is not None:
         lines.append("• Risiko: Data derivatif hanya berasal dari satu venue (Binance).")
+
+    _append_ml_prediction_lines(lines, snapshot, html_mode=html_mode)
 
     base_coin = snapshot.canonical_symbol.split("/")[0]
     lines.append("")

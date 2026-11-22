@@ -96,14 +96,15 @@ def _structure_at_time(
     return MarketStructure.MIXED, latest_sh, latest_sl
 
 
-def build_point_in_time_dataset(
+def _compute_causal_feature_rows(
     candles: Sequence[MarketCandle],
     *,
     config: MlExperimentConfig,
     sentiment_observations: Sequence[SentimentObservation] | None = None,
     use_available_time: bool = False,
-) -> tuple[tuple[FeatureRow, ...], str]:
-    """Build strictly causal feature/target rows with deterministic dataset SHA-256."""
+    include_target_horizon: bool = True,
+) -> list[FeatureRow]:
+    """Shared strictly causal feature computation core used by training & production."""
     validate_closed_candles(candles)
     if not candles:
         raise ValueError("candles cannot be empty")
@@ -115,9 +116,9 @@ def build_point_in_time_dataset(
     tf_secs = int(config.timeframe.duration.total_seconds())
     horizon_bars = max(1, round((config.horizon_hours * 3600) / tf_secs))
     start_idx = max(MIN_HISTORY_EMA_50 - 1, 120)
-    end_idx = len(candles) - horizon_bars
+    end_idx = (len(candles) - horizon_bars) if include_target_horizon else len(candles)
     if end_idx <= start_idx:
-        raise ValueError("insufficient candles for warmup and target horizon")
+        raise ValueError("insufficient candles for warmup and feature computation")
 
     closes = np.array([c.close for c in candles], dtype=np.float64)
     highs = np.array([c.high for c in candles], dtype=np.float64)
@@ -149,8 +150,6 @@ def build_point_in_time_dataset(
     confirmed_fbs: list[StructureEvent] = []
 
     rows: list[FeatureRow] = []
-    digest_items: list[dict[str, object]] = []
-
     for idx in range(len(candles)):
         candle = candles[idx]
         bar_time = candle.available_time if use_available_time else candle.close_time
@@ -273,32 +272,77 @@ def build_point_in_time_dataset(
             "sentiment_article_count_log": sent_count_log,
         }
 
-        target_candle = candles[idx + horizon_bars]
-        fwd_ret = (target_candle.close / c_price) - 1.0
-        label = 1 if fwd_ret > threshold_rate else 0
+        if include_target_horizon:
+            target_candle = candles[idx + horizon_bars]
+            fwd_ret = (target_candle.close / c_price) - 1.0
+            label = 1 if fwd_ret > threshold_rate else 0
+            label_end = target_candle.close_time
+        else:
+            fwd_ret = 0.0
+            label = 0
+            label_end = bar_time + config.timeframe.duration
 
-        row = FeatureRow(
-            prediction_time=bar_time,
-            available_time=row_avail,
-            label_end_time=target_candle.close_time,
-            regime=regime,
-            features=feat_dict,
-            forward_return=fwd_ret,
-            label=label,
+        rows.append(
+            FeatureRow(
+                prediction_time=bar_time,
+                available_time=row_avail,
+                label_end_time=label_end,
+                regime=regime,
+                features=feat_dict,
+                forward_return=fwd_ret,
+                label=label,
+            )
         )
-        rows.append(row)
-        digest_items.append(
-            {
-                "t": row.prediction_time.isoformat(),
-                "le": row.label_end_time.isoformat(),
-                "y": row.label,
-                "f": {k: round(v, 10) for k, v in sorted(feat_dict.items())},
-            }
-        )
+    return rows
 
+
+def build_point_in_time_dataset(
+    candles: Sequence[MarketCandle],
+    *,
+    config: MlExperimentConfig,
+    sentiment_observations: Sequence[SentimentObservation] | None = None,
+    use_available_time: bool = False,
+) -> tuple[tuple[FeatureRow, ...], str]:
+    """Build strictly causal feature/target rows with deterministic dataset SHA-256."""
+    rows = _compute_causal_feature_rows(
+        candles,
+        config=config,
+        sentiment_observations=sentiment_observations,
+        use_available_time=use_available_time,
+        include_target_horizon=True,
+    )
     if len(rows) < 40:
         raise ValueError("insufficient point-in-time feature rows produced")
 
+    digest_items = [
+        {
+            "t": row.prediction_time.isoformat(),
+            "le": row.label_end_time.isoformat(),
+            "y": row.label,
+            "f": {k: round(v, 10) for k, v in sorted(row.features.items())},
+        }
+        for row in rows
+    ]
     encoded = json.dumps(digest_items, sort_keys=True, separators=(",", ":"), allow_nan=False)
     dataset_sha256 = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
     return tuple(rows), dataset_sha256
+
+
+def extract_latest_production_features(
+    candles: Sequence[MarketCandle],
+    *,
+    config: MlExperimentConfig,
+    sentiment_observations: Sequence[SentimentObservation] | None = None,
+    use_available_time: bool = False,
+) -> FeatureRow:
+    """Extract the latest causal feature row using the exact training feature pipeline."""
+    rows = _compute_causal_feature_rows(
+        candles,
+        config=config,
+        sentiment_observations=sentiment_observations,
+        use_available_time=use_available_time,
+        include_target_horizon=False,
+    )
+    if not rows:
+        raise ValueError("insufficient closed candles for production feature extraction")
+    return rows[-1]

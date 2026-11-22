@@ -24,10 +24,15 @@ from crypto_chatbot.market_data.orderbook import normalize_order_book_payload
 from crypto_chatbot.market_data.quality import normalize_ohlcv_rows
 from crypto_chatbot.market_data.symbols import resolve_mvp_spot_symbol, resolve_symbol
 from crypto_chatbot.market_data.tradingview import parse_ai_agent_lens_packet
-from crypto_chatbot.ml.experiment import run_offline_experiment
+from crypto_chatbot.ml.experiment import build_model_artifact, run_offline_experiment
+from crypto_chatbot.ml.shadow import (
+    ShadowInferenceEngine,
+    compute_shadow_monitoring_report,
+    settle_shadow_prediction,
+)
 from crypto_chatbot.news.pipeline import build_sentiment_observations, deduplicate_articles
 from crypto_chatbot.schemas.market import MarketType, Timeframe
-from crypto_chatbot.schemas.ml import MlExperimentConfig
+from crypto_chatbot.schemas.ml import MlExperimentConfig, MlInferenceMode
 from crypto_chatbot.schemas.news import RawNewsItem
 from crypto_chatbot.storage.database import create_db_engine, init_db
 from crypto_chatbot.storage.models import Base
@@ -36,6 +41,7 @@ from crypto_chatbot.storage.repositories import (
     PostgresDerivativesRepository,
     PostgresMarketRepository,
     PostgresMlExperimentRepository,
+    PostgresModelPredictionRepository,
     PostgresNewsRepository,
     PostgresSetupLogRepository,
     PostgresTradingViewRepository,
@@ -552,3 +558,103 @@ def test_postgres_ml_experiment_repository_round_trip(
     listed = ml_repo.list_experiments(canonical_symbol="BTC/USDT", timeframe=Timeframe.H4)
     assert len(listed) == 1
     assert listed[0].experiment_id == report.experiment_id
+
+
+@pytest.mark.asyncio
+async def test_postgres_model_prediction_repository_lifecycle(
+    pg_repository: PostgresMarketRepository,
+) -> None:
+    raw = json.loads(FIXTURE_1000.read_text(encoding="utf-8"))
+    received = datetime(2026, 10, 14, 16, 0, 1, tzinfo=UTC)
+    batch = normalize_ohlcv_rows(
+        raw["raw_ohlcv"],
+        symbol=resolve_mvp_spot_symbol("BTC"),
+        timeframe=Timeframe.H4,
+        received_time=received,
+        now=received,
+    )
+    config = MlExperimentConfig(canonical_symbol="BTC/USDT", timeframe=Timeframe.H4)
+    artifact, _ = build_model_artifact(batch.candles, config=config)
+    promoted_artifact = artifact.model_copy(update={"accepted": True})
+
+    horizon_bars = config.horizon_hours // 4
+    prefix_candles = batch.candles[:-horizon_bars]
+    prefix_batch = batch.model_copy(update={"candles": prefix_candles})
+
+    class _FixtureProvider:
+        async def get_closed_ohlcv(
+            self,
+            symbol: str,
+            timeframe: Timeframe,
+            limit: int = DEFAULT_CANDLE_LIMIT,
+        ) -> OhlcvBatch:
+            _ = symbol, limit
+            if timeframe is Timeframe.H4:
+                return prefix_batch
+            return prefix_batch.model_copy(update={"timeframe": timeframe, "candles": ()})
+
+        async def close(self) -> None:
+            return None
+
+    pred_repo = PostgresModelPredictionRepository(pg_repository._engine)
+    shadow_engine = ShadowInferenceEngine(promoted_artifact, mode=MlInferenceMode.SHADOW)
+    service = AnalysisService(
+        provider=_FixtureProvider(),
+        repository=pg_repository,
+        shadow_engine=shadow_engine,
+        prediction_repository=pred_repo,
+    )
+
+    snapshot = await service.analyze("BTC", Timeframe.H4, include_mtf=False, persist=True)
+    assert snapshot.ml_prediction is None
+
+    saved_list = pred_repo.list_predictions(canonical_symbol="BTC/USDT", timeframe=Timeframe.H4)
+    assert len(saved_list) == 1
+    rec = saved_list[0]
+    assert rec.exposed_to_user is False
+    assert rec.snapshot_id == snapshot.snapshot_id
+    assert pred_repo.save_prediction(rec) is False
+
+    unsettled = pred_repo.list_unsettled_predictions(canonical_symbol="BTC/USDT")
+    assert len(unsettled) == 1
+    assert unsettled[0].prediction_id == rec.prediction_id
+
+    fwd_ret, label, settled_at = settle_shadow_prediction(
+        rec,
+        batch.candles,
+        cost_assumptions=config.cost_assumptions,
+        noise_buffer_bps=config.noise_buffer_bps,
+    )
+    assert fwd_ret is not None
+    assert label in (0, 1)
+    assert settled_at is not None
+
+    assert (
+        pred_repo.update_realized_outcome(
+            rec.prediction_id,
+            realized_return=fwd_ret,
+            realized_label=label,
+            settled_at=settled_at,
+        )
+        is True
+    )
+    # Second settlement must be idempotent no-op.
+    assert (
+        pred_repo.update_realized_outcome(
+            rec.prediction_id,
+            realized_return=fwd_ret,
+            realized_label=label,
+            settled_at=settled_at,
+        )
+        is False
+    )
+
+    assert pred_repo.list_unsettled_predictions(canonical_symbol="BTC/USDT") == ()
+    settled_rec = pred_repo.get_prediction(rec.prediction_id)
+    assert settled_rec is not None
+    assert settled_rec.realized_label == label
+    assert settled_rec.realized_return == pytest.approx(fwd_ret)
+
+    report = compute_shadow_monitoring_report([settled_rec], min_settled=1)
+    assert report.total_predictions == 1
+    assert report.settled_predictions == 1

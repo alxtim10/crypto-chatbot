@@ -39,6 +39,7 @@ from crypto_chatbot.market_data.quality import (
 )
 from crypto_chatbot.market_data.symbols import resolve_mvp_spot_symbol
 from crypto_chatbot.market_data.tradingview import compare_packet_with_exchange_candles
+from crypto_chatbot.ml.shadow import ShadowInferenceEngine
 from crypto_chatbot.news.pipeline import aggregate_sentiment
 from crypto_chatbot.schemas.analysis import (
     AnalysisSnapshot,
@@ -68,6 +69,7 @@ from crypto_chatbot.schemas.tradingview import TradingViewMetrics, TradingViewPa
 from crypto_chatbot.storage.repositories import (
     DerivativesRepository,
     MarketRepository,
+    ModelPredictionRepository,
     NewsRepository,
     SetupLogRepository,
     TradingViewRepository,
@@ -1307,6 +1309,8 @@ class AnalysisService:
         setup_repository: SetupLogRepository | None = None,
         tradingview_repository: TradingViewRepository | None = None,
         news_repository: NewsRepository | None = None,
+        shadow_engine: ShadowInferenceEngine | None = None,
+        prediction_repository: ModelPredictionRepository | None = None,
     ) -> None:
         self._provider = provider
         self._repository = repository
@@ -1315,6 +1319,8 @@ class AnalysisService:
         self._setup_repository = setup_repository
         self._tradingview_repository = tradingview_repository
         self._news_repository = news_repository
+        self._shadow_engine = shadow_engine
+        self._prediction_repository = prediction_repository
 
     async def _fetch_optional_ltf_15m(self, canonical_symbol: str) -> OhlcvBatch | None:
         try:
@@ -1411,6 +1417,18 @@ class AnalysisService:
             tradingview_packet=tv_packet,
             news_observations=news_observations,
         )
+
+        if self._shadow_engine is not None:
+            record, summary = self._shadow_engine.predict_for_snapshot(
+                snapshot,
+                primary.candles,
+                sentiment_observations=news_observations,
+                use_available_time=True,
+            )
+            if summary is not None:
+                snapshot = snapshot.model_copy(update={"ml_prediction": summary})
+            if persist and self._prediction_repository is not None and record is not None:
+                self._prediction_repository.save_prediction(record)
 
         if persist and self._repository is not None:
             if primary.candles:

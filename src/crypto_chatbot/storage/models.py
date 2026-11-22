@@ -565,3 +565,42 @@ class MlExperimentRow(Base):
     oof_net_return: Mapped[float] = mapped_column(Double, nullable=False)
     holdout_net_return: Mapped[float] = mapped_column(Double, nullable=False)
     report_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+
+
+class ModelPredictionRow(Base):
+    """Phase 13 shadow & released ML prediction audit log (`model_predictions`); no secrets."""
+
+    __tablename__ = "model_predictions"
+    __table_args__ = (
+        UniqueConstraint("prediction_id", name="uq_model_predictions_id"),
+        Index(
+            "ix_model_predictions_lookup",
+            "canonical_symbol",
+            "timeframe",
+            "prediction_time",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    prediction_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    snapshot_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    experiment_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    canonical_symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    timeframe: Mapped[str] = mapped_column(String(16), nullable=False)
+    target_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    horizon_hours: Mapped[int] = mapped_column(Integer, nullable=False)
+    prediction_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    model_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    feature_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    quality_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    regime: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    calibrated_probability: Mapped[float | None] = mapped_column(Double, nullable=True)
+    confidence_label: Mapped[str] = mapped_column(String(32), nullable=False)
+    abstained: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    abstention_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    max_feature_zscore: Mapped[float | None] = mapped_column(Double, nullable=True)
+    latency_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    exposed_to_user: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    realized_return: Mapped[float | None] = mapped_column(Double, nullable=True)
+    realized_label: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

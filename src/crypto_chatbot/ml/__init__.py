@@ -7,6 +7,7 @@ from crypto_chatbot.ml.evaluation import (
     decide_promotion,
 )
 from crypto_chatbot.ml.experiment import (
+    build_model_artifact,
     evaluate_feature_rows_experiment,
     run_offline_experiment,
 )
@@ -14,6 +15,7 @@ from crypto_chatbot.ml.features import (
     ALL_FEATURE_NAMES,
     FEATURE_FAMILIES,
     build_point_in_time_dataset,
+    extract_latest_production_features,
 )
 from crypto_chatbot.ml.models import (
     CalibratedLogisticPipeline,
@@ -21,6 +23,11 @@ from crypto_chatbot.ml.models import (
     L2LogisticRegression,
     NaiveBaseRateModel,
     PlattCalibrator,
+)
+from crypto_chatbot.ml.shadow import (
+    ShadowInferenceEngine,
+    compute_shadow_monitoring_report,
+    settle_shadow_prediction,
 )
 from crypto_chatbot.ml.validation import (
     PurgedSplit,
@@ -38,14 +45,19 @@ __all__ = [
     "NaiveBaseRateModel",
     "PlattCalibrator",
     "PurgedSplit",
+    "ShadowInferenceEngine",
     "assert_no_fold_leakage",
+    "build_model_artifact",
     "build_point_in_time_dataset",
     "compute_ece",
     "compute_evaluation_summary",
     "compute_regime_stability",
+    "compute_shadow_monitoring_report",
     "decide_promotion",
     "evaluate_feature_rows_experiment",
+    "extract_latest_production_features",
     "generate_purged_walk_forward_splits",
     "run_offline_experiment",
+    "settle_shadow_prediction",
     "split_dev_and_holdout",
 ]

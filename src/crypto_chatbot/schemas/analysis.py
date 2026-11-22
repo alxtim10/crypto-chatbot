@@ -357,6 +357,25 @@ class DerivativesMetrics(BaseModel):
     cross_source_pair: str | None = None
 
 
+class ModelPredictionSummary(BaseModel):
+    """User-facing experimental prediction attached only when ML release mode is PROMOTED."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    prediction_id: str = Field(min_length=1)
+    target_name: str = Field(min_length=1)
+    horizon_hours: int = Field(ge=1)
+    calibrated_probability: FiniteFloat | None = Field(default=None, ge=0.0, le=1.0)
+    abstained: bool
+    abstention_reason: str | None = None
+    confidence_label: str = Field(min_length=1)
+    data_quality_status: QualityStatus
+    model_version: str = Field(min_length=1)
+    feature_version: str = Field(min_length=1)
+    limitations: tuple[str, ...]
+    non_guarantee_notice: str = Field(min_length=1)
+
+
 class AnalysisSnapshot(BaseModel):
     """Complete deterministic snapshot passed to templates and Gemini (PROJECT_PLAN §5.8)."""
 
@@ -380,6 +399,7 @@ class AnalysisSnapshot(BaseModel):
     tradingview: TradingViewMetrics | None = None
     sentiment: SentimentMetrics | None = None
     trade_setup: TradeSetup | None = None
+    ml_prediction: ModelPredictionSummary | None = None
     facts: tuple[Fact, ...] = ()
     regime: Regime | None = None
     market_structure: MarketStructure | None = None

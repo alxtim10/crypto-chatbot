@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import Engine, delete, select
+from sqlalchemy import Engine, delete, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
@@ -25,10 +25,11 @@ from crypto_chatbot.schemas.market import (
     MarketCandle,
     MarketType,
     QualityFlag,
+    QualityStatus,
     Timeframe,
     UtcDatetime,
 )
-from crypto_chatbot.schemas.ml import MlExperimentReport
+from crypto_chatbot.schemas.ml import MlExperimentReport, ShadowPredictionRecord
 from crypto_chatbot.schemas.news import (
     MIN_ENTITY_MATCH_CONFIDENCE,
     NormalizedNewsArticle,
@@ -49,6 +50,7 @@ from crypto_chatbot.storage.models import (
     MarketCandleRow,
     MessageRow,
     MlExperimentRow,
+    ModelPredictionRow,
     NewsArticleRow,
     OpenInterestRow,
     OrderBookSnapshotRow,
@@ -1595,3 +1597,180 @@ class PostgresMlExperimentRepository:
         with Session(self._engine) as session:
             rows = list(session.scalars(stmt))
         return tuple(MlExperimentReport.model_validate(r.report_payload) for r in rows)
+
+
+class ModelPredictionRepository(Protocol):
+    """Storage contract for shadow/promoted ML prediction logs and settlement updates."""
+
+    def save_prediction(self, record: ShadowPredictionRecord) -> bool: ...
+
+    def get_prediction(self, prediction_id: str) -> ShadowPredictionRecord | None: ...
+
+    def list_predictions(
+        self,
+        *,
+        canonical_symbol: str | None = None,
+        timeframe: Timeframe | None = None,
+        limit: int = 100,
+    ) -> tuple[ShadowPredictionRecord, ...]: ...
+
+    def list_unsettled_predictions(
+        self,
+        *,
+        canonical_symbol: str | None = None,
+        timeframe: Timeframe | None = None,
+        limit: int = 100,
+    ) -> tuple[ShadowPredictionRecord, ...]: ...
+
+    def update_realized_outcome(
+        self,
+        prediction_id: str,
+        *,
+        realized_return: float,
+        realized_label: int,
+        settled_at: datetime,
+    ) -> bool: ...
+
+
+def _row_to_shadow_prediction(row: ModelPredictionRow) -> ShadowPredictionRecord:
+    return ShadowPredictionRecord(
+        prediction_id=row.prediction_id,
+        snapshot_id=row.snapshot_id,
+        experiment_id=row.experiment_id,
+        canonical_symbol=row.canonical_symbol,
+        timeframe=Timeframe(row.timeframe),
+        target_name=row.target_name,
+        horizon_hours=row.horizon_hours,
+        prediction_time=_to_utc(row.prediction_time),
+        model_version=row.model_version,
+        feature_version=row.feature_version,
+        quality_status=QualityStatus(row.quality_status),
+        regime=row.regime,
+        calibrated_probability=row.calibrated_probability,
+        confidence_label=row.confidence_label,
+        abstained=row.abstained,
+        abstention_reason=row.abstention_reason,
+        max_feature_zscore=row.max_feature_zscore,
+        latency_ms=row.latency_ms,
+        exposed_to_user=row.exposed_to_user,
+        realized_return=row.realized_return,
+        realized_label=row.realized_label,
+        settled_at=_to_utc(row.settled_at) if row.settled_at is not None else None,
+    )
+
+
+class PostgresModelPredictionRepository:
+    """PostgreSQL storage for Phase 13 shadow & released ML predictions (`model_predictions`)."""
+
+    def __init__(self, engine: Engine) -> None:
+        self._engine = engine
+
+    def save_prediction(self, record: ShadowPredictionRecord) -> bool:
+        payload = {
+            "prediction_id": record.prediction_id,
+            "snapshot_id": record.snapshot_id,
+            "experiment_id": record.experiment_id,
+            "canonical_symbol": record.canonical_symbol,
+            "timeframe": record.timeframe.value,
+            "target_name": record.target_name,
+            "horizon_hours": record.horizon_hours,
+            "prediction_time": _to_utc(record.prediction_time),
+            "model_version": record.model_version,
+            "feature_version": record.feature_version,
+            "quality_status": record.quality_status.value,
+            "regime": record.regime,
+            "calibrated_probability": record.calibrated_probability,
+            "confidence_label": record.confidence_label,
+            "abstained": record.abstained,
+            "abstention_reason": record.abstention_reason,
+            "max_feature_zscore": record.max_feature_zscore,
+            "latency_ms": record.latency_ms,
+            "exposed_to_user": record.exposed_to_user,
+            "realized_return": record.realized_return,
+            "realized_label": record.realized_label,
+            "settled_at": _to_utc(record.settled_at) if record.settled_at is not None else None,
+        }
+        stmt = (
+            insert(ModelPredictionRow)
+            .values(payload)
+            .on_conflict_do_nothing(constraint="uq_model_predictions_id")
+            .returning(ModelPredictionRow.id)
+        )
+        with Session(self._engine) as session, session.begin():
+            return bool(session.scalars(stmt).all())
+
+    def get_prediction(self, prediction_id: str) -> ShadowPredictionRecord | None:
+        stmt = select(ModelPredictionRow).where(ModelPredictionRow.prediction_id == prediction_id)
+        with Session(self._engine) as session:
+            row = session.scalar(stmt)
+        if row is None:
+            return None
+        return _row_to_shadow_prediction(row)
+
+    def list_predictions(
+        self,
+        *,
+        canonical_symbol: str | None = None,
+        timeframe: Timeframe | None = None,
+        limit: int = 100,
+    ) -> tuple[ShadowPredictionRecord, ...]:
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        stmt = select(ModelPredictionRow)
+        if canonical_symbol is not None:
+            stmt = stmt.where(ModelPredictionRow.canonical_symbol == canonical_symbol)
+        if timeframe is not None:
+            stmt = stmt.where(ModelPredictionRow.timeframe == timeframe.value)
+        stmt = stmt.order_by(
+            ModelPredictionRow.prediction_time.desc(), ModelPredictionRow.id.desc()
+        ).limit(limit)
+        with Session(self._engine) as session:
+            rows = list(session.scalars(stmt))
+        return tuple(_row_to_shadow_prediction(r) for r in rows)
+
+    def list_unsettled_predictions(
+        self,
+        *,
+        canonical_symbol: str | None = None,
+        timeframe: Timeframe | None = None,
+        limit: int = 100,
+    ) -> tuple[ShadowPredictionRecord, ...]:
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        stmt = select(ModelPredictionRow).where(ModelPredictionRow.settled_at.is_(None))
+        if canonical_symbol is not None:
+            stmt = stmt.where(ModelPredictionRow.canonical_symbol == canonical_symbol)
+        if timeframe is not None:
+            stmt = stmt.where(ModelPredictionRow.timeframe == timeframe.value)
+        stmt = stmt.order_by(
+            ModelPredictionRow.prediction_time.asc(), ModelPredictionRow.id.asc()
+        ).limit(limit)
+        with Session(self._engine) as session:
+            rows = list(session.scalars(stmt))
+        return tuple(_row_to_shadow_prediction(r) for r in rows)
+
+    def update_realized_outcome(
+        self,
+        prediction_id: str,
+        *,
+        realized_return: float,
+        realized_label: int,
+        settled_at: datetime,
+    ) -> bool:
+        if realized_label not in (0, 1):
+            raise ValueError("realized_label must be 0 or 1")
+        stmt = (
+            update(ModelPredictionRow)
+            .where(
+                ModelPredictionRow.prediction_id == prediction_id,
+                ModelPredictionRow.settled_at.is_(None),
+            )
+            .values(
+                realized_return=realized_return,
+                realized_label=realized_label,
+                settled_at=_to_utc(settled_at),
+            )
+            .returning(ModelPredictionRow.id)
+        )
+        with Session(self._engine) as session, session.begin():
+            return bool(session.scalars(stmt).all())

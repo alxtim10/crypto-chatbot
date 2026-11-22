@@ -11,6 +11,7 @@ from typing import Annotated
 from pydantic import Field, SecretStr, ValidationError, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+from crypto_chatbot.schemas.ml import MlInferenceMode
 from crypto_chatbot.schemas.tradingview import TRADINGVIEW_PUBLISHED_WEBHOOK_IPS
 
 
@@ -41,6 +42,7 @@ class Settings(BaseSettings):
     tradingview_allowed_ips: Annotated[tuple[str, ...], NoDecode] = (
         TRADINGVIEW_PUBLISHED_WEBHOOK_IPS
     )
+    ml_inference_mode: MlInferenceMode = MlInferenceMode.OFF
 
     @field_validator("tradingview_webhook_secret", mode="before")
     @classmethod
