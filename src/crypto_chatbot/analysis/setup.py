@@ -23,6 +23,7 @@ from crypto_chatbot.schemas.analysis import (
     TechnicalMetrics,
     TradeSetup,
 )
+from crypto_chatbot.schemas.macro import MacroBenchmarkContext, PositioningRegime
 from crypto_chatbot.schemas.market import MarketCandle, Timeframe
 from crypto_chatbot.schemas.ml import CostAssumptions
 from crypto_chatbot.schemas.news import SentimentLabel, SentimentMetrics
@@ -79,6 +80,7 @@ class _LtfRefinement(NamedTuple):
     ltf_support: float | None = None
     ltf_resistance: float | None = None
     extra_risk_notes: tuple[str, ...] = ()
+    has_counter_sweep: bool = False
 
 
 def _wait_setup(
@@ -252,6 +254,7 @@ def _refine_with_ltf_15m(
     extra_notes: list[str] = []
 
     if bias is SetupBias.LONG:
+        has_counter_sweep = ltf_swp is StructureEventType.LIQUIDITY_SWEEP_BEARISH
         if (
             ltf_swp is StructureEventType.LIQUIDITY_SWEEP_BULLISH
             and ltf_brk is StructureEventType.CHOCH_BULLISH
@@ -318,8 +321,11 @@ def _refine_with_ltf_15m(
                 e_low - 0.25 * ltf_atr,
                 e_mid - MIN_LTF_SL_HTF_ATR * htf_atr,
             )
+            if ltf_sup is not None and ltf_sup < e_low:
+                sl_15m = min(sl_15m, ltf_sup - SL_ATR_BUFFER * ltf_atr)
             inv_15m = "Di bawah Support / Swing Low 15m terkonfirmasi + buffer ATR"
     else:
+        has_counter_sweep = ltf_swp is StructureEventType.LIQUIDITY_SWEEP_BULLISH
         if (
             ltf_swp is StructureEventType.LIQUIDITY_SWEEP_BEARISH
             and ltf_brk is StructureEventType.CHOCH_BEARISH
@@ -388,6 +394,8 @@ def _refine_with_ltf_15m(
                 e_high + 0.25 * ltf_atr,
                 e_mid + MIN_LTF_SL_HTF_ATR * htf_atr,
             )
+            if ltf_res is not None and ltf_res > e_high:
+                sl_15m = max(sl_15m, ltf_res + SL_ATR_BUFFER * ltf_atr)
             inv_15m = "Di atas Resistance / Swing High 15m terkonfirmasi + buffer ATR"
 
     return _LtfRefinement(
@@ -400,6 +408,7 @@ def _refine_with_ltf_15m(
         ltf_support=ltf_sup,
         ltf_resistance=ltf_res,
         extra_risk_notes=tuple(extra_notes),
+        has_counter_sweep=has_counter_sweep,
     )
 
 
@@ -610,6 +619,7 @@ def build_trade_setup(
     as_of: datetime | None = None,
     use_available_time: bool = False,
     cost_assumptions: CostAssumptions | None = None,
+    macro_context: MacroBenchmarkContext | None = None,
 ) -> TradeSetup:
     """Compute 1 deterministic conditional trade setup (Entry, SL, TP1-3) or honest WAIT."""
     htf_sup, htf_res = _extract_sr_levels(structure, smc)
@@ -661,6 +671,96 @@ def build_trade_setup(
         derivatives=derivatives,
         sentiment=sentiment,
     )
+    if macro_context is not None:
+        if macro_context.dxy is not None and macro_context.dxy.macro_impact == "headwind":
+            risk_notes.append(
+                "Makro Headwind: Indeks Dolar AS (DXY) menguat dengan korelasi negatif."
+            )
+        if (
+            macro_context.btc_benchmark is not None
+            and macro_context.btc_benchmark.leader_alignment == "divergent_warning"
+            and bias is SetupBias.LONG
+        ):
+            risk_notes.append(
+                "Konflik Leader: Setup LONG pada altcoin bertentangan dengan "
+                "tren bearish BTC benchmark."
+            )
+        if macro_context.positioning_regime == PositioningRegime.CROWDED_SQUEEZE_RISK:
+            risk_notes.append(
+                "Rezim Posisi: Risiko crowded squeeze terdeteksi pada pasar futures "
+                "(funding/posisi ekstrem)."
+            )
+
+    # Filter 1: Overbought/Oversold Exhaustion at Dealing Range Extremes
+    if (
+        bias is SetupBias.LONG
+        and metrics.rsi_14 is not None
+        and metrics.rsi_14 >= 75.0
+        and smc.dealing_zone is DealingZone.PREMIUM
+    ):
+        return _wait_setup(
+            f"RSI 14 jenuh beli ekstrem ({metrics.rsi_14:.1f} >= 75) di zona Premium dealing "
+            "range; waspada exhaustion pucuk, tunggu retracement ke zona lebih murah (WAIT).",
+            risk_notes,
+            entry_timeframe=primary_timeframe,
+            htf_support=htf_sup,
+            htf_resistance=htf_res,
+            ltf_support=ltf_sup,
+            ltf_resistance=ltf_res,
+        )
+    if (
+        bias is SetupBias.SHORT
+        and metrics.rsi_14 is not None
+        and metrics.rsi_14 <= 25.0
+        and smc.dealing_zone is DealingZone.DISCOUNT
+    ):
+        return _wait_setup(
+            f"RSI 14 jenuh jual ekstrem ({metrics.rsi_14:.1f} <= 25) di zona Discount "
+            "dealing range; waspada exhaustion dasar, tunggu pullback ke zona lebih tinggi (WAIT).",
+            risk_notes,
+            entry_timeframe=primary_timeframe,
+            htf_support=htf_sup,
+            htf_resistance=htf_res,
+            ltf_support=ltf_sup,
+            ltf_resistance=ltf_res,
+        )
+
+    # Filter 2 (HTF): Liquidity Sweep counter-trend + Adverse Order Book Imbalance
+    htf_swp = smc.latest_sweep.event_type if smc.latest_sweep else None
+    if derivatives is not None and derivatives.imbalance_10bps is not None:
+        if (
+            bias is SetupBias.LONG
+            and htf_swp is StructureEventType.LIQUIDITY_SWEEP_BEARISH
+            and derivatives.imbalance_10bps <= -0.30
+        ):
+            imb_val = derivatives.imbalance_10bps
+            return _wait_setup(
+                "Terdeteksi Liquidity Sweep bearish disertai tekanan order book tebal di sisi "
+                f"ask (imbalance 10bps {imb_val:.2f} <= -0,30); waspada distribusi pucuk (WAIT).",
+                risk_notes,
+                entry_timeframe=primary_timeframe,
+                htf_support=htf_sup,
+                htf_resistance=htf_res,
+                ltf_support=ltf_sup,
+                ltf_resistance=ltf_res,
+            )
+        if (
+            bias is SetupBias.SHORT
+            and htf_swp is StructureEventType.LIQUIDITY_SWEEP_BULLISH
+            and derivatives.imbalance_10bps >= 0.30
+        ):
+            imb_val = derivatives.imbalance_10bps
+            return _wait_setup(
+                "Terdeteksi Liquidity Sweep bullish disertai dukungan order book tebal di sisi "
+                f"bid (imbalance 10bps +{imb_val:.2f} >= +0,30); waspada absorpsi dasar (WAIT).",
+                risk_notes,
+                entry_timeframe=primary_timeframe,
+                htf_support=htf_sup,
+                htf_resistance=htf_res,
+                ltf_support=ltf_sup,
+                ltf_resistance=ltf_res,
+            )
+
     htf_conf_note: str | None = None
     if primary_timeframe is Timeframe.M15:
         htf_wait, htf_conf_note = _evaluate_htf_filter_for_15m(
@@ -717,6 +817,41 @@ def build_trade_setup(
             ltf_sup = ltf_ref.ltf_support or ltf_sup
             ltf_res = ltf_ref.ltf_resistance or ltf_res
             risk_notes.extend(ltf_ref.extra_risk_notes)
+
+            # Filter 2 (LTF): 15m Counter-Liquidity Sweep + Adverse Order Book Imbalance
+            if (
+                derivatives is not None
+                and derivatives.imbalance_10bps is not None
+                and ltf_ref.has_counter_sweep
+            ):
+                if bias is SetupBias.LONG and derivatives.imbalance_10bps <= -0.30:
+                    imb_val = derivatives.imbalance_10bps
+                    return _wait_setup(
+                        "Terdeteksi 15m Liquidity Sweep bearish disertai tekanan order book "
+                        f"tebal di sisi ask (imbalance 10bps {imb_val:.2f} <= -0,30); "
+                        "waspada jebakan pucuk (WAIT).",
+                        risk_notes,
+                        entry_timeframe=primary_timeframe,
+                        ltf_confirmation=ltf_ref.confirmation,
+                        htf_support=htf_sup,
+                        htf_resistance=htf_res,
+                        ltf_support=ltf_sup,
+                        ltf_resistance=ltf_res,
+                    )
+                if bias is SetupBias.SHORT and derivatives.imbalance_10bps >= 0.30:
+                    imb_val = derivatives.imbalance_10bps
+                    return _wait_setup(
+                        "Terdeteksi 15m Liquidity Sweep bullish disertai dukungan order book "
+                        f"tebal di sisi bid (imbalance 10bps +{imb_val:.2f} >= +0,30); "
+                        "waspada absorpsi dasar (WAIT).",
+                        risk_notes,
+                        entry_timeframe=primary_timeframe,
+                        ltf_confirmation=ltf_ref.confirmation,
+                        htf_support=htf_sup,
+                        htf_resistance=htf_res,
+                        ltf_support=ltf_sup,
+                        ltf_resistance=ltf_res,
+                    )
             if (
                 ltf_ref.entry_low is not None
                 and ltf_ref.entry_high is not None
@@ -852,6 +987,10 @@ def build_trade_setup(
             "1:1,5; perkecil ukuran posisi atau tunggu zona entry lebih presisi."
         )
 
+    sl_dist_ratio = abs(entry_mid - stop_loss) / entry_mid
+    sl_dist_pct = round(sl_dist_ratio * 100.0, 4)
+    max_theor_lev = max(1, int(0.8 / sl_dist_ratio)) if sl_dist_ratio > 0 else 1
+
     return TradeSetup(
         status=SetupStatus.READY,
         bias=bias,
@@ -867,6 +1006,8 @@ def build_trade_setup(
         ltf_resistance=ltf_res,
         stop_loss=stop_loss,
         invalidation_reason=invalidation_reason,
+        stop_loss_distance_pct=sl_dist_pct,
+        max_theoretical_leverage=max_theor_lev,
         tp1=tp1,
         tp1_label=tp1_label,
         tp2=tp2,

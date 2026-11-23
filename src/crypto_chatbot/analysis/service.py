@@ -23,6 +23,7 @@ from crypto_chatbot.analysis.indicators import (
     INDICATOR_PARAMETERS,
     compute_technical_metrics,
 )
+from crypto_chatbot.analysis.macro import build_macro_benchmark_context
 from crypto_chatbot.analysis.orderflow import compute_closed_candle_orderflow
 from crypto_chatbot.analysis.regimes import classify_regime, classify_volatility_regime
 from crypto_chatbot.analysis.setup import SETUP_PARAMETERS, build_trade_setup
@@ -41,11 +42,12 @@ from crypto_chatbot.market_data.base import (
     OhlcvBatch,
 )
 from crypto_chatbot.market_data.bybit_derivatives import BybitDerivativesProvider
+from crypto_chatbot.market_data.macro_provider import DxyMarketDataProvider
 from crypto_chatbot.market_data.quality import (
     determine_quality_status,
     is_candle_stale,
 )
-from crypto_chatbot.market_data.symbols import resolve_mvp_spot_symbol
+from crypto_chatbot.market_data.symbols import resolve_default_perp_symbol
 from crypto_chatbot.market_data.tradingview import compare_packet_with_exchange_candles
 from crypto_chatbot.ml.shadow import ShadowInferenceEngine
 from crypto_chatbot.news.pipeline import aggregate_sentiment
@@ -68,6 +70,7 @@ from crypto_chatbot.schemas.derivatives import (
     DerivativesContext,
     OrderFlowMetrics,
 )
+from crypto_chatbot.schemas.macro import MacroBenchmarkContext
 from crypto_chatbot.schemas.market import (
     MarketCandle,
     MarketType,
@@ -185,6 +188,16 @@ def _compute_sentiment_digest(metrics: SentimentMetrics) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _compute_macro_digest(metrics: MacroBenchmarkContext) -> str:
+    encoded = json.dumps(
+        metrics.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _compute_snapshot_id(
     *,
     provider: str,
@@ -201,6 +214,7 @@ def _compute_snapshot_id(
     derivatives_digest: str | None = None,
     tradingview_digest: str | None = None,
     sentiment_digest: str | None = None,
+    macro_digest: str | None = None,
 ) -> str:
     payload: dict[str, Any] = {
         "as_of": as_of.isoformat(),
@@ -221,6 +235,8 @@ def _compute_snapshot_id(
         payload["tradingview_digest"] = tradingview_digest
     if sentiment_digest is not None:
         payload["sentiment_digest"] = sentiment_digest
+    if macro_digest is not None:
+        payload["macro_digest"] = macro_digest
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(
         "utf-8"
     )
@@ -273,6 +289,7 @@ def _build_facts(
     cross_venue_derivatives: CrossVenueDerivativesSummary | None = None,
     statistics: StatisticalMetrics | None = None,
     volatility_percentile: float | None = None,
+    macro_context: MacroBenchmarkContext | None = None,
 ) -> tuple[tuple[Fact, ...], dict[str, str]]:
     facts: list[Fact] = []
     fact_ids_by_key: dict[str, str] = {}
@@ -791,6 +808,22 @@ def _build_facts(
         add_fact("setup_rr_tp1", "Rasio R:R TP 1", trade_setup.rr_tp1, "ratio", "rr_ratio")
         add_fact("setup_rr_tp2", "Rasio R:R TP 2", trade_setup.rr_tp2, "ratio", "rr_ratio")
         add_fact("setup_rr_tp3", "Rasio R:R TP 3", trade_setup.rr_tp3, "ratio", "rr_ratio")
+        add_fact(
+            "setup_stop_loss_distance_pct",
+            "Jarak stop loss ke invalidasi",
+            trade_setup.stop_loss_distance_pct,
+            "%",
+            "percent",
+        )
+        add_fact(
+            "setup_max_theoretical_leverage",
+            "Leverage referensi teoretis",
+            float(trade_setup.max_theoretical_leverage)
+            if trade_setup.max_theoretical_leverage is not None
+            else None,
+            "x",
+            "integer",
+        )
 
     if trade_setup is not None:
         m15_src = f"{source.rsplit(':', 1)[0]}:15m"
@@ -910,6 +943,51 @@ def _build_facts(
                 "bps",
                 "bps",
                 fact_source=cv_src,
+            )
+
+    if macro_context is not None:
+        if macro_context.dxy is not None:
+            dxy_src = f"yahoo:nyb:{macro_context.dxy.symbol}"
+            add_fact(
+                "dxy_last_close",
+                "Harga penutupan DXY",
+                macro_context.dxy.last_close,
+                "USD",
+                "price",
+                fact_as_of=macro_context.dxy.as_of,
+                fact_source=dxy_src,
+            )
+            add_fact(
+                "dxy_rolling_corr_20",
+                "Korelasi rolling DXY (20 bar)",
+                macro_context.dxy.rolling_corr_20,
+                "r",
+                "signed_decimal_2",
+                fact_as_of=macro_context.dxy.as_of,
+                fact_source=dxy_src,
+            )
+        if (
+            macro_context.btc_benchmark is not None
+            and macro_context.btc_benchmark.leader_alignment != "self"
+        ):
+            btc_src = f"binance:{macro_context.btc_benchmark.canonical_symbol}"
+            add_fact(
+                "alt_relative_strength_vs_btc_20",
+                "Relative strength vs BTC (20 bar)",
+                macro_context.btc_benchmark.relative_strength_20_pct,
+                "%",
+                "percent",
+                fact_as_of=macro_context.btc_benchmark.as_of,
+                fact_source=btc_src,
+            )
+            add_fact(
+                "alt_beta_vs_btc_20",
+                "Rolling Beta vs BTC (20 bar)",
+                macro_context.btc_benchmark.rolling_beta_20,
+                "beta",
+                "decimal_2",
+                fact_as_of=macro_context.btc_benchmark.as_of,
+                fact_source=btc_src,
             )
 
     return tuple(facts), fact_ids_by_key
@@ -1128,6 +1206,9 @@ def build_analysis_snapshot(
     cross_venue_derivatives: CrossVenueDerivativesSummary | None = None,
     order_flow: OrderFlowMetrics | None = None,
     use_available_time: bool = False,
+    dxy_candles: Sequence[MarketCandle] | None = None,
+    btc_candles: Sequence[MarketCandle] | None = None,
+    macro_context: MacroBenchmarkContext | None = None,
 ) -> AnalysisSnapshot:
     """Assemble a complete deterministic `AnalysisSnapshot` from spot and optional inputs."""
     if batch.has_provider_error or not batch.candles:
@@ -1309,6 +1390,21 @@ def build_analysis_snapshot(
         failed_breakouts,
     )
     smc = analyze_smc(batch.candles, structure=structure)
+    actual_order_flow = order_flow or compute_closed_candle_orderflow(batch.candles)
+    if macro_context is None:
+        macro_context = build_macro_benchmark_context(
+            target_candles=batch.candles,
+            target_canonical_symbol=batch.canonical_symbol,
+            as_of=as_of,
+            dxy_candles=dxy_candles,
+            btc_candles=btc_candles,
+            derivatives=deriv_result.metrics if deriv_result is not None else None,
+            order_flow=actual_order_flow,
+        )
+    macro_digest: str | None = None
+    if macro_context is not None:
+        macro_digest = _compute_macro_digest(macro_context)
+
     trade_setup = build_trade_setup(
         metrics=ind_result.metrics,
         regime=regime,
@@ -1321,9 +1417,9 @@ def build_analysis_snapshot(
         htf_candles_by_tf=htf_candles_by_tf or None,
         as_of=as_of,
         use_available_time=use_available_time,
+        macro_context=macro_context,
     )
     source = f"{batch.metadata.venue}:{batch.canonical_symbol}:{batch.timeframe.value}"
-    actual_order_flow = order_flow or compute_closed_candle_orderflow(batch.candles)
     facts, fact_ids_by_key = _build_facts(
         metrics=ind_result.metrics,
         mtf_rsi_values=ind_result.mtf_rsi_values,
@@ -1345,6 +1441,7 @@ def build_analysis_snapshot(
         cross_venue_derivatives=cross_venue_derivatives,
         statistics=statistical_metrics,
         volatility_percentile=volatility_regime_result.percentile,
+        macro_context=macro_context,
     )
 
     recent_cutoff = as_of - 10 * batch.timeframe.duration
@@ -1376,6 +1473,7 @@ def build_analysis_snapshot(
         derivatives_digest=deriv_digest,
         tradingview_digest=tv_digest,
         sentiment_digest=sent_digest,
+        macro_digest=macro_digest,
     )
     params = dict(INDICATOR_PARAMETERS)
     params.update(STATISTICS_PARAMETERS)
@@ -1409,6 +1507,7 @@ def build_analysis_snapshot(
         trade_setup=trade_setup,
         order_flow=actual_order_flow,
         cross_venue_derivatives=cross_venue_derivatives,
+        macro_context=macro_context,
         facts=facts,
         regime=regime,
         market_structure=structure.market_structure,
@@ -1484,6 +1583,7 @@ class AnalysisService:
         bybit_provider: BybitDerivativesProvider | None = None,
         shadow_engine: ShadowInferenceEngine | None = None,
         prediction_repository: ModelPredictionRepository | None = None,
+        dxy_provider: DxyMarketDataProvider | None = None,
     ) -> None:
         self._provider = provider
         self._repository = repository
@@ -1495,6 +1595,7 @@ class AnalysisService:
         self._news_repository = news_repository
         self._shadow_engine = shadow_engine
         self._prediction_repository = prediction_repository
+        self._dxy_provider = dxy_provider
 
     async def _fetch_optional_ltf_15m(self, canonical_symbol: str) -> OhlcvBatch | None:
         try:
@@ -1517,7 +1618,7 @@ class AnalysisService:
         persist: bool = True,
     ) -> AnalysisSnapshot:
         """Fetch market data, build an `AnalysisSnapshot`, and optionally persist it."""
-        mapping = resolve_mvp_spot_symbol(symbol)
+        mapping = resolve_default_perp_symbol(symbol)
         primary = await self._provider.get_closed_ohlcv(
             mapping.canonical_symbol,
             timeframe,
@@ -1530,6 +1631,9 @@ class AnalysisService:
             is not QualityStatus.INSUFFICIENT_DATA
         )
 
+        effective_symbol = primary.canonical_symbol if primary_ok else mapping.canonical_symbol
+        effective_base = primary.metadata.base_unit if primary_ok else mapping.base
+
         mtf_batches: dict[Timeframe, OhlcvBatch] | None = None
         if include_mtf and primary_ok:
             other_tfs = [
@@ -1537,26 +1641,26 @@ class AnalysisService:
             ]
             fetched = await asyncio.gather(
                 *(
-                    self._provider.get_closed_ohlcv(mapping.canonical_symbol, tf, limit=100)
+                    self._provider.get_closed_ohlcv(effective_symbol, tf, limit=100)
                     for tf in other_tfs
                 )
             )
             mtf_batches = dict(zip(other_tfs, fetched, strict=True))
             if timeframe is not Timeframe.M15:
-                m15_batch = await self._fetch_optional_ltf_15m(mapping.canonical_symbol)
+                m15_batch = await self._fetch_optional_ltf_15m(effective_symbol)
                 if m15_batch is not None:
                     mtf_batches[Timeframe.M15] = m15_batch
 
         derivatives_context: DerivativesContext | None = None
         if self._derivatives_provider is not None and include_derivatives and primary_ok:
             funding_batch, oi_batch, ob_batch, liq_batch = await asyncio.gather(
-                self._derivatives_provider.get_funding_rate(mapping.base),
-                self._derivatives_provider.get_open_interest(mapping.base, timeframe),
+                self._derivatives_provider.get_funding_rate(effective_base),
+                self._derivatives_provider.get_open_interest(effective_base, timeframe),
                 self._derivatives_provider.get_order_book(
-                    mapping.canonical_symbol,
-                    market_type=MarketType.SPOT,
+                    effective_symbol,
+                    market_type=mapping.market_type,
                 ),
-                self._derivatives_provider.get_liquidations(mapping.base),
+                self._derivatives_provider.get_liquidations(effective_base),
             )
             derivatives_context = DerivativesContext(
                 funding=funding_batch,
@@ -1597,6 +1701,30 @@ class AnalysisService:
                 end_available_time=primary_as_of,
             )
 
+        dxy_candles: tuple[MarketCandle, ...] | None = None
+        if self._dxy_provider is not None and primary_ok and primary.candles:
+            try:
+                dxy_candles = await self._dxy_provider.get_dxy_candles(
+                    timeframe,
+                    limit=100,
+                    now=primary.candles[-1].close_time,
+                )
+            except Exception:
+                dxy_candles = None
+
+        btc_candles: tuple[MarketCandle, ...] | None = None
+        if "BTC" not in mapping.canonical_symbol.upper() and primary_ok:
+            try:
+                btc_batch = await self._provider.get_closed_ohlcv(
+                    "BTC/USDT:USDT",
+                    timeframe,
+                    limit=limit,
+                )
+                if btc_batch.candles:
+                    btc_candles = btc_batch.candles
+            except Exception:
+                btc_candles = None
+
         snapshot = build_analysis_snapshot(
             primary,
             mtf_batches=mtf_batches,
@@ -1604,6 +1732,8 @@ class AnalysisService:
             tradingview_packet=tv_packet,
             news_observations=news_observations,
             cross_venue_derivatives=cross_venue,
+            dxy_candles=dxy_candles,
+            btc_candles=btc_candles,
         )
 
         if self._shadow_engine is not None:
@@ -1766,4 +1896,5 @@ class AnalysisService:
             mtf_batches=mtf_batches,
             tradingview_packet=tv_packet,
             news_observations=news_observations,
+            macro_context=stored.macro_context,
         )

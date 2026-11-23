@@ -180,6 +180,8 @@ class TradeSetup(BaseModel):
     net_rr_tp2: FiniteFloat | None = None
     net_rr_tp3: FiniteFloat | None = None
     cost_rate_round_trip: FiniteFloat | None = Field(default=None, ge=0)
+    stop_loss_distance_pct: FiniteFloat | None = Field(default=None, ge=0)
+    max_theoretical_leverage: int | None = Field(default=None, ge=1)
     wait_reason: str | None = None
     risk_notes: tuple[str, ...] = ()
 
@@ -299,7 +301,7 @@ class TechnicalMetrics(BaseModel):
     atr_percentile_100: FiniteFloat | None = Field(default=None, ge=0, le=100)
     bollinger_mid_20: FiniteFloat | None = Field(default=None, gt=0)
     bollinger_upper_20: FiniteFloat | None = Field(default=None, gt=0)
-    bollinger_lower_20: FiniteFloat | None = Field(default=None, gt=0)
+    bollinger_lower_20: FiniteFloat | None = None
     bollinger_percent_b: FiniteFloat | None = None
     bollinger_bandwidth: FiniteFloat | None = Field(default=None, ge=0)
     donchian_upper_20: FiniteFloat | None = Field(default=None, gt=0)
@@ -307,7 +309,7 @@ class TechnicalMetrics(BaseModel):
     donchian_mid_20: FiniteFloat | None = Field(default=None, gt=0)
     vwap_rolling_20: FiniteFloat | None = Field(default=None, gt=0)
     vwap_upper_20: FiniteFloat | None = Field(default=None, gt=0)
-    vwap_lower_20: FiniteFloat | None = Field(default=None, gt=0)
+    vwap_lower_20: FiniteFloat | None = None
     vwap_z_score: FiniteFloat | None = None
     mtf_rsi_alignment: MtfRsiAlignment | None = None
     prev_day_high: FiniteFloat | None = Field(default=None, gt=0)
@@ -403,6 +405,9 @@ class ModelPredictionSummary(BaseModel):
     non_guarantee_notice: str = Field(min_length=1)
 
 
+from crypto_chatbot.schemas.macro import MacroBenchmarkContext  # noqa: E402
+
+
 class AnalysisSnapshot(BaseModel):
     """Complete deterministic snapshot passed to templates and Gemini (PROJECT_PLAN §5.8)."""
 
@@ -429,6 +434,7 @@ class AnalysisSnapshot(BaseModel):
     order_flow: OrderFlowMetrics | None = None
     cross_venue_derivatives: CrossVenueDerivativesSummary | None = None
     prediction_markets: PredictionMarketSummary | None = None
+    macro_context: MacroBenchmarkContext | None = None
     ml_prediction: ModelPredictionSummary | None = None
     facts: tuple[Fact, ...] = ()
     regime: Regime | None = None
@@ -501,6 +507,17 @@ class AnalysisSnapshot(BaseModel):
                     raise ValueError(
                         "smc zone confirmation_time cannot exceed snapshot as_of (lookahead)"
                     )
+
+        if self.macro_context is not None:
+            if self.macro_context.as_of > self.as_of:
+                raise ValueError("macro_context as_of cannot exceed snapshot as_of (lookahead)")
+            if self.macro_context.dxy is not None and self.macro_context.dxy.as_of > self.as_of:
+                raise ValueError("dxy as_of cannot exceed snapshot as_of (lookahead)")
+            if (
+                self.macro_context.btc_benchmark is not None
+                and self.macro_context.btc_benchmark.as_of > self.as_of
+            ):
+                raise ValueError("btc_benchmark as_of cannot exceed snapshot as_of (lookahead)")
 
         if self.quality_status in (QualityStatus.READY, QualityStatus.DEGRADED):
             if self.input_range is None:

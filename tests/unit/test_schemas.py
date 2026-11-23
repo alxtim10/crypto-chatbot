@@ -369,18 +369,18 @@ def test_analysis_response_rejects_unknown_snapshot_fact_id() -> None:
 
 def test_command_argument_schemas() -> None:
     analyze = AnalyzeCommandArgs(symbol="btc", timeframe="4H")  # type: ignore[arg-type]
-    assert analyze.symbol == "BTC/USDT"
+    assert analyze.symbol == "BTC/USDT:USDT"
     assert analyze.timeframe is Timeframe.H4
     assert AnalyzeCommandArgs.model_validate_json(analyze.model_dump_json()) == analyze
 
     compare = CompareCommandArgs(symbols=("btc", "ETH/USDT"), timeframe="1d")  # type: ignore[arg-type]
-    assert compare.symbols == ("BTC/USDT", "ETH/USDT")
+    assert compare.symbols == ("BTC/USDT:USDT", "ETH/USDT:USDT")
     assert compare.timeframe is Timeframe.D1
     assert CompareCommandArgs.model_validate_json(compare.model_dump_json()) == compare
 
     wl_add = WatchlistCommandArgs(action="ADD", symbol="sol")  # type: ignore[arg-type]
     assert wl_add.action is WatchlistAction.ADD
-    assert wl_add.symbol == "SOL/USDT"
+    assert wl_add.symbol == "SOL/USDT:USDT"
     assert WatchlistCommandArgs.model_validate_json(wl_add.model_dump_json()) == wl_add
 
     wl_list = WatchlistCommandArgs()
@@ -388,17 +388,17 @@ def test_command_argument_schemas() -> None:
     assert wl_list.symbol is None
 
     alt_m15 = AnalyzeCommandArgs(symbol="doge", timeframe="15m")  # type: ignore[arg-type]
-    assert alt_m15.symbol == "DOGE/USDT"
+    assert alt_m15.symbol == "DOGE/USDT:USDT"
     assert alt_m15.timeframe is Timeframe.M15
 
 
 @pytest.mark.parametrize(
     ("cls", "kwargs"),
     [
-        (AnalyzeCommandArgs, {"symbol": "BTC perpetual", "timeframe": "4h"}),
+        (AnalyzeCommandArgs, {"symbol": "BTC spot", "timeframe": "4h"}),
         (AnalyzeCommandArgs, {"symbol": "BTC", "timeframe": "5m"}),
         (AnalyzeCommandArgs, {"symbol": "BTC/EUR", "timeframe": "4h"}),
-        (CompareCommandArgs, {"symbols": ("BTC", "BTC/USDT"), "timeframe": "1d"}),
+        (CompareCommandArgs, {"symbols": ("BTC", "BTC/USDT:USDT"), "timeframe": "1d"}),
         (CompareCommandArgs, {"symbols": ("BTC",), "timeframe": "1d"}),
         (WatchlistCommandArgs, {"action": "add"}),
         (WatchlistCommandArgs, {"action": "list", "symbol": "BTC"}),
@@ -410,3 +410,17 @@ def test_command_argument_schemas_reject_invalid_inputs(
 ) -> None:
     with pytest.raises(ValidationError):
         cls.model_validate(kwargs)
+
+
+def test_technical_metrics_permits_negative_lower_bands_for_hyper_volatile_assets() -> None:
+    metrics = TechnicalMetrics(
+        last_close=0.05,
+        bollinger_mid_20=0.06,
+        bollinger_upper_20=1.13,
+        bollinger_lower_20=-1.01,
+        vwap_rolling_20=0.06,
+        vwap_upper_20=1.10,
+        vwap_lower_20=-0.98,
+    )
+    assert metrics.bollinger_lower_20 == -1.01
+    assert metrics.vwap_lower_20 == -0.98

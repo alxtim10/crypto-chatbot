@@ -8,7 +8,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
-from crypto_chatbot.market_data.symbols import resolve_mvp_spot_symbol
+from crypto_chatbot.market_data.symbols import resolve_default_perp_symbol
 from crypto_chatbot.schemas.commands import (
     AnalyzeCommandArgs,
     CompareCommandArgs,
@@ -28,9 +28,18 @@ _BAD_TIMEFRAME_TEXT_RE = re.compile(
 _SUPPORTED_TIMEFRAME_TEXT_RE = re.compile(r"\b(15m|1h|4h|1d)\b", re.IGNORECASE)
 
 _SYMBOL_ALIASES: tuple[tuple[re.Pattern[str], str], ...] = (
-    (re.compile(r"\b(?:BTC/USDT|BTCUSDT|BTC|BITCOIN)\b", re.IGNORECASE), "BTC/USDT"),
-    (re.compile(r"\b(?:ETH/USDT|ETHUSDT|ETH|ETHEREUM)\b", re.IGNORECASE), "ETH/USDT"),
-    (re.compile(r"\b(?:SOL/USDT|SOLUSDT|SOL|SOLANA)\b", re.IGNORECASE), "SOL/USDT"),
+    (
+        re.compile(r"\b(?:BTC/USDT:USDT|BTC/USDT|BTCUSDT|BTC|BITCOIN)\b", re.IGNORECASE),
+        "BTC/USDT:USDT",
+    ),
+    (
+        re.compile(r"\b(?:ETH/USDT:USDT|ETH/USDT|ETHUSDT|ETH|ETHEREUM)\b", re.IGNORECASE),
+        "ETH/USDT:USDT",
+    ),
+    (
+        re.compile(r"\b(?:SOL/USDT:USDT|SOL/USDT|SOLUSDT|SOL|SOLANA)\b", re.IGNORECASE),
+        "SOL/USDT:USDT",
+    ),
 )
 
 _USDT_PAIR_TEXT_RE = re.compile(r"\b([A-Z0-9]{2,12})/USDT\b", re.IGNORECASE)
@@ -196,7 +205,7 @@ _NON_TICKER_ACRONYMS: frozenset[str] = frozenset(
     }
 )
 _NON_USDT_PAIR_RE = re.compile(r"\b([A-Z0-9]{2,12}/(?!USDT\b)[A-Z]{2,10})\b", re.IGNORECASE)
-_PERPETUAL_HINT_RE = re.compile(r"\b(?:perp|perpetual|futures)\b|\.P\b", re.IGNORECASE)
+_SPOT_HINT_RE = re.compile(r"\b(?:spot)\b", re.IGNORECASE)
 _COMPARE_WORD_RE = re.compile(
     r"\b(?:bandingkan|dibanding|compare|versus|vs|perbandingan)\b",
     re.IGNORECASE,
@@ -205,7 +214,7 @@ _CONTEXT_TOPIC_RE = re.compile(
     r"\b(?:momentum|tren|trend|rsi|ema|macd|atr|adx|dmi|volume|volatilitas|"
     r"support|resistance|level|struktur|analisis|analisa|kondisi|bagaimana|"
     r"gimana|kenapa|mengapa|jelaskan|lanjut|kesimpulan|risiko|"
-    r"entry|sl|tp|smc|fvg|order\s*block|setup|plan|likuiditas|liquidity|funding|oi)\b",
+    r"entry|sl|tp|smc|fvg|order\s*block|setup|plan|likuiditas|liquidity|funding|oi|dxy|benchmark)\b",
     re.IGNORECASE,
 )
 _ORDER_OR_ADVICE_RE = re.compile(
@@ -215,7 +224,9 @@ _ORDER_OR_ADVICE_RE = re.compile(
     r"\bwajib\s+jual\b|\ball[\s-]+in\b)",
     re.IGNORECASE,
 )
-_HEADER_RE = re.compile(r"^\[([^\]]+)\s+(15m|1h|4h|1d)\]", re.IGNORECASE)
+_HEADER_BRACKET_RE = re.compile(r"^\[([^\]]+)\s+(15m|1h|4h|1d)\]", re.IGNORECASE)
+_HEADER_HTML_RE = re.compile(r"^<b>([^ (]+(?:\s*,\s*[^ (]+)*)\s*\((15m|1h|4h|1d)\)", re.IGNORECASE)
+_HEADER_RE = _HEADER_BRACKET_RE
 
 
 class CommandParseError(ValueError):
@@ -251,7 +262,7 @@ FollowupIntent = AnalyzeIntent | CompareIntent | RefusalIntent
 def _clean_symbol_error(raw: str, detail: str) -> str:
     return (
         f"Simbol '{raw}' tidak valid atau belum didukung ({detail}). "
-        "Gunakan simbol spot Binance /USDT (contoh: BTC, ETH, SOL, DOGE, SUI)."
+        "Gunakan simbol perpetual Binance /USDT:USDT (contoh: BTC, ETH, SOL, DOGE, SUI)."
     )
 
 
@@ -390,7 +401,7 @@ def _extract_mvp_symbols(text: str) -> list[str]:
             if token in _NON_TICKER_ACRONYMS:
                 continue
             try:
-                found.append((match.start(), resolve_mvp_spot_symbol(token).canonical_symbol))
+                found.append((match.start(), resolve_default_perp_symbol(token).canonical_symbol))
             except ValueError:
                 continue
 
@@ -399,7 +410,7 @@ def _extract_mvp_symbols(text: str) -> list[str]:
         if token in _NON_TICKER_ACRONYMS:
             continue
         try:
-            found.append((match.start(), resolve_mvp_spot_symbol(token).canonical_symbol))
+            found.append((match.start(), resolve_default_perp_symbol(token).canonical_symbol))
         except ValueError:
             continue
 
@@ -420,14 +431,17 @@ def _extract_recent_context(
     tf_found = False
 
     for msg in reversed(recent_messages):
-        header_match = _HEADER_RE.match(msg.content.strip())
+        content_stripped = msg.content.strip()
+        header_match = _HEADER_BRACKET_RE.match(content_stripped) or _HEADER_HTML_RE.match(
+            content_stripped
+        )
         if header_match is not None:
             if not tf_found:
                 recent_tf = Timeframe(header_match.group(2).lower())
                 tf_found = True
             for raw_part in header_match.group(1).split(","):
                 try:
-                    canonical = resolve_mvp_spot_symbol(raw_part.strip()).canonical_symbol
+                    canonical = resolve_default_perp_symbol(raw_part.strip()).canonical_symbol
                 except ValueError:
                     continue
                 if canonical not in recent_symbols:
@@ -477,12 +491,11 @@ def resolve_followup_intent(
             )
         )
 
-    if _PERPETUAL_HINT_RE.search(cleaned):
+    if _SPOT_HINT_RE.search(cleaned):
         return RefusalIntent(
             message=(
-                "Analisis difokuskan pada pasar spot Binance /USDT (data funding & open interest "
-                "perpetual ditambahkan otomatis sebagai konteks) dan tidak mendukung eksekusi "
-                "kontrak perpetual/futures."
+                "Analisis difokuskan pada kontrak Perpetual Futures Binance (BASE/USDT:USDT) "
+                "dan tidak melayani pasar spot atau eksekusi order langsung."
             )
         )
 
@@ -490,8 +503,8 @@ def resolve_followup_intent(
     if non_usdt:
         return RefusalIntent(
             message=(
-                f"Pasangan '{non_usdt[0]}' belum didukung. Saat ini analisis hanya mendukung "
-                "pasangan spot Binance /USDT (contoh: BTC/USDT, DOGE/USDT, SUI/USDT)."
+                f"Pasangan '{non_usdt[0]}' belum didukung. Saat ini analisis difokuskan pada "
+                "kontrak perpetual Binance /USDT:USDT (contoh: BTC, DOGE, SUI)."
             )
         )
 

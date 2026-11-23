@@ -6,7 +6,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from crypto_chatbot.market_data.symbols import resolve_mvp_spot_symbol
+from crypto_chatbot.market_data.symbols import resolve_default_perp_symbol
 from crypto_chatbot.schemas.market import Timeframe
 
 
@@ -28,7 +28,7 @@ class AnalyzeCommandArgs(BaseModel):
     def _validate_symbol(cls, value: object) -> str:
         if not isinstance(value, str):
             raise ValueError("symbol must be a string")
-        return resolve_mvp_spot_symbol(value).canonical_symbol
+        return resolve_default_perp_symbol(value).canonical_symbol
 
     @field_validator("timeframe", mode="before")
     @classmethod
@@ -50,7 +50,7 @@ class CompareCommandArgs(BaseModel):
             for item in value:
                 if not isinstance(item, str):
                     raise ValueError("each symbol must be a string")
-                resolved.append(resolve_mvp_spot_symbol(item).canonical_symbol)
+                resolved.append(resolve_default_perp_symbol(item).canonical_symbol)
             if len(resolved) != len(set(resolved)):
                 raise ValueError("symbols to compare must be distinct")
             return tuple(resolved)
@@ -88,7 +88,7 @@ class WatchlistCommandArgs(BaseModel):
             return None
         if not isinstance(value, str):
             raise ValueError("symbol must be a string")
-        return resolve_mvp_spot_symbol(value).canonical_symbol
+        return resolve_default_perp_symbol(value).canonical_symbol
 
     @model_validator(mode="after")
     def _validate_action_symbol(self) -> WatchlistCommandArgs:

@@ -147,5 +147,22 @@ def resolve_symbol(raw: str, *, market_type: MarketType = MarketType.SPOT) -> Sy
 
 
 def resolve_mvp_spot_symbol(raw: str) -> SymbolMapping:
-    """Resolve a symbol strictly for the MVP spot universe."""
+    """Resolve a symbol strictly for the legacy MVP spot universe."""
     return resolve_symbol(raw, market_type=MarketType.SPOT)
+
+
+def resolve_default_perp_symbol(raw: str) -> SymbolMapping:
+    """Resolve user input directly to perpetual futures contract (e.g. BTC -> BTC/USDT:USDT)."""
+    cleaned = raw.strip().upper()
+    if "/" in cleaned and ":" not in cleaned:
+        base, _, quote = cleaned.partition("/")
+        cleaned = f"{base}/{quote}:{quote}"
+    elif (
+        cleaned.endswith("USDT")
+        and "/" not in cleaned
+        and ":" not in cleaned
+        and not cleaned.endswith(".P")
+    ):
+        base = cleaned[:-4]
+        cleaned = f"{base}/USDT:USDT"
+    return resolve_symbol(cleaned, market_type=MarketType.PERPETUAL)

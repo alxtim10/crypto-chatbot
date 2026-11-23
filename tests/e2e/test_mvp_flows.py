@@ -90,7 +90,8 @@ class _E2ECcxtClient:
             raise self._error
 
         step_ms = _TF_DURATION_MS[timeframe]
-        scale = 1.0 if symbol == "BTC/USDT" else 0.05 if symbol == "ETH/USDT" else 0.0025
+        clean_sym = symbol.split(":")[0]
+        scale = 1.0 if clean_sym == "BTC/USDT" else 0.05 if clean_sym == "ETH/USDT" else 0.0025
         closed_count = min(self._candle_count, max(1, (limit or 1000) - 1))
         rows_slice = self._raw[-closed_count:]
         end_ms = int(self._anchor_close.timestamp() * 1000)
@@ -361,9 +362,9 @@ async def test_e2e_complete_mvp_user_journey() -> None:
     assert "Disclaimer:" in start_out
 
     analyze_out = "\n".join(await harness.send("/analyze BTC 4h"))
-    assert "BTC/USDT (4h)" in analyze_out
+    assert "BTC/USDT:USDT (4h)" in analyze_out
     assert "Status kualitas: READY" in analyze_out
-    assert "ccxt:BINANCE:BTCUSDT" in analyze_out
+    assert "ccxt:BINANCE:BTCUSDT.P" in analyze_out
     assert "UTC (" in analyze_out
     assert "WIB)" in analyze_out
     assert "[F1]" in analyze_out
@@ -372,14 +373,14 @@ async def test_e2e_complete_mvp_user_journey() -> None:
     assert "65.577,38 USDT" in analyze_out
 
     followup_out = "\n".join(await harness.send("bandingkan momentumnya dengan ETH"))
-    assert "Perbandingan Deskriptif (BTC/USDT, ETH/USDT - 4h)" in followup_out
-    assert "ccxt:BINANCE:BTCUSDT" in followup_out
-    assert "ccxt:BINANCE:ETHUSDT" in followup_out
+    assert "Perbandingan Deskriptif (BTC/USDT:USDT, ETH/USDT:USDT - 4h)" in followup_out
+    assert "ccxt:BINANCE:BTCUSDT.P" in followup_out
+    assert "ccxt:BINANCE:ETHUSDT.P" in followup_out
 
     compare_out = "\n".join(await harness.send("/compare BTC ETH 1d"))
-    assert "Perbandingan Deskriptif (BTC/USDT, ETH/USDT - 1d)" in compare_out
-    assert "BTC/USDT (1d)" in compare_out
-    assert "ETH/USDT (1d)" in compare_out
+    assert "Perbandingan Deskriptif (BTC/USDT:USDT, ETH/USDT:USDT - 1d)" in compare_out
+    assert "BTC/USDT:USDT (1d)" in compare_out
+    assert "ETH/USDT:USDT (1d)" in compare_out
 
     memory_out = "\n".join(await harness.send("/memory"))
     assert "Pesan tersimpan (maks 20): 6 pesan" in memory_out
@@ -484,7 +485,7 @@ async def test_e2e_failure_malformed_symbol_and_hostile_html() -> None:
 
     for cmd in (
         "/analyze BTC/EUR 4h",
-        "/analyze BTC-PERP 4h",
+        "/analyze BTC-SPOT 4h",
         "/analyze <script>alert()</script> 4h",
         "/<evil_cmd>",
     ):

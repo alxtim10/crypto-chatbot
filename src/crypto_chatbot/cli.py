@@ -26,11 +26,13 @@ from crypto_chatbot.market_data.derivatives_quality import (
     normalize_liquidation_events,
     normalize_open_interest_payload,
 )
+from crypto_chatbot.market_data.macro_provider import DxyMarketDataProvider
 from crypto_chatbot.market_data.orderbook import normalize_order_book_payload
 from crypto_chatbot.market_data.quality import normalize_ohlcv_rows
 from crypto_chatbot.market_data.symbols import (
     SymbolError,
     SymbolMapping,
+    resolve_default_perp_symbol,
     resolve_mvp_spot_symbol,
     resolve_symbol,
 )
@@ -313,9 +315,12 @@ async def _analyze_live(
     tradingview_repository: TradingViewRepository | None = None,
     news_repository: NewsRepository | None = None,
 ) -> AnalysisSnapshot:
-    async with CcxtMarketDataProvider() as provider:
+    futures_exchange = os.environ.get("FUTURES_EXCHANGE", "binance").strip().lower() or "binance"
+    async with CcxtMarketDataProvider(exchange_id=futures_exchange) as provider:
         if include_derivatives:
-            async with CcxtDerivativesLiquidityProvider() as deriv_provider:
+            async with CcxtDerivativesLiquidityProvider(
+                exchange_id=futures_exchange
+            ) as deriv_provider:
                 service = AnalysisService(
                     provider=provider,
                     repository=repository,
@@ -324,6 +329,7 @@ async def _analyze_live(
                     setup_repository=setup_repository,
                     tradingview_repository=tradingview_repository,
                     news_repository=news_repository,
+                    dxy_provider=DxyMarketDataProvider(),
                 )
                 return await service.analyze(
                     symbol,
@@ -364,7 +370,11 @@ def _run_analyze(
 ) -> int:
     engine: Any = None
     try:
-        mapping = resolve_mvp_spot_symbol(symbol_raw)
+        mapping = (
+            resolve_mvp_spot_symbol(symbol_raw)
+            if fixture_path is not None
+            else resolve_default_perp_symbol(symbol_raw)
+        )
         try:
             timeframe = Timeframe(timeframe_raw.strip().lower())
         except ValueError:
@@ -616,7 +626,11 @@ def _run_ml_experiment(
 ) -> int:
     engine: Any = None
     try:
-        mapping = resolve_mvp_spot_symbol(symbol_raw)
+        mapping = (
+            resolve_mvp_spot_symbol(symbol_raw)
+            if fixture_path is not None
+            else resolve_default_perp_symbol(symbol_raw)
+        )
         try:
             timeframe = Timeframe(timeframe_raw.strip().lower())
         except ValueError:
@@ -729,9 +743,9 @@ def _run_setup_stats(
     canonical: str | None = None
     if symbol:
         try:
-            canonical = resolve_mvp_spot_symbol(symbol).canonical_symbol
+            canonical = resolve_default_perp_symbol(symbol).canonical_symbol
         except Exception:
-            canonical = symbol if "/" in symbol else f"{symbol}/USDT"
+            canonical = symbol if ":" in symbol else f"{symbol}/USDT:USDT"
 
     try:
         init_db(engine)
@@ -832,9 +846,9 @@ def _run_shadow_report(
     canonical: str | None = None
     if symbol:
         try:
-            canonical = resolve_mvp_spot_symbol(symbol).canonical_symbol
+            canonical = resolve_default_perp_symbol(symbol).canonical_symbol
         except Exception:
-            canonical = symbol if "/" in symbol else f"{symbol}/USDT"
+            canonical = symbol if ":" in symbol else f"{symbol}/USDT:USDT"
 
     try:
         init_db(engine)

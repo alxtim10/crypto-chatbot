@@ -25,7 +25,10 @@ from crypto_chatbot.llm.tools import (
 )
 from crypto_chatbot.market_data.base import DEFAULT_CANDLE_LIMIT, OhlcvBatch
 from crypto_chatbot.market_data.quality import normalize_ohlcv_rows
-from crypto_chatbot.market_data.symbols import resolve_mvp_spot_symbol
+from crypto_chatbot.market_data.symbols import (
+    resolve_default_perp_symbol,
+    resolve_mvp_spot_symbol,
+)
 from crypto_chatbot.schemas.analysis import AnalysisSnapshot
 from crypto_chatbot.schemas.llm import NarrationStatus
 from crypto_chatbot.schemas.market import Timeframe
@@ -350,7 +353,7 @@ def _make_batch(symbol: str, timeframe: Timeframe) -> OhlcvBatch:
     received = last_open + timeframe.duration + timedelta(seconds=1)
     return normalize_ohlcv_rows(
         raw,
-        symbol=resolve_mvp_spot_symbol(symbol),
+        symbol=resolve_default_perp_symbol(symbol),
         timeframe=timeframe,
         received_time=received,
         now=received,
@@ -367,12 +370,12 @@ async def test_tool_registry_allowlist_and_argument_validation() -> None:
     eth_1d = _make_batch("ETH", Timeframe.D1)
     provider = _FakeProvider(
         {
-            ("BTC/USDT", Timeframe.H4): btc_4h,
-            ("BTC/USDT", Timeframe.H1): btc_1h,
-            ("BTC/USDT", Timeframe.D1): btc_1d,
-            ("ETH/USDT", Timeframe.H4): eth_4h,
-            ("ETH/USDT", Timeframe.H1): eth_1h,
-            ("ETH/USDT", Timeframe.D1): eth_1d,
+            ("BTC/USDT:USDT", Timeframe.H4): btc_4h,
+            ("BTC/USDT:USDT", Timeframe.H1): btc_1h,
+            ("BTC/USDT:USDT", Timeframe.D1): btc_1d,
+            ("ETH/USDT:USDT", Timeframe.H4): eth_4h,
+            ("ETH/USDT:USDT", Timeframe.H1): eth_1h,
+            ("ETH/USDT:USDT", Timeframe.D1): eth_1d,
         }
     )
     registry = ToolRegistry(AnalysisService(provider=provider))
@@ -384,19 +387,19 @@ async def test_tool_registry_allowlist_and_argument_validation() -> None:
 
     single = await registry.execute("analyze_coin", {"symbol": "btc", "timeframe": "4h"})
     assert len(single.snapshots) == 1
-    assert single.snapshots[0].canonical_symbol == "BTC/USDT"
+    assert single.snapshots[0].canonical_symbol == "BTC/USDT:USDT"
 
     compared = await registry.execute(
         "compare_coins",
         {"symbols": ["BTC", "ETH"], "timeframe": "4h"},
     )
-    assert [s.canonical_symbol for s in compared.snapshots] == ["BTC/USDT", "ETH/USDT"]
+    assert [s.canonical_symbol for s in compared.snapshots] == ["BTC/USDT:USDT", "ETH/USDT:USDT"]
 
     for bad_tool, args in (
         ("fetch_url", {"url": "https://evil.test"}),
         ("run_sql", {"query": "SELECT * FROM users"}),
         ("exec_python", {"code": "print(1)"}),
-        ("analyze_coin", {"symbol": "BTC perpetual", "timeframe": "4h"}),
+        ("analyze_coin", {"symbol": "BTC spot", "timeframe": "4h"}),
         ("analyze_coin", {"symbol": "BTC/EUR", "timeframe": "4h"}),
         ("analyze_coin", {"symbol": "BTC", "timeframe": "5m"}),
         ("analyze_coin", {"symbol": "BTC", "timeframe": "4h", "extra": "bad"}),

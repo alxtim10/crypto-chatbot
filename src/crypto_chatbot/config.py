@@ -53,6 +53,17 @@ class Settings(BaseSettings):
         TRADINGVIEW_PUBLISHED_WEBHOOK_IPS
     )
     ml_inference_mode: MlInferenceMode = MlInferenceMode.OFF
+    futures_exchange: str = Field(default="binance")
+
+    @field_validator("futures_exchange", mode="before")
+    @classmethod
+    def _validate_futures_exchange(cls, value: object) -> str:
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return "binance"
+        cleaned = str(value).strip().lower()
+        if cleaned not in {"binance", "gate", "bingx"}:
+            raise ValueError("must be one of: binance, gate, bingx")
+        return cleaned
 
     @field_validator("tradingview_webhook_secret", mode="before")
     @classmethod

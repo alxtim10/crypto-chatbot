@@ -14,7 +14,7 @@ from crypto_chatbot.market_data.ccxt_provider import (
     CcxtMarketDataProvider,
 )
 from crypto_chatbot.market_data.symbols import SymbolError
-from crypto_chatbot.schemas.market import QualityFlag, Timeframe
+from crypto_chatbot.schemas.market import MarketType, QualityFlag, Timeframe
 
 FIXTURE_PATH = Path(__file__).resolve().parents[1] / "fixtures" / "binance_btc_4h_sample.json"
 
@@ -66,9 +66,9 @@ async def test_ccxt_provider_normalizes_recorded_fixture() -> None:
 
     batch = await provider.get_closed_ohlcv("BTC", Timeframe.H4, limit=10)
 
-    assert fake_client.calls == [("BTC/USDT", "4h", None, 11)]
-    assert batch.canonical_symbol == "BTC/USDT"
-    assert batch.provider_symbol == "BINANCE:BTCUSDT"
+    assert fake_client.calls == [("BTC/USDT:USDT", "4h", None, 11)]
+    assert batch.canonical_symbol == "BTC/USDT:USDT"
+    assert batch.provider_symbol == "BINANCE:BTCUSDT.P"
     assert batch.metadata.base_unit == "BTC"
     assert batch.metadata.quote_currency == "USDT"
     assert len(batch.candles) == 10
@@ -99,7 +99,7 @@ async def test_ccxt_provider_retries_transient_errors_then_succeeds() -> None:
         clock=lambda: received_time,
     )
 
-    batch = await provider.get_closed_ohlcv("BTC/USDT", Timeframe.H4, limit=10)
+    batch = await provider.get_closed_ohlcv("BTC", Timeframe.H4, limit=10)
 
     assert len(fake_client.calls) == 3
     assert len(batch.candles) == 10
@@ -176,7 +176,7 @@ async def test_ccxt_provider_rejects_invalid_symbol_or_limit_before_network() ->
     provider = CcxtMarketDataProvider(client=fake_client)
 
     with pytest.raises(SymbolError):
-        await provider.get_closed_ohlcv("BTC perpetual", Timeframe.H4, limit=10)
+        await provider.get_closed_ohlcv("BTC spot", Timeframe.H4, limit=10)
 
     with pytest.raises(ValueError, match="limit"):
         await provider.get_closed_ohlcv("BTC", Timeframe.H4, limit=1001)
@@ -203,11 +203,47 @@ def test_ccxt_provider_rejects_invalid_public_api_url(bad_url: str) -> None:
 async def test_ccxt_provider_default_client_uses_public_spot_endpoint_without_secrets() -> None:
     async with CcxtMarketDataProvider() as provider:
         client: Any = provider._client
-        assert client.urls["api"]["public"] == DEFAULT_BINANCE_PUBLIC_API_URL
-        assert client.options["defaultType"] == "spot"
-        assert client.options["fetchMarkets"]["types"] == ["spot"]
+        assert client.options["defaultType"] == "swap"
+        assert client.options["fetchMarkets"]["types"] == ["linear"]
         assert not getattr(client, "apiKey", "")
         assert not getattr(client, "secret", "")
+
+    async with CcxtMarketDataProvider(market_type=MarketType.SPOT) as spot_provider:
+        spot_client: Any = spot_provider._client
+        assert spot_client.urls["api"]["public"] == DEFAULT_BINANCE_PUBLIC_API_URL
+        assert spot_client.options["defaultType"] == "spot"
+        assert spot_client.options["fetchMarkets"]["types"] == ["spot"]
+
+
+@pytest.mark.asyncio
+async def test_ccxt_provider_falls_back_to_1000_perp_contract_on_bad_symbol() -> None:
+    fixture = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+    received_time = datetime.fromisoformat(fixture["received_time"])
+    fake_client = FakeCcxtClient(
+        [
+            ccxt.BadSymbol("binanceusdm does not have market symbol PEPE/USDT:USDT"),
+            fixture["raw_ohlcv"],
+        ]
+    )
+
+    provider = CcxtMarketDataProvider(
+        client=fake_client,
+        retry_initial_seconds=0.0,
+        retry_max_seconds=0.0,
+        clock=lambda: received_time,
+    )
+
+    batch = await provider.get_closed_ohlcv("PEPE", Timeframe.H4, limit=10)
+
+    assert [call[0] for call in fake_client.calls] == [
+        "PEPE/USDT:USDT",
+        "1000PEPE/USDT:USDT",
+    ]
+    assert not batch.has_provider_error
+    assert batch.canonical_symbol == "1000PEPE/USDT:USDT"
+    assert batch.provider_symbol == "BINANCE:1000PEPEUSDT.P"
+    assert batch.metadata.base_unit == "1000PEPE"
+    assert len(batch.candles) == 10
 
 
 @pytest.mark.live

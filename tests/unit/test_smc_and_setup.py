@@ -587,3 +587,176 @@ def test_altcoin_subcent_formatting_and_15m_guard_allowlist() -> None:
         fact_ids=("F1",),
     )
     assert validate_narration(narration, snap).is_valid is True
+
+
+def test_trade_setup_exhaustion_filters_and_counter_sweep_guard() -> None:
+    t_pivot = ANCHOR
+    p_high = StructureEvent(
+        event_type=StructureEventType.SWING_HIGH,
+        event_time=t_pivot,
+        confirmation_time=t_pivot,
+        level=66_500.0,
+    )
+    p_low = StructureEvent(
+        event_type=StructureEventType.SWING_LOW,
+        event_time=t_pivot,
+        confirmation_time=t_pivot,
+        level=64_100.0,
+    )
+    bull_structure = StructureAnalysis(
+        pivots=(),
+        market_structure=MarketStructure.BULLISH,
+        last_swing_highs=(p_high,),
+        last_swing_lows=(p_low,),
+    )
+    bull_metrics_overbought = TechnicalMetrics(
+        last_close=65_000.0,
+        ema_20=64_600.0,
+        ema_50=63_800.0,
+        atr_14=500.0,
+        adx_14=32.0,
+        rsi_14=78.5,
+    )
+    bull_smc_premium = SmcSummary(
+        dealing_range_high=67_000.0,
+        dealing_range_low=62_000.0,
+        equilibrium=64_500.0,
+        dealing_zone=DealingZone.PREMIUM,
+    )
+
+    # 1. LONG with RSI 78.5 in Premium zone -> forced WAIT
+    ob_wait = build_trade_setup(
+        metrics=bull_metrics_overbought,
+        regime=Regime.TRENDING_UP,
+        structure=bull_structure,
+        smc=bull_smc_premium,
+    )
+    assert ob_wait.status is SetupStatus.WAIT
+    assert ob_wait.wait_reason is not None
+    assert "jenuh beli ekstrem" in ob_wait.wait_reason
+
+    # 2. SHORT with RSI 22.0 in Discount zone -> forced WAIT
+    bear_structure = StructureAnalysis(
+        pivots=(),
+        market_structure=MarketStructure.BEARISH,
+        last_swing_highs=(p_high,),
+        last_swing_lows=(p_low,),
+    )
+    bear_metrics_oversold = TechnicalMetrics(
+        last_close=60_000.0,
+        ema_20=60_500.0,
+        ema_50=61_500.0,
+        atr_14=500.0,
+        adx_14=30.0,
+        rsi_14=21.5,
+    )
+    bear_smc_discount = SmcSummary(
+        dealing_range_high=63_000.0,
+        dealing_range_low=57_000.0,
+        equilibrium=60_000.0,
+        dealing_zone=DealingZone.DISCOUNT,
+    )
+    os_wait = build_trade_setup(
+        metrics=bear_metrics_oversold,
+        regime=Regime.TRENDING_DOWN,
+        structure=bear_structure,
+        smc=bear_smc_discount,
+    )
+    assert os_wait.status is SetupStatus.WAIT
+    assert os_wait.wait_reason is not None
+    assert "jenuh jual ekstrem" in os_wait.wait_reason
+
+    # 3. Counter-sweep (bearish sweep) with adverse order book imbalance <= -0.30 -> forced WAIT
+    bull_metrics_normal = TechnicalMetrics(
+        last_close=65_000.0,
+        ema_20=64_600.0,
+        ema_50=63_800.0,
+        atr_14=500.0,
+        adx_14=32.0,
+        rsi_14=60.0,
+    )
+    bull_smc_sweep_bear = SmcSummary(
+        dealing_range_high=67_000.0,
+        dealing_range_low=62_000.0,
+        equilibrium=64_500.0,
+        dealing_zone=DealingZone.EQUILIBRIUM,
+        latest_sweep=StructureEvent(
+            event_type=StructureEventType.LIQUIDITY_SWEEP_BEARISH,
+            event_time=t_pivot,
+            confirmation_time=t_pivot,
+            level=66_800.0,
+        ),
+    )
+    adverse_deriv = DerivativesMetrics(imbalance_10bps=-0.44)
+    sweep_wait = build_trade_setup(
+        metrics=bull_metrics_normal,
+        regime=Regime.TRENDING_UP,
+        structure=bull_structure,
+        smc=bull_smc_sweep_bear,
+        derivatives=adverse_deriv,
+    )
+    assert sweep_wait.status is SetupStatus.WAIT
+    assert sweep_wait.wait_reason is not None
+    assert "Liquidity Sweep bearish" in sweep_wait.wait_reason
+
+
+def test_trade_setup_sl_guarded_strictly_below_ltf_support() -> None:
+    t_pivot = ANCHOR
+    p_high = StructureEvent(
+        event_type=StructureEventType.SWING_HIGH,
+        event_time=t_pivot,
+        confirmation_time=t_pivot,
+        level=30.0,
+    )
+    p_low = StructureEvent(
+        event_type=StructureEventType.SWING_LOW,
+        event_time=t_pivot,
+        confirmation_time=t_pivot,
+        level=25.0,
+    )
+    structure_4h = StructureAnalysis(
+        pivots=(),
+        market_structure=MarketStructure.BULLISH,
+        last_swing_highs=(p_high,),
+        last_swing_lows=(p_low,),
+    )
+    metrics_4h = TechnicalMetrics(
+        last_close=26.86,
+        ema_20=26.0,
+        ema_50=25.0,
+        atr_14=0.8,
+        adx_14=30.0,
+        rsi_14=60.0,
+    )
+    smc_4h = SmcSummary(
+        dealing_range_high=30.0,
+        dealing_range_low=24.0,
+        equilibrium=27.0,
+        dealing_zone=DealingZone.EQUILIBRIUM,
+    )
+
+    # 15m candles with support at 25.89 and FVG around 26.34..26.45
+    candles_15m = [
+        _candle(
+            i,
+            open_p=26.0,
+            high_p=26.5,
+            low_p=25.89,
+            close_p=26.3,
+            timeframe=Timeframe.M15,
+        )
+        for i in range(25)
+    ]
+    setup = build_trade_setup(
+        metrics=metrics_4h,
+        regime=Regime.TRENDING_UP,
+        structure=structure_4h,
+        smc=smc_4h,
+        primary_timeframe=Timeframe.H4,
+        ltf_candles=candles_15m,
+    )
+    if setup.status is SetupStatus.READY:
+        assert setup.stop_loss is not None
+        if setup.ltf_support is not None:
+            # Must strictly be below LTF support
+            assert setup.stop_loss < setup.ltf_support

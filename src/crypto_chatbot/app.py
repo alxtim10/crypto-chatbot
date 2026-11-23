@@ -27,6 +27,7 @@ from crypto_chatbot.llm.gemini import (
 from crypto_chatbot.market_data.bybit_derivatives import BybitDerivativesProvider
 from crypto_chatbot.market_data.ccxt_provider import CcxtMarketDataProvider
 from crypto_chatbot.market_data.derivatives_provider import CcxtDerivativesLiquidityProvider
+from crypto_chatbot.market_data.macro_provider import DxyMarketDataProvider
 from crypto_chatbot.memory.service import MemoryService
 from crypto_chatbot.storage.database import create_db_engine, init_db
 from crypto_chatbot.storage.repositories import (
@@ -72,9 +73,10 @@ def build_telegram_application(
     tradingview_repo = PostgresTradingViewRepository(engine)
     news_repo = PostgresNewsRepository(engine)
     memory_repo = PostgresUserMemoryRepository(engine)
-    provider = CcxtMarketDataProvider()
-    derivatives_provider = CcxtDerivativesLiquidityProvider()
-    bybit_provider = BybitDerivativesProvider()
+    provider = CcxtMarketDataProvider(exchange_id=settings.futures_exchange)
+    derivatives_provider = CcxtDerivativesLiquidityProvider(exchange_id=settings.futures_exchange)
+    bybit_provider = BybitDerivativesProvider() if settings.futures_exchange == "binance" else None
+    dxy_provider = DxyMarketDataProvider()
     analysis_service = AnalysisService(
         provider=provider,
         repository=market_repo,
@@ -84,6 +86,7 @@ def build_telegram_application(
         setup_repository=setup_repo,
         tradingview_repository=tradingview_repo,
         news_repository=news_repo,
+        dxy_provider=dxy_provider,
     )
 
     transport = GoogleGenAiTransport(
@@ -117,7 +120,8 @@ def build_telegram_application(
         del app
         await provider.close()
         await derivatives_provider.close()
-        await bybit_provider.close()
+        if bybit_provider is not None:
+            await bybit_provider.close()
         engine.dispose()
 
     application = (

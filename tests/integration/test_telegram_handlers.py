@@ -24,7 +24,9 @@ from crypto_chatbot.bot.templates import TELEGRAM_MAX_MESSAGE_LENGTH
 from crypto_chatbot.llm.gemini import GeminiNarrator, RawGeminiOutput
 from crypto_chatbot.market_data.base import DEFAULT_CANDLE_LIMIT, OhlcvBatch
 from crypto_chatbot.market_data.quality import normalize_ohlcv_rows
-from crypto_chatbot.market_data.symbols import resolve_mvp_spot_symbol
+from crypto_chatbot.market_data.symbols import (
+    resolve_default_perp_symbol,
+)
 from crypto_chatbot.memory.service import MemoryService
 from crypto_chatbot.schemas.market import Timeframe
 from crypto_chatbot.storage.repositories import (
@@ -132,7 +134,7 @@ class _FixtureProvider:
         timeframe: Timeframe,
         limit: int = DEFAULT_CANDLE_LIMIT,
     ) -> OhlcvBatch:
-        mapping = resolve_mvp_spot_symbol(symbol)
+        mapping = resolve_default_perp_symbol(symbol)
         # Re-stamp timestamps onto clean grid for the requested timeframe so MTF is valid.
         now_anchor = datetime(2026, 11, 21, 12, 0, tzinfo=UTC)
         rows = self._raw[-limit:]
@@ -265,7 +267,7 @@ async def test_user_isolation_and_forget_scope() -> None:
 
     # User 222 remains completely untouched
     assert len(repo.get_recent_messages(222)) == 2
-    assert repo.get_preferences(222).watchlist == ("ETH/USDT",)
+    assert repo.get_preferences(222).watchlist == ("ETH/USDT:USDT",)
     assert len([i for i in repo.interactions if i.telegram_user_id == 222]) == 1
 
 
@@ -350,16 +352,16 @@ async def test_ptb_command_and_followup_handlers_end_to_end() -> None:
     assert "Selamat datang" in start_out
 
     analyze_out = "\n".join(await invoke(2, "/analyze BTC 4h", ["BTC", "4h"]))
-    assert "BTC/USDT (4h)" in analyze_out
+    assert "BTC/USDT:USDT (4h)" in analyze_out
     assert "65.577,38 USDT" in analyze_out
 
     followup_out = "\n".join(await invoke(8, "bandingkan momentumnya dengan ETH"))
-    assert "Perbandingan Deskriptif (BTC/USDT, ETH/USDT - 4h)" in followup_out
-    assert "BTC/USDT (4h)" in followup_out
-    assert "ETH/USDT (4h)" in followup_out
+    assert "Perbandingan Deskriptif (BTC/USDT:USDT, ETH/USDT:USDT - 4h)" in followup_out
+    assert "BTC/USDT:USDT (4h)" in followup_out
+    assert "ETH/USDT:USDT (4h)" in followup_out
 
     alt_m15_out = "\n".join(await invoke(2, "/analyze DOGE 15m", ["DOGE", "15m"]))
-    assert "DOGE/USDT (15m)" in alt_m15_out
+    assert "DOGE/USDT:USDT (15m)" in alt_m15_out
 
     bad_cmd_out = "\n".join(await invoke(2, "/analyze BTC 5m", ["BTC", "5m"]))
     assert "tidak didukung" in bad_cmd_out.lower()

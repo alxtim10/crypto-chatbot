@@ -36,6 +36,10 @@ from crypto_chatbot.market_data.derivatives_quality import (
     normalize_open_interest_payload,
     normalize_open_interest_unit,
 )
+from crypto_chatbot.market_data.macro_provider import (
+    DxyMarketDataProvider,
+    is_dxy_market_closed,
+)
 from crypto_chatbot.market_data.orderbook import (
     DEFAULT_DEPTH_BANDS_BPS,
     OrderBookSynchronizer,
@@ -51,6 +55,7 @@ from crypto_chatbot.market_data.symbols import (
     SUPPORTED_MVP_BASES,
     SymbolError,
     SymbolMapping,
+    resolve_default_perp_symbol,
     resolve_mvp_spot_symbol,
     resolve_symbol,
 )
@@ -94,6 +99,7 @@ __all__ = [
     "CcxtOhlcvClient",
     "CcxtSpotOrderBookClient",
     "DerivativesLiquidityProvider",
+    "DxyMarketDataProvider",
     "MarketDataProvider",
     "OhlcvBatch",
     "OrderBookSynchronizer",
@@ -111,6 +117,7 @@ __all__ = [
     "compute_tradingview_idempotency_key",
     "determine_quality_status",
     "is_candle_stale",
+    "is_dxy_market_closed",
     "normalize_funding_rate_payload",
     "normalize_funding_rate_value",
     "normalize_liquidation_events",
@@ -119,6 +126,7 @@ __all__ = [
     "normalize_open_interest_unit",
     "normalize_order_book_payload",
     "parse_ai_agent_lens_packet",
+    "resolve_default_perp_symbol",
     "resolve_mvp_spot_symbol",
     "resolve_symbol",
     "sanitize_tradingview_payload",

@@ -229,7 +229,7 @@ def render_deterministic_snapshot(
     lines: list[str] = []
     header = (
         f"Analisis {snapshot.canonical_symbol} ({snapshot.timeframe.value}) - "
-        f"{snapshot.venue.upper()} {snapshot.market_type.value}"
+        f"{snapshot.venue.upper()} {snapshot.market_type.value.upper()}"
     )
     lines.append(_bold(header, html_mode))
     lines.append(
@@ -398,6 +398,50 @@ def render_deterministic_snapshot(
             lines.append(f"- Dispersi funding: {_esc(f_disp, html_mode)}")
             lines.append(f"- Spread mark price: {_esc(p_spr, html_mode)}")
 
+        if snapshot.macro_context is not None:
+            mc = snapshot.macro_context
+            lines.append("")
+            lines.append(_bold("Konteks Makro & Derivatif (DXY & BTC Benchmark)", html_mode))
+            lines.append(f"- Rezim posisi: {_esc(mc.positioning_regime.value.upper(), html_mode)}")
+            if mc.dxy is not None:
+                dxy = mc.dxy
+                dxy_closed_tag = " [FX Weekend/Tutup]" if dxy.is_weekend_or_closed else ""
+                corr_str = (
+                    format_indonesian_number(dxy.rolling_corr_20, 2, signed=True)
+                    if dxy.rolling_corr_20 is not None
+                    else "tidak tersedia"
+                )
+                lines.append(
+                    f"- US Dollar Index (DXY): {format_indonesian_number(dxy.last_close, 2)} "
+                    f"| tren: {_esc(dxy.trend.upper(), html_mode)} "
+                    f"| korelasi (20b): {_esc(corr_str, html_mode)} "
+                    f"| dampak: {_esc(dxy.macro_impact.upper(), html_mode)}"
+                    f"{_esc(dxy_closed_tag, html_mode)}"
+                )
+            if mc.btc_benchmark is not None and mc.btc_benchmark.leader_alignment != "self":
+                btc = mc.btc_benchmark
+                rs_str = (
+                    f"{format_indonesian_number(btc.relative_strength_20_pct, 2, signed=True)}%"
+                    if btc.relative_strength_20_pct is not None
+                    else "tidak tersedia"
+                )
+                beta_str = (
+                    format_indonesian_number(btc.rolling_beta_20, 2)
+                    if btc.rolling_beta_20 is not None
+                    else "tidak tersedia"
+                )
+                corr_btc_str = (
+                    format_indonesian_number(btc.rolling_corr_20, 2, signed=True)
+                    if btc.rolling_corr_20 is not None
+                    else "tidak tersedia"
+                )
+                lines.append(
+                    f"- Benchmark BTC: RS (20b): {_esc(rs_str, html_mode)} "
+                    f"| beta: {_esc(beta_str, html_mode)} "
+                    f"| korelasi: {_esc(corr_btc_str, html_mode)} "
+                    f"| keselarasan: {_esc(btc.leader_alignment.upper(), html_mode)}"
+                )
+
         if snapshot.tradingview is not None:
             tv = snapshot.tradingview
             lines.append("")
@@ -481,6 +525,14 @@ def render_deterministic_snapshot(
                     lines.append(f"- Alasan WAIT: {_esc(setup.wait_reason, html_mode)}")
                 if setup.entry_source:
                     lines.append(f"- Sumber zona entry: {_esc(setup.entry_source, html_mode)}")
+                if setup.stop_loss_distance_pct is not None:
+                    sl_dist_str = format_indonesian_number(setup.stop_loss_distance_pct, 2)
+                    lines.append(f"- Jarak Stop Loss: {sl_dist_str}%")
+                if setup.max_theoretical_leverage is not None:
+                    lines.append(
+                        f"- Batas leverage teoretis referensi: {setup.max_theoretical_leverage}x "
+                        f"(berdasarkan jarak likuidasi 80% buffer)"
+                    )
 
         if snapshot.factors:
             lines.append("")
@@ -702,6 +754,30 @@ def render_compact_snapshot(
         if pm_parts:
             lines.append(_esc("Pasar Prediksi (Tersirat): " + " | ".join(pm_parts), html_mode))
 
+    if snapshot.macro_context is not None:
+        mc = snapshot.macro_context
+        macro_parts: list[str] = [f"Posisi: {mc.positioning_regime.value.upper()}"]
+        if mc.dxy is not None:
+            dxy_info = f"DXY: {mc.dxy.macro_impact.upper()}"
+            if mc.dxy.rolling_corr_20 is not None:
+                dxy_info += (
+                    f" (r={format_indonesian_number(mc.dxy.rolling_corr_20, 2, signed=True)})"
+                )
+            macro_parts.append(dxy_info)
+        if mc.btc_benchmark is not None and mc.btc_benchmark.leader_alignment != "self":
+            btc_info = "vs BTC: "
+            if mc.btc_benchmark.relative_strength_20_pct is not None:
+                rs_val = format_indonesian_number(
+                    mc.btc_benchmark.relative_strength_20_pct, 2, signed=True
+                )
+                btc_info += f"{rs_val}%"
+            if mc.btc_benchmark.rolling_beta_20 is not None:
+                btc_info += (
+                    f" (beta={format_indonesian_number(mc.btc_benchmark.rolling_beta_20, 2)})"
+                )
+            macro_parts.append(btc_info)
+        lines.append(_esc("Konteks Makro & Posisi: " + " | ".join(macro_parts), html_mode))
+
     if len(snapshot.mtf_overview) >= 2:
         lines.append("")
         lines.append(_bold("Alur Top-Down Multi-Timeframe (1d → 4h → 1h → 15m)", html_mode))
@@ -807,6 +883,14 @@ def render_compact_snapshot(
         lines.append(_esc(f"• TP 1: {tp1_tok} (R:R {rr1_tok}{t1_note})", html_mode))
         lines.append(_esc(f"• TP 2: {tp2_tok} (R:R {rr2_tok}{t2_note})", html_mode))
         lines.append(_esc(f"• TP 3: {tp3_tok} (R:R {rr3_tok}{t3_note})", html_mode))
+        if setup.stop_loss_distance_pct is not None:
+            lev_str = (
+                f" | Max Ref Lev: {setup.max_theoretical_leverage}x"
+                if setup.max_theoretical_leverage
+                else ""
+            )
+            sl_pct_str = format_indonesian_number(setup.stop_loss_distance_pct, 2)
+            lines.append(_esc(f"• Jarak SL: {sl_pct_str}%{lev_str}", html_mode))
         if setup.ltf_confirmation:
             lines.append(_esc(f"• Konfirmasi 15m/MTF: {setup.ltf_confirmation}", html_mode))
 

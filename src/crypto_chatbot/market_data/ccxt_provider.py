@@ -24,8 +24,12 @@ from crypto_chatbot.market_data.base import (
     OhlcvBatch,
 )
 from crypto_chatbot.market_data.quality import normalize_ohlcv_rows
-from crypto_chatbot.market_data.symbols import SymbolMapping, resolve_mvp_spot_symbol
+from crypto_chatbot.market_data.symbols import (
+    SymbolMapping,
+    resolve_symbol,
+)
 from crypto_chatbot.schemas.market import (
+    MarketType,
     ProviderMetadata,
     QualityFlag,
     Timeframe,
@@ -38,6 +42,24 @@ DEFAULT_RETRY_MAX_SECONDS = 4.0
 DEFAULT_BINANCE_PUBLIC_API_URL = "https://data-api.binance.vision/api/v3"
 
 _TRANSIENT_EXCEPTIONS = (ccxt.NetworkError, TimeoutError)
+_BINANCE_1000_PERP_BASES: frozenset[str] = frozenset(
+    {
+        "BONK",
+        "BTTC",
+        "CAT",
+        "CHEEMS",
+        "FLOKI",
+        "LUNC",
+        "MOG",
+        "PEPE",
+        "RATS",
+        "SATS",
+        "SHIB",
+        "WHY",
+        "X",
+        "XEC",
+    }
+)
 
 
 class CcxtOhlcvClient(Protocol):
@@ -56,13 +78,18 @@ class CcxtOhlcvClient(Protocol):
     async def close(self) -> None: ...
 
 
+SUPPORTED_PERP_EXCHANGES: frozenset[str] = frozenset({"binance", "gate", "bingx"})
+
+
 class CcxtMarketDataProvider:
-    """Public Binance spot OHLCV provider backed by CCXT async_support."""
+    """Public perpetual futures (or spot) OHLCV provider backed by CCXT async_support."""
 
     def __init__(
         self,
         *,
         client: CcxtOhlcvClient | None = None,
+        exchange_id: str = "binance",
+        market_type: MarketType = MarketType.PERPETUAL,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         retry_initial_seconds: float = DEFAULT_RETRY_INITIAL_SECONDS,
@@ -81,12 +108,22 @@ class CcxtMarketDataProvider:
             ch.isspace() for ch in public_api_base_url
         ):
             raise ValueError("public_api_base_url must be a valid https:// URL without whitespace")
+        normalized_exchange = exchange_id.strip().lower()
+        if normalized_exchange not in SUPPORTED_PERP_EXCHANGES:
+            raise ValueError(
+                f"unsupported exchange_id '{exchange_id}'; "
+                f"expected one of {sorted(SUPPORTED_PERP_EXCHANGES)}"
+            )
 
+        self._exchange_id = normalized_exchange
+        self._market_type = market_type
         self._owns_client = client is None
         self._client: CcxtOhlcvClient = (
             client
             if client is not None
-            else self._build_default_client(timeout_seconds, public_api_base_url)
+            else self._build_default_client(
+                timeout_seconds, public_api_base_url, market_type, normalized_exchange
+            )
         )
         self._timeout_seconds = timeout_seconds
         self._max_attempts = max_attempts
@@ -99,9 +136,45 @@ class CcxtMarketDataProvider:
     def _build_default_client(
         timeout_seconds: float,
         public_api_base_url: str,
+        market_type: MarketType = MarketType.PERPETUAL,
+        exchange_id: str = "binance",
     ) -> CcxtOhlcvClient:
-        # Public spot market data only: never pass exchange credentials in MVP (ADR 0001).
-        exchange: CcxtOhlcvClient = ccxt_async.binance(
+        # Public market data only: never pass exchange credentials (ADR 0001 / ADR 0013).
+        if market_type is MarketType.PERPETUAL:
+            if exchange_id == "gate":
+                exchange_gate: CcxtOhlcvClient = ccxt_async.gate(
+                    {
+                        "enableRateLimit": True,
+                        "timeout": int(timeout_seconds * 1000),
+                        "options": {
+                            "defaultType": "swap",
+                            "fetchMarkets": {"types": ["swap"]},
+                        },
+                    }
+                )
+                return exchange_gate
+            if exchange_id == "bingx":
+                exchange_bingx: CcxtOhlcvClient = ccxt_async.bingx(
+                    {
+                        "enableRateLimit": True,
+                        "timeout": int(timeout_seconds * 1000),
+                        "options": {"defaultType": "swap"},
+                    }
+                )
+                return exchange_bingx
+            exchange_perp: CcxtOhlcvClient = ccxt_async.binanceusdm(
+                {
+                    "enableRateLimit": True,
+                    "timeout": int(timeout_seconds * 1000),
+                    "options": {
+                        "defaultType": "swap",
+                        "fetchMarkets": {"types": ["linear"]},
+                    },
+                }
+            )
+            return exchange_perp
+
+        exchange_spot: CcxtOhlcvClient = ccxt_async.binance(
             {
                 "enableRateLimit": True,
                 "timeout": int(timeout_seconds * 1000),
@@ -112,7 +185,7 @@ class CcxtMarketDataProvider:
                 },
             }
         )
-        return exchange
+        return exchange_spot
 
     async def _fetch_once(
         self,
@@ -156,17 +229,27 @@ class CcxtMarketDataProvider:
         timeframe: Timeframe,
         limit: int = DEFAULT_CANDLE_LIMIT,
     ) -> OhlcvBatch:
-        """Fetch closed spot candles with retries, timeout, and deterministic quality checks."""
+        """Fetch closed perpetual futures candles with retries, timeout, and quality checks."""
         if limit < 1 or limit > MAX_CANDLE_LIMIT:
             raise ValueError(f"limit must be between 1 and {MAX_CANDLE_LIMIT}")
 
-        mapping = resolve_mvp_spot_symbol(symbol)
+        mapping = resolve_symbol(symbol, market_type=self._market_type)
+        if self._market_type is MarketType.PERPETUAL and self._exchange_id != "binance":
+            provider_sym = f"{self._exchange_id.upper()}:{mapping.base}{mapping.quote}.P"
+            mapping = mapping.model_copy(
+                update={
+                    "venue": self._exchange_id,
+                    "provider_symbol": provider_sym,
+                }
+            )
         # Request one extra row when below venue cap so dropping the open candle preserves `limit`.
         fetch_limit = min(limit + 1, MAX_CANDLE_LIMIT)
 
         extra_flags: list[QualityFlag] = []
         client_id = getattr(self._client, "id", "").lower()
-        if client_id and client_id != mapping.venue:
+        if client_id and not (
+            client_id.startswith(mapping.venue) or mapping.venue.startswith(client_id)
+        ):
             extra_flags.append(QualityFlag.SYMBOL_MISMATCH)
 
         try:
@@ -175,6 +258,49 @@ class CcxtMarketDataProvider:
                 timeframe,
                 fetch_limit,
             )
+        except ccxt.BadSymbol as exc:
+            if (
+                self._market_type is MarketType.PERPETUAL
+                and mapping.base in _BINANCE_1000_PERP_BASES
+            ):
+                fallback_mapping = resolve_symbol(
+                    f"1000{mapping.base}",
+                    market_type=MarketType.PERPETUAL,
+                )
+                try:
+                    raw_rows = await self._fetch_with_retries(
+                        fallback_mapping.ccxt_symbol,
+                        timeframe,
+                        fetch_limit,
+                    )
+                    mapping = fallback_mapping
+                except TimeoutError:
+                    return self._provider_error_batch(
+                        mapping=fallback_mapping,
+                        timeframe=timeframe,
+                        message=(
+                            f"Provider timeout fetching {fallback_mapping.canonical_symbol} "
+                            f"{timeframe.value} after {self._max_attempts} attempt(s)"
+                        ),
+                    )
+                except ccxt.BaseError as fallback_exc:
+                    return self._provider_error_batch(
+                        mapping=fallback_mapping,
+                        timeframe=timeframe,
+                        message=(
+                            f"Provider error ({type(fallback_exc).__name__}) fetching "
+                            f"{fallback_mapping.canonical_symbol} {timeframe.value}"
+                        ),
+                    )
+            else:
+                return self._provider_error_batch(
+                    mapping=mapping,
+                    timeframe=timeframe,
+                    message=(
+                        f"Provider error ({type(exc).__name__}) fetching "
+                        f"{mapping.canonical_symbol} {timeframe.value}"
+                    ),
+                )
         except TimeoutError:
             return self._provider_error_batch(
                 mapping=mapping,

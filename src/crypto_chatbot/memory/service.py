@@ -6,7 +6,7 @@ from collections.abc import Sequence
 
 from crypto_chatbot.llm.gemini import NarrationOutcome
 from crypto_chatbot.llm.guard import validate_narration
-from crypto_chatbot.market_data.symbols import resolve_mvp_spot_symbol
+from crypto_chatbot.market_data.symbols import resolve_default_perp_symbol
 from crypto_chatbot.schemas.analysis import AnalysisSnapshot
 from crypto_chatbot.schemas.llm import LlmAnalysisNarration
 from crypto_chatbot.storage.repositories import (
@@ -46,8 +46,8 @@ class MemoryService:
         return self._repository.get_preferences(user_id)
 
     def add_to_watchlist(self, user_id: int, raw_symbol: str) -> tuple[UserPreferences, bool]:
-        """Add an MVP spot symbol to user's explicit watchlist idempotently."""
-        canonical = resolve_mvp_spot_symbol(raw_symbol).canonical_symbol
+        """Add an MVP perpetual symbol to user's explicit watchlist idempotently."""
+        canonical = resolve_default_perp_symbol(raw_symbol).canonical_symbol
         prefs = self._repository.get_preferences(user_id)
         if canonical in prefs.watchlist:
             return prefs, False
@@ -56,8 +56,8 @@ class MemoryService:
         return updated, True
 
     def remove_from_watchlist(self, user_id: int, raw_symbol: str) -> tuple[UserPreferences, bool]:
-        """Remove an MVP spot symbol from user's watchlist if present."""
-        canonical = resolve_mvp_spot_symbol(raw_symbol).canonical_symbol
+        """Remove an MVP perpetual symbol from user's watchlist if present."""
+        canonical = resolve_default_perp_symbol(raw_symbol).canonical_symbol
         prefs = self._repository.get_preferences(user_id)
         if canonical not in prefs.watchlist:
             return prefs, False

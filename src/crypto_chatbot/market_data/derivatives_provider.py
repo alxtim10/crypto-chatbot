@@ -110,6 +110,7 @@ class CcxtDerivativesLiquidityProvider:
         *,
         spot_client: CcxtSpotOrderBookClient | None = None,
         futures_client: CcxtFuturesDerivativesClient | None = None,
+        exchange_id: str = "binance",
         liquidation_fetcher: LiquidationFetcher | None = None,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
@@ -132,6 +133,7 @@ class CcxtDerivativesLiquidityProvider:
         ):
             raise ValueError("spot_public_api_url must be a valid https:// URL without whitespace")
 
+        self._exchange_id = exchange_id.strip().lower()
         self._owns_spot_client = spot_client is None
         self._owns_futures_client = futures_client is None
         self._spot_client: CcxtSpotOrderBookClient = (
@@ -142,7 +144,7 @@ class CcxtDerivativesLiquidityProvider:
         self._futures_client: CcxtFuturesDerivativesClient = (
             futures_client
             if futures_client is not None
-            else self._build_default_futures_client(timeout_seconds)
+            else self._build_default_futures_client(timeout_seconds, self._exchange_id)
         )
         self._liquidation_fetcher = liquidation_fetcher
         self._timeout_seconds = timeout_seconds
@@ -177,19 +179,53 @@ class CcxtDerivativesLiquidityProvider:
     @staticmethod
     def _build_default_futures_client(
         timeout_seconds: float,
+        exchange_id: str = "binance",
     ) -> CcxtFuturesDerivativesClient:
         # Public USD-M futures data only: no credentials.
+        if exchange_id == "gate":
+            gate_client: CcxtFuturesDerivativesClient = ccxt_async.gate(
+                {
+                    "enableRateLimit": True,
+                    "timeout": int(timeout_seconds * 1000),
+                    "options": {
+                        "defaultType": "swap",
+                        "fetchMarkets": {"types": ["swap"]},
+                    },
+                }
+            )
+            return gate_client
+        if exchange_id == "bingx":
+            bingx_client: CcxtFuturesDerivativesClient = ccxt_async.bingx(
+                {
+                    "enableRateLimit": True,
+                    "timeout": int(timeout_seconds * 1000),
+                    "options": {"defaultType": "swap"},
+                }
+            )
+            return bingx_client
         client: CcxtFuturesDerivativesClient = ccxt_async.binanceusdm(
             {
                 "enableRateLimit": True,
                 "timeout": int(timeout_seconds * 1000),
                 "options": {
                     "defaultType": "swap",
-                    "fetchMarkets": {"types": ["swap"]},
+                    "fetchMarkets": {"types": ["linear"]},
                 },
             }
         )
         return client
+
+    def _resolve_venue_mapping(self, symbol: str, *, market_type: MarketType) -> SymbolMapping:
+        mapping = resolve_symbol(symbol, market_type=market_type)
+        if market_type is MarketType.PERPETUAL and self._exchange_id != "binance":
+            provider_sym = f"{self._exchange_id.upper()}:{mapping.base}{mapping.quote}.P"
+            return mapping.model_copy(
+                update={
+                    "venue": self._exchange_id,
+                    "provider_symbol": provider_sym,
+                }
+            )
+        return mapping
 
     async def _call_with_retries(self, op: Callable[[], Awaitable[_T]]) -> _T:
         retrying = AsyncRetrying(
@@ -226,21 +262,27 @@ class CcxtDerivativesLiquidityProvider:
 
     async def get_funding_rate(self, symbol: str) -> FundingRateBatch:
         """Fetch latest perpetual funding rate and interval comparability metadata."""
-        mapping = resolve_symbol(symbol, market_type=MarketType.PERPETUAL)
+        mapping = self._resolve_venue_mapping(symbol, market_type=MarketType.PERPETUAL)
         extra_flags = self._venue_mismatch_flags(
             getattr(self._futures_client, "id", ""),
             mapping,
             market_type=MarketType.PERPETUAL,
         )
 
+        async def _safe_intervals() -> Mapping[str, Any]:
+            try:
+                return await self._call_with_retries(
+                    lambda: self._futures_client.fetch_funding_intervals([mapping.ccxt_symbol])
+                )
+            except ccxt.NotSupported:
+                return {}
+
         try:
             raw_funding, raw_intervals = await asyncio.gather(
                 self._call_with_retries(
                     lambda: self._futures_client.fetch_funding_rate(mapping.ccxt_symbol)
                 ),
-                self._call_with_retries(
-                    lambda: self._futures_client.fetch_funding_intervals([mapping.ccxt_symbol])
-                ),
+                _safe_intervals(),
             )
         except TimeoutError:
             return FundingRateBatch(
@@ -314,18 +356,24 @@ class CcxtDerivativesLiquidityProvider:
         """Fetch latest + historical perpetual open interest and normalize units."""
         if history_limit < 1 or history_limit > 500:
             raise ValueError("history_limit must be between 1 and 500")
-        mapping = resolve_symbol(symbol, market_type=MarketType.PERPETUAL)
+        mapping = self._resolve_venue_mapping(symbol, market_type=MarketType.PERPETUAL)
         extra_flags = self._venue_mismatch_flags(
             getattr(self._futures_client, "id", ""),
             mapping,
             market_type=MarketType.PERPETUAL,
         )
 
+        async def _safe_latest_oi() -> Mapping[str, Any] | None:
+            try:
+                return await self._call_with_retries(
+                    lambda: self._futures_client.fetch_open_interest(mapping.ccxt_symbol)
+                )
+            except ccxt.NotSupported:
+                return None
+
         try:
             raw_latest, raw_history = await asyncio.gather(
-                self._call_with_retries(
-                    lambda: self._futures_client.fetch_open_interest(mapping.ccxt_symbol)
-                ),
+                _safe_latest_oi(),
                 self._call_with_retries(
                     lambda: self._futures_client.fetch_open_interest_history(
                         mapping.ccxt_symbol,
@@ -334,6 +382,8 @@ class CcxtDerivativesLiquidityProvider:
                     )
                 ),
             )
+            if raw_latest is None and raw_history:
+                raw_latest = raw_history[-1]
         except TimeoutError:
             return OpenInterestBatch(
                 canonical_symbol=mapping.canonical_symbol,
@@ -393,7 +443,7 @@ class CcxtDerivativesLiquidityProvider:
         if limit < 5 or limit > 5000:
             raise ValueError("limit must be between 5 and 5000")
 
-        mapping = resolve_symbol(symbol, market_type=market_type)
+        mapping = self._resolve_venue_mapping(symbol, market_type=market_type)
         client: CcxtSpotOrderBookClient | CcxtFuturesDerivativesClient = (
             self._spot_client if market_type is MarketType.SPOT else self._futures_client
         )

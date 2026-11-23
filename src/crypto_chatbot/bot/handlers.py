@@ -462,6 +462,21 @@ def register_handlers(
         )
         await _reply_chunks(update, await bot_service.handle_text_message(uid, text))
 
+    async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.error(
+            "Unhandled exception processing update: %s",
+            context.error,
+            exc_info=context.error,
+        )
+        if isinstance(update, Update) and update.effective_message:
+            try:
+                await update.effective_message.reply_text(
+                    "⚠️ Terjadi kendala saat memproses permintaan Anda. "
+                    "Silakan coba beberapa saat lagi."
+                )
+            except Exception as err:
+                logger.error("Failed to deliver error response to user: %s", err)
+
     application.add_handler(CommandHandler("start", start_cmd))
     application.add_handler(CommandHandler("help", help_cmd))
     application.add_handler(CommandHandler("analyze", analyze_cmd))
@@ -471,3 +486,4 @@ def register_handlers(
     application.add_handler(CommandHandler("forget", forget_cmd))
     application.add_handler(MessageHandler(filters.COMMAND, unknown_cmd))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_msg))
+    application.add_error_handler(global_error_handler)
