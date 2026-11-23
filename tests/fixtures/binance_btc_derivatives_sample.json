@@ -1,0 +1,105 @@
+{
+  "symbol": "BTC",
+  "received_time": "2026-11-21T12:01:00+00:00",
+  "funding_interval_hours": 8,
+  "funding_rate": {
+    "symbol": "BTC/USDT:USDT",
+    "timestamp": 1795262400000,
+    "datetime": "2026-11-21T12:00:00.000Z",
+    "fundingTimestamp": 1795291200000,
+    "fundingRate": 0.000125,
+    "markPrice": 65585.0,
+    "indexPrice": 65578.0,
+    "info": {
+      "symbol": "BTCUSDT",
+      "lastFundingRate": "0.00012500",
+      "markPrice": "65585.0",
+      "indexPrice": "65578.0",
+      "time": "1795262400000",
+      "nextFundingTime": "1795291200000"
+    }
+  },
+  "funding_intervals": {
+    "BTC/USDT:USDT": {
+      "symbol": "BTC/USDT:USDT",
+      "interval": "8h",
+      "info": {
+        "symbol": "BTCUSDT",
+        "fundingIntervalHours": 8
+      }
+    }
+  },
+  "open_interest": {
+    "contract_size": 1.0,
+    "is_inverse": false,
+    "latest": {
+      "symbol": "BTC/USDT:USDT",
+      "timestamp": 1795262400000,
+      "openInterestAmount": 82400.0,
+      "openInterestValue": 5403596800.0,
+      "info": {
+        "symbol": "BTCUSDT",
+        "openInterest": "82400.0"
+      }
+    },
+    "history": [
+      {
+        "symbol": "BTC/USDT:USDT",
+        "timestamp": 1795233600000,
+        "openInterestAmount": 79000.0,
+        "openInterestValue": 5140000000.0
+      },
+      {
+        "symbol": "BTC/USDT:USDT",
+        "timestamp": 1795248000000,
+        "openInterestAmount": 80000.0,
+        "openInterestValue": 5240000000.0
+      }
+    ]
+  },
+  "order_book": {
+    "symbol": "BTC/USDT",
+    "timestamp": 1795262400000,
+    "nonce": 500100,
+    "bids": [
+      [65575.0, 2.5],
+      [65560.0, 4.0],
+      [65520.0, 6.0],
+      [65350.0, 10.0],
+      [65200.0, 12.0]
+    ],
+    "asks": [
+      [65581.0, 2.0],
+      [65600.0, 3.5],
+      [65630.0, 5.5],
+      [65800.0, 8.0],
+      [66000.0, 15.0]
+    ]
+  },
+  "order_book_diffs": [
+    {
+      "first_update_id": 500101,
+      "final_update_id": 500102,
+      "prev_final_update_id": 500100,
+      "event_time": "2026-11-21T12:00:05+00:00",
+      "bids": [[65576.0, 3.0], [65575.0, 0.0]],
+      "asks": [[65582.0, 2.5]]
+    }
+  ],
+  "liquidations": [
+    {
+      "id": "liq-btc-001",
+      "timestamp": 1795262340000,
+      "side": "sell",
+      "price": 65500.0,
+      "amount": 1.5
+    },
+    {
+      "id": "liq-btc-002",
+      "timestamp": 1795262370000,
+      "side": "buy",
+      "price": 65600.0,
+      "amount": 0.5
+    }
+  ]
+}
