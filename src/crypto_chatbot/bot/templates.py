@@ -1021,6 +1021,10 @@ def render_help_message() -> str:
             "- /compare &lt;SIMBOL1&gt; &lt;SIMBOL2&gt; [SIMBOL3] [15m|1h|4h|1d] "
             "— contoh: /compare BTC ETH 1d"
         ),
+        (
+            "- /pine &lt;SIMBOL&gt; [15m|1h|4h|1d] — export TradingView Pine Script v6 "
+            "untuk Entry, SL, TP, S/R, dan zona SMC"
+        ),
         "- /watchlist — tampilkan daftar pantau",
         "- /watchlist add &lt;SIMBOL&gt; — tambah pair spot /USDT ke daftar pantau",
         "- /watchlist remove &lt;SIMBOL&gt; — hapus dari daftar pantau",

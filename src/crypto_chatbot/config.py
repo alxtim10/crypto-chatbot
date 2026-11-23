@@ -54,6 +54,10 @@ class Settings(BaseSettings):
     )
     ml_inference_mode: MlInferenceMode = MlInferenceMode.OFF
     futures_exchange: str = Field(default="binance")
+    futures_exchange_fallbacks: Annotated[tuple[str, ...], NoDecode] = Field(
+        default=(),
+        validate_default=True,
+    )
 
     @field_validator("futures_exchange", mode="before")
     @classmethod
@@ -64,6 +68,32 @@ class Settings(BaseSettings):
         if cleaned not in {"binance", "gate", "bingx"}:
             raise ValueError("must be one of: binance, gate, bingx")
         return cleaned
+
+    @field_validator("futures_exchange_fallbacks", mode="before")
+    @classmethod
+    def _validate_futures_exchange_fallbacks(cls, value: object) -> tuple[str, ...]:
+        if value is None:
+            return ()
+        items: list[str]
+        if isinstance(value, str):
+            items = [part.strip().lower() for part in value.split(",") if part.strip()]
+        elif isinstance(value, (tuple, list)):
+            items = [str(part).strip().lower() for part in value if str(part).strip()]
+        else:
+            raise ValueError("must be a comma-separated list of exchanges")
+
+        allowed = {"binance", "gate", "bingx"}
+        for item in items:
+            if item not in allowed:
+                raise ValueError(
+                    f"unsupported fallback exchange '{item}'; must be one of: binance, gate, bingx"
+                )
+        return tuple(dict.fromkeys(items))
+
+    @property
+    def futures_exchange_chain(self) -> tuple[str, ...]:
+        """Ordered, deduplicated exchange chain starting with the primary futures exchange."""
+        return tuple(dict.fromkeys((self.futures_exchange, *self.futures_exchange_fallbacks)))
 
     @field_validator("tradingview_webhook_secret", mode="before")
     @classmethod

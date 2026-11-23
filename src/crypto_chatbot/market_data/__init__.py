@@ -36,6 +36,12 @@ from crypto_chatbot.market_data.derivatives_quality import (
     normalize_open_interest_payload,
     normalize_open_interest_unit,
 )
+from crypto_chatbot.market_data.fallback_provider import (
+    FallbackDerivativesLiquidityProvider,
+    FallbackMarketDataProvider,
+    build_futures_providers,
+    normalize_exchange_chain,
+)
 from crypto_chatbot.market_data.macro_provider import (
     DxyMarketDataProvider,
     is_dxy_market_closed,
@@ -100,6 +106,8 @@ __all__ = [
     "CcxtSpotOrderBookClient",
     "DerivativesLiquidityProvider",
     "DxyMarketDataProvider",
+    "FallbackDerivativesLiquidityProvider",
+    "FallbackMarketDataProvider",
     "MarketDataProvider",
     "OhlcvBatch",
     "OrderBookSynchronizer",
@@ -109,6 +117,7 @@ __all__ = [
     "TradingViewWebhookProcessor",
     "TradingViewWebhookServer",
     "WebhookResult",
+    "build_futures_providers",
     "build_webhook_ssl_context",
     "check_cross_source_price",
     "compare_funding_rates",
@@ -118,6 +127,7 @@ __all__ = [
     "determine_quality_status",
     "is_candle_stale",
     "is_dxy_market_closed",
+    "normalize_exchange_chain",
     "normalize_funding_rate_payload",
     "normalize_funding_rate_value",
     "normalize_liquidation_events",

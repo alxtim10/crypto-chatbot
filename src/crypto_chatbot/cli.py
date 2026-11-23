@@ -14,17 +14,27 @@ from typing import Any
 
 import numpy as np
 
+from crypto_chatbot.analysis.backtest import (
+    BacktestConfig,
+    render_backtest_report,
+    run_setup_backtest,
+)
+from crypto_chatbot.analysis.pine_export import generate_pine_script
 from crypto_chatbot.analysis.service import AnalysisService, build_analysis_snapshot
 from crypto_chatbot.analysis.setup import evaluate_setup_against_candles
 from crypto_chatbot.app import run_bot
 from crypto_chatbot.bot.templates import render_compact_snapshot, render_deterministic_snapshot
 from crypto_chatbot.config import ConfigError, load_settings
-from crypto_chatbot.market_data.ccxt_provider import CcxtMarketDataProvider
-from crypto_chatbot.market_data.derivatives_provider import CcxtDerivativesLiquidityProvider
+from crypto_chatbot.market_data.base import OhlcvBatch
+from crypto_chatbot.market_data.bybit_derivatives import BybitDerivativesProvider
 from crypto_chatbot.market_data.derivatives_quality import (
     normalize_funding_rate_payload,
     normalize_liquidation_events,
     normalize_open_interest_payload,
+)
+from crypto_chatbot.market_data.fallback_provider import (
+    build_futures_providers,
+    normalize_exchange_chain,
 )
 from crypto_chatbot.market_data.macro_provider import DxyMarketDataProvider
 from crypto_chatbot.market_data.orderbook import normalize_order_book_payload
@@ -48,7 +58,7 @@ from crypto_chatbot.ops import (
 )
 from crypto_chatbot.schemas.analysis import AnalysisSnapshot
 from crypto_chatbot.schemas.derivatives import DerivativesContext
-from crypto_chatbot.schemas.market import MarketType, Timeframe
+from crypto_chatbot.schemas.market import MarketType, QualityStatus, Timeframe
 from crypto_chatbot.schemas.ml import MlExperimentConfig
 from crypto_chatbot.schemas.news import RawNewsItem, SentimentObservation
 from crypto_chatbot.schemas.tradingview import TradingViewPacket
@@ -193,21 +203,12 @@ def _load_derivatives_fixture(
     return context
 
 
-def _analyze_from_fixture(
+def _load_fixture_batch(
     *,
-    symbol: str,
+    mapping: SymbolMapping,
     timeframe: Timeframe,
     fixture_path: Path,
-    derivatives_fixture_path: Path | None,
-    tradingview_fixture_path: Path | None,
-    news_fixture_path: Path | None,
-    repository: MarketRepository | None,
-    derivatives_repository: DerivativesRepository | None,
-    setup_repository: SetupLogRepository | None = None,
-    tradingview_repository: TradingViewRepository | None = None,
-    news_repository: NewsRepository | None = None,
-) -> AnalysisSnapshot:
-    mapping = resolve_mvp_spot_symbol(symbol)
+) -> tuple[OhlcvBatch, datetime]:
     if not fixture_path.is_file():
         raise ValueError(f"fixture file not found: {fixture_path}")
 
@@ -237,6 +238,29 @@ def _analyze_from_fixture(
         timeframe=timeframe,
         received_time=received_time,
         now=received_time,
+    )
+    return batch, received_time
+
+
+def _analyze_from_fixture(
+    *,
+    symbol: str,
+    timeframe: Timeframe,
+    fixture_path: Path,
+    derivatives_fixture_path: Path | None,
+    tradingview_fixture_path: Path | None,
+    news_fixture_path: Path | None,
+    repository: MarketRepository | None,
+    derivatives_repository: DerivativesRepository | None,
+    setup_repository: SetupLogRepository | None = None,
+    tradingview_repository: TradingViewRepository | None = None,
+    news_repository: NewsRepository | None = None,
+) -> AnalysisSnapshot:
+    mapping = resolve_mvp_spot_symbol(symbol)
+    batch, received_time = _load_fixture_batch(
+        mapping=mapping,
+        timeframe=timeframe,
+        fixture_path=fixture_path,
     )
     derivatives_context = (
         _load_derivatives_fixture(
@@ -303,6 +327,13 @@ def _analyze_from_fixture(
     return snapshot
 
 
+def _resolve_exchange_chain_from_env() -> tuple[str, ...]:
+    primary = os.environ.get("FUTURES_EXCHANGE", "binance").strip().lower() or "binance"
+    raw_fallbacks = os.environ.get("FUTURES_EXCHANGE_FALLBACKS", "")
+    fallbacks = [part.strip().lower() for part in raw_fallbacks.split(",") if part.strip()]
+    return normalize_exchange_chain((primary, *fallbacks))
+
+
 async def _analyze_live(
     *,
     symbol: str,
@@ -315,43 +346,33 @@ async def _analyze_live(
     tradingview_repository: TradingViewRepository | None = None,
     news_repository: NewsRepository | None = None,
 ) -> AnalysisSnapshot:
-    futures_exchange = os.environ.get("FUTURES_EXCHANGE", "binance").strip().lower() or "binance"
-    async with CcxtMarketDataProvider(exchange_id=futures_exchange) as provider:
-        if include_derivatives:
-            async with CcxtDerivativesLiquidityProvider(
-                exchange_id=futures_exchange
-            ) as deriv_provider:
-                service = AnalysisService(
-                    provider=provider,
-                    repository=repository,
-                    derivatives_provider=deriv_provider,
-                    derivatives_repository=derivatives_repository,
-                    setup_repository=setup_repository,
-                    tradingview_repository=tradingview_repository,
-                    news_repository=news_repository,
-                    dxy_provider=DxyMarketDataProvider(),
-                )
-                return await service.analyze(
-                    symbol,
-                    timeframe,
-                    include_mtf=include_mtf,
-                    include_derivatives=True,
-                    persist=repository is not None,
-                )
+    chain = _resolve_exchange_chain_from_env()
+    provider, deriv_provider = build_futures_providers(chain)
+    bybit_provider = BybitDerivativesProvider() if "binance" in chain else None
+    try:
         service = AnalysisService(
             provider=provider,
             repository=repository,
+            derivatives_provider=deriv_provider if include_derivatives else None,
+            bybit_provider=bybit_provider if include_derivatives else None,
+            derivatives_repository=derivatives_repository,
             setup_repository=setup_repository,
             tradingview_repository=tradingview_repository,
             news_repository=news_repository,
+            dxy_provider=DxyMarketDataProvider() if include_derivatives else None,
         )
         return await service.analyze(
             symbol,
             timeframe,
             include_mtf=include_mtf,
-            include_derivatives=False,
+            include_derivatives=include_derivatives,
             persist=repository is not None,
         )
+    finally:
+        await provider.close()
+        await deriv_provider.close()
+        if bybit_provider is not None:
+            await bybit_provider.close()
 
 
 def _run_analyze(
@@ -912,6 +933,142 @@ def _run_shadow_report(
     return 0
 
 
+async def _fetch_live_ohlcv_for_backtest(
+    *,
+    symbol: str,
+    timeframe: Timeframe,
+    limit: int,
+) -> OhlcvBatch:
+    chain = _resolve_exchange_chain_from_env()
+    provider, deriv_provider = build_futures_providers(chain)
+    try:
+        return await provider.get_closed_ohlcv(symbol, timeframe, limit=limit)
+    finally:
+        await provider.close()
+        await deriv_provider.close()
+
+
+def _run_backtest(
+    *,
+    symbol_raw: str,
+    timeframe_raw: str,
+    limit: int,
+    warmup: int,
+    max_hold: int,
+    step: int,
+    fixture_path: Path | None,
+    as_json: bool,
+) -> int:
+    try:
+        try:
+            timeframe = Timeframe(timeframe_raw.strip().lower())
+        except ValueError:
+            supported = ", ".join(tf.value for tf in Timeframe)
+            raise ValueError(
+                f"unsupported timeframe '{timeframe_raw}' (supported: {supported})"
+            ) from None
+
+        if fixture_path is not None:
+            mapping = resolve_mvp_spot_symbol(symbol_raw)
+            batch, _ = _load_fixture_batch(
+                mapping=mapping,
+                timeframe=timeframe,
+                fixture_path=fixture_path,
+            )
+        else:
+            mapping = resolve_default_perp_symbol(symbol_raw)
+            batch = asyncio.run(
+                _fetch_live_ohlcv_for_backtest(
+                    symbol=mapping.canonical_symbol,
+                    timeframe=timeframe,
+                    limit=limit,
+                )
+            )
+
+        if batch.has_provider_error or not batch.candles:
+            msg = batch.error_message or "failed to load OHLCV candles for backtest"
+            raise ValueError(msg)
+
+        config = BacktestConfig(
+            warmup_bars=warmup,
+            max_hold_bars=max_hold,
+            step_bars=step,
+        )
+        report = run_setup_backtest(batch.candles, config=config)
+    except (SymbolError, ValueError, json.JSONDecodeError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if as_json:
+        print(report.model_dump_json(indent=2))
+    else:
+        print(render_backtest_report(report))
+    return 0
+
+
+def _run_pine(
+    *,
+    symbol_raw: str,
+    timeframe_raw: str,
+    fixture_path: Path | None,
+    out_path: Path | None,
+) -> int:
+    try:
+        mapping = (
+            resolve_mvp_spot_symbol(symbol_raw)
+            if fixture_path is not None
+            else resolve_default_perp_symbol(symbol_raw)
+        )
+        try:
+            timeframe = Timeframe(timeframe_raw.strip().lower())
+        except ValueError:
+            supported = ", ".join(tf.value for tf in Timeframe)
+            raise ValueError(
+                f"unsupported timeframe '{timeframe_raw}' (supported: {supported})"
+            ) from None
+
+        if fixture_path is not None:
+            snapshot = _analyze_from_fixture(
+                symbol=mapping.canonical_symbol,
+                timeframe=timeframe,
+                fixture_path=fixture_path,
+                derivatives_fixture_path=None,
+                tradingview_fixture_path=None,
+                news_fixture_path=None,
+                repository=None,
+                derivatives_repository=None,
+            )
+        else:
+            snapshot = asyncio.run(
+                _analyze_live(
+                    symbol=mapping.canonical_symbol,
+                    timeframe=timeframe,
+                    include_mtf=True,
+                    include_derivatives=True,
+                    repository=None,
+                    derivatives_repository=None,
+                )
+            )
+    except (SymbolError, ValueError, json.JSONDecodeError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if snapshot.quality_status is QualityStatus.INSUFFICIENT_DATA:
+        print(
+            f"Error: INSUFFICIENT_DATA for {snapshot.canonical_symbol} {snapshot.timeframe.value}",
+            file=sys.stderr,
+        )
+        return 1
+
+    script = generate_pine_script(snapshot)
+    if out_path is not None:
+        out_path.write_text(script, encoding="utf-8")
+        print(f"Pine Script written to {out_path}")
+    else:
+        print(script, end="")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="crypto-chatbot")
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -1106,6 +1263,77 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Optional PostgreSQL URL override.",
     )
 
+    backtest_parser = subcommands.add_parser(
+        "backtest",
+        help="Run deterministic point-in-time trade setup replay backtest.",
+    )
+    backtest_parser.add_argument("symbol", help="Target symbol (e.g. BTC, ETH, SOL).")
+    backtest_parser.add_argument(
+        "timeframe",
+        nargs="?",
+        default="4h",
+        help="Candle timeframe (default: 4h).",
+    )
+    backtest_parser.add_argument(
+        "--limit",
+        type=int,
+        default=1000,
+        help="Maximum closed candles to fetch in live mode (default: 1000).",
+    )
+    backtest_parser.add_argument(
+        "--warmup",
+        type=int,
+        default=200,
+        help="Minimum warmup bars before first signal evaluation (default: 200).",
+    )
+    backtest_parser.add_argument(
+        "--max-hold",
+        type=int,
+        default=24,
+        help="Maximum holding bars per setup before expiration (default: 24).",
+    )
+    backtest_parser.add_argument(
+        "--step",
+        type=int,
+        default=1,
+        help="Bar step interval between evaluations when idle (default: 1).",
+    )
+    backtest_parser.add_argument(
+        "--fixture",
+        type=Path,
+        default=None,
+        help="Optional recorded CCXT JSON fixture for offline replay.",
+    )
+    backtest_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print full BacktestReport JSON instead of Indonesian text report.",
+    )
+
+    pine_parser = subcommands.add_parser(
+        "pine",
+        help="Generate TradingView Pine Script v6 overlay from deterministic analysis.",
+    )
+    pine_parser.add_argument("symbol", help="Target symbol (e.g. BTC, ETH, SOL).")
+    pine_parser.add_argument(
+        "timeframe",
+        nargs="?",
+        default="4h",
+        help="Primary timeframe (default: 4h).",
+    )
+    pine_parser.add_argument(
+        "--fixture",
+        type=Path,
+        default=None,
+        help="Optional recorded CCXT JSON fixture for offline generation.",
+    )
+    pine_parser.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help="Optional output .pine file path (prints to stdout if omitted).",
+    )
+
     args = parser.parse_args(argv)
     if args.command == "check-config":
         return _check_config()
@@ -1122,6 +1350,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             persist=args.persist,
             include_mtf=not args.no_mtf,
             include_derivatives=not args.no_derivatives,
+        )
+    if args.command == "backtest":
+        return _run_backtest(
+            symbol_raw=args.symbol,
+            timeframe_raw=args.timeframe,
+            limit=args.limit,
+            warmup=args.warmup,
+            max_hold=args.max_hold,
+            step=args.step,
+            fixture_path=args.fixture,
+            as_json=args.json,
+        )
+    if args.command == "pine":
+        return _run_pine(
+            symbol_raw=args.symbol,
+            timeframe_raw=args.timeframe,
+            fixture_path=args.fixture,
+            out_path=args.out,
         )
     if args.command == "setup-stats":
         return _run_setup_stats(

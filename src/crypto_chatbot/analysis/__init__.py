@@ -1,5 +1,14 @@
 """Deterministic technical analysis engine (indicators, regimes, structure, service)."""
 
+from crypto_chatbot.analysis.backtest import (
+    BacktestConfig,
+    BacktestReport,
+    BacktestTrade,
+    BootstrapSummary,
+    RegimeBreakdown,
+    render_backtest_report,
+    run_setup_backtest,
+)
 from crypto_chatbot.analysis.derivatives import (
     DERIVATIVES_PARAMETERS,
     DerivativesAnalysisResult,
@@ -42,6 +51,7 @@ from crypto_chatbot.analysis.indicators import (
     true_range_series,
     validate_closed_candles,
 )
+from crypto_chatbot.analysis.pine_export import generate_pine_script
 from crypto_chatbot.analysis.regimes import (
     HIGH_VOLATILITY_ATR_PERCENTILE,
     RANGING_ADX_MAX,
@@ -88,10 +98,15 @@ __all__ = [
     "SETUP_PARAMETERS",
     "TRENDING_ADX_MIN",
     "AnalysisService",
+    "BacktestConfig",
+    "BacktestReport",
+    "BacktestTrade",
+    "BootstrapSummary",
     "DerivativesAnalysisResult",
     "IndicatorResult",
     "MtfRsiResult",
     "PreviousPeriodLevels",
+    "RegimeBreakdown",
     "StructureAnalysis",
     "adx_dmi_series",
     "analyze_market_structure",
@@ -111,10 +126,13 @@ __all__ = [
     "detect_failed_breakouts",
     "ema_series",
     "evaluate_setup_against_candles",
+    "generate_pine_script",
     "macd_series",
     "relative_volume_series",
+    "render_backtest_report",
     "rma_series",
     "rsi_series",
+    "run_setup_backtest",
     "simple_return_series",
     "true_range_series",
     "validate_closed_candles",

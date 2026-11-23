@@ -25,8 +25,7 @@ from crypto_chatbot.llm.gemini import (
     GoogleGenAiTransport,
 )
 from crypto_chatbot.market_data.bybit_derivatives import BybitDerivativesProvider
-from crypto_chatbot.market_data.ccxt_provider import CcxtMarketDataProvider
-from crypto_chatbot.market_data.derivatives_provider import CcxtDerivativesLiquidityProvider
+from crypto_chatbot.market_data.fallback_provider import build_futures_providers
 from crypto_chatbot.market_data.macro_provider import DxyMarketDataProvider
 from crypto_chatbot.memory.service import MemoryService
 from crypto_chatbot.storage.database import create_db_engine, init_db
@@ -73,9 +72,10 @@ def build_telegram_application(
     tradingview_repo = PostgresTradingViewRepository(engine)
     news_repo = PostgresNewsRepository(engine)
     memory_repo = PostgresUserMemoryRepository(engine)
-    provider = CcxtMarketDataProvider(exchange_id=settings.futures_exchange)
-    derivatives_provider = CcxtDerivativesLiquidityProvider(exchange_id=settings.futures_exchange)
-    bybit_provider = BybitDerivativesProvider() if settings.futures_exchange == "binance" else None
+    provider, derivatives_provider = build_futures_providers(settings.futures_exchange_chain)
+    bybit_provider = (
+        BybitDerivativesProvider() if "binance" in settings.futures_exchange_chain else None
+    )
     dxy_provider = DxyMarketDataProvider()
     analysis_service = AnalysisService(
         provider=provider,

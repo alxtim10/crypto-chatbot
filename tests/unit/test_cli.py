@@ -263,3 +263,58 @@ def test_cli_ml_experiment_from_fixture(
     )
     assert rc_text == 0
     assert "ML Experiment" in capsys.readouterr().out
+
+
+def test_cli_backtest_and_pine_from_fixture(
+    isolated_cwd: Path,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    from crypto_chatbot.analysis.backtest import BacktestReport
+
+    rc_bt = cli.main(
+        [
+            "backtest",
+            "BTC",
+            "4h",
+            "--fixture",
+            str(FIXTURE_1000),
+            "--warmup",
+            "200",
+            "--json",
+        ]
+    )
+    assert rc_bt == 0
+    bt_report = BacktestReport.model_validate_json(capsys.readouterr().out)
+    assert bt_report.total_bars == 1000
+    assert bt_report.evaluated_bars > 0
+
+    rc_bt_text = cli.main(
+        [
+            "backtest",
+            "BTC",
+            "4h",
+            "--fixture",
+            str(FIXTURE_1000),
+        ]
+    )
+    assert rc_bt_text == 0
+    assert "BACKTEST DETERMINISTIK" in capsys.readouterr().out
+
+    out_pine = tmp_path / "btc_4h.pine"
+    rc_pine = cli.main(
+        [
+            "pine",
+            "BTC",
+            "4h",
+            "--fixture",
+            str(FIXTURE_1000),
+            "--out",
+            str(out_pine),
+        ]
+    )
+    assert rc_pine == 0
+    assert "Pine Script written to" in capsys.readouterr().out
+    pine_content = out_pine.read_text(encoding="utf-8")
+    assert "//@version=6" in pine_content
+    assert "if barstate.islast" in pine_content

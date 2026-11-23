@@ -13,6 +13,7 @@ from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
+from crypto_chatbot.analysis.pine_export import generate_pine_script
 from crypto_chatbot.analysis.service import AnalysisService
 from crypto_chatbot.bot.access import AccessController
 from crypto_chatbot.bot.commands import (
@@ -40,7 +41,7 @@ from crypto_chatbot.memory.service import MemoryService
 from crypto_chatbot.ops.logging import SecretRedactingFilter as SecretRedactingFilter
 from crypto_chatbot.schemas.commands import WatchlistAction
 from crypto_chatbot.schemas.llm import AnalysisResponse
-from crypto_chatbot.schemas.market import Timeframe
+from crypto_chatbot.schemas.market import QualityStatus, Timeframe
 
 logger = logging.getLogger(__name__)
 
@@ -174,6 +175,51 @@ class BotService:
                 "request_id=%s user_id=%s action=compare db_error", request_id, user_id
             )
             return ("Gagal mengakses database. Perbandingan tidak dapat diselesaikan saat ini.",)
+
+    async def handle_pine(
+        self,
+        user_id: int | None,
+        args: Sequence[str],
+    ) -> tuple[str, ...]:
+        request_id = f"req-{uuid.uuid4().hex[:12]}"
+        denied = self._authorize(user_id, request_id, "pine")
+        if denied is not None or user_id is None:
+            return denied or _deny_chunks("not_allowlisted")
+
+        try:
+            default_tf = self._safe_default_timeframe(user_id)
+            parsed = parse_analyze_args(args, default_timeframe=default_tf)
+            snapshot = await self._analysis_service.analyze(parsed.symbol, parsed.timeframe)
+        except CommandParseError as exc:
+            return split_telegram_message(
+                html.escape(str(exc), quote=False),
+                TELEGRAM_MAX_MESSAGE_LENGTH,
+            )
+        except SQLAlchemyError:
+            logger.exception("request_id=%s user_id=%s action=pine db_error", request_id, user_id)
+            return ("Gagal mengakses database. Script Pine tidak dapat dibuat saat ini.",)
+
+        if snapshot.quality_status is QualityStatus.INSUFFICIENT_DATA:
+            return (
+                f"Data tidak mencukupi (INSUFFICIENT_DATA) untuk membuat Pine Script "
+                f"{html.escape(snapshot.canonical_symbol)} ({snapshot.timeframe.value}).",
+            )
+
+        pine_code = generate_pine_script(snapshot)
+        header = (
+            f"<b>TradingView Pine Script v6 — {html.escape(snapshot.canonical_symbol)} "
+            f"({snapshot.timeframe.value})</b>\n"
+            "Salin kode berikut ke TradingView Pine Editor → Add to chart:"
+        )
+        msg = f"{header}\n<pre>{html.escape(pine_code, quote=False)}</pre>"
+        if len(msg) <= TELEGRAM_MAX_MESSAGE_LENGTH:
+            return (msg,)
+
+        code_chunks = split_telegram_message(pine_code, TELEGRAM_MAX_MESSAGE_LENGTH - 64)
+        chunks = [f"{header}\n<pre>{html.escape(code_chunks[0], quote=False)}</pre>"]
+        for extra in code_chunks[1:]:
+            chunks.append(f"<pre>{html.escape(extra, quote=False)}</pre>")
+        return tuple(chunks)
 
     async def handle_watchlist(
         self,
@@ -428,6 +474,10 @@ def register_handlers(
         uid = update.effective_user.id if update.effective_user else None
         await _reply_chunks(update, await bot_service.handle_compare(uid, context.args or []))
 
+    async def pine_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        uid = update.effective_user.id if update.effective_user else None
+        await _reply_chunks(update, await bot_service.handle_pine(uid, context.args or []))
+
     async def watchlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         uid = update.effective_user.id if update.effective_user else None
         await _reply_chunks(update, await bot_service.handle_watchlist(uid, context.args or []))
@@ -481,6 +531,7 @@ def register_handlers(
     application.add_handler(CommandHandler("help", help_cmd))
     application.add_handler(CommandHandler("analyze", analyze_cmd))
     application.add_handler(CommandHandler("compare", compare_cmd))
+    application.add_handler(CommandHandler("pine", pine_cmd))
     application.add_handler(CommandHandler("watchlist", watchlist_cmd))
     application.add_handler(CommandHandler("memory", memory_cmd))
     application.add_handler(CommandHandler("forget", forget_cmd))
