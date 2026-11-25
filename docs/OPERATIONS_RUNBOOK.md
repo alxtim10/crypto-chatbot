@@ -48,13 +48,17 @@ This runbook documents personal operations for running the crypto research chatb
 
 ---
 
-## 4. Container Deployment
+## 4. Local Deployment & Execution
 
-Run locally or on a private server via Docker Compose:
+Run directly using Python virtual environment (`.venv`):
 
 ```bash
-docker compose up -d
-docker compose logs -f bot
-```
+# 1. Health check & configuration
+.venv/bin/crypto-chatbot health-check
 
-The container runs as a non-root user (`appuser`), with a read-only root filesystem, `no-new-privileges: true`, and an automated `HEALTHCHECK` running `crypto-chatbot health-check`.
+# 2. Run bot in foreground
+.venv/bin/crypto-chatbot run-bot
+
+# Or run in background (daemon / nohup)
+nohup .venv/bin/crypto-chatbot run-bot > bot.log 2>&1 &
+```
