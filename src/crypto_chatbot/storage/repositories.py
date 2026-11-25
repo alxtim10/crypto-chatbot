@@ -41,6 +41,7 @@ from crypto_chatbot.schemas.tradingview import (
     TradingViewEventType,
     TradingViewPacket,
 )
+from crypto_chatbot.schemas.whale import NetworkType, WhaleWatchlistEntry
 from crypto_chatbot.storage.models import (
     AnalysisSnapshotRow,
     ConversationRow,
@@ -59,6 +60,7 @@ from crypto_chatbot.storage.models import (
     TradingViewPacketRow,
     UserPreferenceRow,
     UserRow,
+    WhaleWatchlistRow,
 )
 
 
@@ -143,6 +145,7 @@ class TradeSetupRecord(BaseModel):
     snapshot_id: str
     venue: str
     canonical_symbol: str
+    market_type: str | None = None
     timeframe: Timeframe
     as_of: UtcDatetime
     status: str
@@ -532,6 +535,74 @@ class PostgresUserMemoryRepository:
                 )
             )
             session.execute(stmt)
+
+    def update_watchlist(
+        self,
+        telegram_user_id: int,
+        symbol: str,
+        *,
+        action: Literal["add", "remove"],
+    ) -> tuple[UserPreferences, bool]:
+        """Atomically add or remove a watchlist symbol under a row lock (`FOR UPDATE`)."""
+        now = datetime.now(UTC)
+        with Session(self._engine) as session, session.begin():
+            self._ensure_user_in_session(session, telegram_user_id)
+            row = session.scalar(
+                select(UserPreferenceRow)
+                .where(UserPreferenceRow.telegram_user_id == telegram_user_id)
+                .with_for_update()
+            )
+            if row is None:
+                defaults = UserPreferences()
+                watchlist = list(defaults.watchlist)
+                if action == "add":
+                    if symbol in watchlist:
+                        return defaults, False
+                    watchlist.append(symbol)
+                    changed = True
+                else:
+                    if symbol not in watchlist:
+                        return defaults, False
+                    watchlist = [s for s in watchlist if s != symbol]
+                    changed = True
+                session.add(
+                    UserPreferenceRow(
+                        telegram_user_id=telegram_user_id,
+                        watchlist=watchlist,
+                        language=defaults.language,
+                        default_timeframe=defaults.default_timeframe.value,
+                        display_currency=defaults.display_currency,
+                        updated_at=now,
+                    )
+                )
+                return defaults.model_copy(update={"watchlist": tuple(watchlist)}), changed
+
+            watchlist = list(row.watchlist)
+            if action == "add":
+                if symbol in watchlist:
+                    changed = False
+                else:
+                    watchlist.append(symbol)
+                    row.watchlist = watchlist
+                    row.updated_at = now
+                    changed = True
+            else:
+                if symbol not in watchlist:
+                    changed = False
+                else:
+                    watchlist = [s for s in watchlist if s != symbol]
+                    row.watchlist = watchlist
+                    row.updated_at = now
+                    changed = True
+            return (
+                UserPreferences(
+                    watchlist=tuple(watchlist),
+                    language=row.language,
+                    default_timeframe=Timeframe(row.default_timeframe),
+                    display_currency=row.display_currency,
+                ),
+                changed,
+            )
 
     def append_message(
         self,
@@ -1087,6 +1158,7 @@ def _row_to_setup_record(row: TradeSetupRow) -> TradeSetupRecord:
         snapshot_id=row.snapshot_id,
         venue=row.venue,
         canonical_symbol=row.canonical_symbol,
+        market_type=getattr(row, "market_type", None),
         timeframe=Timeframe(row.timeframe),
         as_of=_to_utc(row.as_of),
         status=row.status,
@@ -1127,6 +1199,7 @@ class PostgresSetupLogRepository:
             "snapshot_id": snapshot.snapshot_id,
             "venue": snapshot.venue,
             "canonical_symbol": snapshot.canonical_symbol,
+            "market_type": snapshot.market_type.value,
             "timeframe": snapshot.timeframe.value,
             "as_of": snapshot.as_of,
             "created_at": datetime.now(UTC),
@@ -1780,3 +1853,96 @@ class PostgresModelPredictionRepository:
         )
         with Session(self._engine) as session, session.begin():
             return bool(session.scalars(stmt).all())
+
+
+_EMPTY_WHALE_SENTINEL = "__EMPTY_WATCHLIST__"
+
+
+class PostgresWhaleWatchlistRepository:
+    """Synchronous PostgreSQL persistence for user whale watchlists (`whale_watchlists`)."""
+
+    def __init__(self, engine: Engine) -> None:
+        self._engine = engine
+
+    def get_user_entries(self, user_id: int) -> tuple[WhaleWatchlistEntry, ...] | None:
+        """Return saved entries for user_id, or None if the user has never customized defaults."""
+        stmt = (
+            select(WhaleWatchlistRow)
+            .where(WhaleWatchlistRow.telegram_user_id == user_id)
+            .order_by(WhaleWatchlistRow.id.asc())
+        )
+        with Session(self._engine) as session:
+            rows = list(session.scalars(stmt))
+        if not rows:
+            return None
+        return tuple(
+            WhaleWatchlistEntry(
+                address=row.address,
+                network=NetworkType(row.network),
+                label=row.label,
+                added_at=_to_utc(row.added_at),
+            )
+            for row in rows
+            if row.active and row.address != _EMPTY_WHALE_SENTINEL
+        )
+
+    def replace_user_entries(
+        self,
+        user_id: int,
+        entries: Sequence[WhaleWatchlistEntry],
+    ) -> None:
+        """Persist the full ordered watchlist snapshot for user_id atomically."""
+        now = datetime.now(UTC)
+        with Session(self._engine) as session, session.begin():
+            PostgresUserMemoryRepository._ensure_user_in_session(session, user_id)
+            session.execute(
+                update(WhaleWatchlistRow)
+                .where(WhaleWatchlistRow.telegram_user_id == user_id)
+                .values(active=False)
+            )
+            if not entries:
+                existing_count = len(
+                    session.scalars(
+                        select(WhaleWatchlistRow.id).where(
+                            WhaleWatchlistRow.telegram_user_id == user_id
+                        )
+                    ).all()
+                )
+                if existing_count == 0:
+                    sentinel = (
+                        insert(WhaleWatchlistRow)
+                        .values(
+                            telegram_user_id=user_id,
+                            address=_EMPTY_WHALE_SENTINEL,
+                            network=NetworkType.EVM.value,
+                            label="",
+                            added_at=now,
+                            active=False,
+                        )
+                        .on_conflict_do_nothing(index_elements=["telegram_user_id", "address"])
+                    )
+                    session.execute(sentinel)
+                return
+
+            for entry in entries:
+                stmt = (
+                    insert(WhaleWatchlistRow)
+                    .values(
+                        telegram_user_id=user_id,
+                        address=entry.address,
+                        network=entry.network.value,
+                        label=entry.label,
+                        added_at=_to_utc(entry.added_at),
+                        active=True,
+                    )
+                    .on_conflict_do_update(
+                        index_elements=["telegram_user_id", "address"],
+                        set_={
+                            "network": entry.network.value,
+                            "label": entry.label,
+                            "added_at": _to_utc(entry.added_at),
+                            "active": True,
+                        },
+                    )
+                )
+                session.execute(stmt)

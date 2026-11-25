@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import html
 import logging
+import math
 import uuid
 from collections.abc import Sequence
 from typing import Any, Literal
@@ -25,6 +27,13 @@ from crypto_chatbot.analysis.scanner import (
     scan_market_setups,
 )
 from crypto_chatbot.analysis.service import AnalysisService
+from crypto_chatbot.analysis.whale_tracker import (
+    WhaleWatchlistManager,
+    aggregate_whale_positions,
+    format_whale_overview_telegram,
+    format_whale_wallet_telegram,
+    format_whale_watchlist_telegram,
+)
 from crypto_chatbot.bot.access import AccessController
 from crypto_chatbot.bot.commands import (
     AnalyzeIntent,
@@ -35,10 +44,12 @@ from crypto_chatbot.bot.commands import (
     RefusalIntent,
     ScanIntent,
     ScreenIntent,
+    WhaleIntent,
     _extract_recent_context,
     parse_analyze_args,
     parse_compare_args,
     parse_watchlist_args,
+    parse_whale_args,
     resolve_followup_intent,
 )
 from crypto_chatbot.bot.templates import (
@@ -51,11 +62,13 @@ from crypto_chatbot.bot.templates import (
     split_telegram_message,
 )
 from crypto_chatbot.llm.gemini import GeminiNarrator
+from crypto_chatbot.llm.guard import validate_conversational_answer
 from crypto_chatbot.llm.render import render_analysis_response, render_comparison_response
 from crypto_chatbot.market_data.symbols import resolve_default_perp_symbol
+from crypto_chatbot.market_data.whale_provider import WhaleDataProvider
 from crypto_chatbot.memory.service import MemoryService
 from crypto_chatbot.ops.logging import SecretRedactingFilter as SecretRedactingFilter
-from crypto_chatbot.schemas.commands import WatchlistAction
+from crypto_chatbot.schemas.commands import WatchlistAction, WhaleAction
 from crypto_chatbot.schemas.llm import AnalysisResponse
 from crypto_chatbot.schemas.market import (
     MULTI_STYLE_SCAN_TIMEFRAMES,
@@ -64,6 +77,7 @@ from crypto_chatbot.schemas.market import (
     format_trading_style_short,
     resolve_primary_timeframe,
 )
+from crypto_chatbot.schemas.whale import NetworkType
 
 logger = logging.getLogger(__name__)
 
@@ -87,11 +101,15 @@ class BotService:
         analysis_service: AnalysisService,
         narrator: GeminiNarrator,
         memory: MemoryService,
+        whale_provider: WhaleDataProvider | None = None,
+        whale_watchlist: WhaleWatchlistManager | None = None,
     ) -> None:
         self._access = access
         self._analysis_service = analysis_service
         self._narrator = narrator
         self._memory = memory
+        self._whale_provider = whale_provider or WhaleDataProvider()
+        self._whale_watchlist = whale_watchlist or WhaleWatchlistManager()
 
     def _authorize(
         self, user_id: int | None, request_id: str, action: str
@@ -108,8 +126,8 @@ class BotService:
             return _deny_chunks(decision.reason)
         return None
 
-    def _safe_default_timeframe(self, user_id: int) -> Timeframe:
-        prefs = self._memory.get_preferences(user_id)
+    async def _safe_default_timeframe(self, user_id: int) -> Timeframe:
+        prefs = await asyncio.to_thread(self._memory.get_preferences, user_id)
         return prefs.default_timeframe
 
     async def handle_start(self, user_id: int | None) -> tuple[str, ...]:
@@ -118,7 +136,7 @@ class BotService:
         if denied is not None or user_id is None:
             return denied or _deny_chunks("not_allowlisted")
         try:
-            self._memory.ensure_user(user_id)
+            await asyncio.to_thread(self._memory.ensure_user, user_id)
         except SQLAlchemyError:
             logger.exception("request_id=%s user_id=%s action=start db_error", request_id, user_id)
             return ("Layanan database sedang bermasalah. Coba beberapa saat lagi.",)
@@ -144,7 +162,7 @@ class BotService:
             return denied or _deny_chunks("not_allowlisted")
 
         try:
-            default_tf = self._safe_default_timeframe(user_id)
+            default_tf = await self._safe_default_timeframe(user_id)
             parsed = parse_analyze_args(args, default_timeframe=default_tf)
             user_text = "/analyze " + " ".join(args)
             return await self._execute_single_analysis(
@@ -177,7 +195,7 @@ class BotService:
             return denied or _deny_chunks("not_allowlisted")
 
         try:
-            default_tf = self._safe_default_timeframe(user_id)
+            default_tf = await self._safe_default_timeframe(user_id)
             parsed = parse_compare_args(args, default_timeframe=default_tf)
             user_text = "/compare " + " ".join(args)
             return await self._execute_comparison(
@@ -209,7 +227,7 @@ class BotService:
             return denied or _deny_chunks("not_allowlisted")
 
         try:
-            default_tf = self._safe_default_timeframe(user_id)
+            default_tf = await self._safe_default_timeframe(user_id)
             parsed = parse_analyze_args(args, default_timeframe=default_tf)
             return await self._execute_pine(
                 symbol=parsed.symbol,
@@ -235,7 +253,7 @@ class BotService:
             return denied or _deny_chunks("not_allowlisted")
 
         try:
-            prefs = self._memory.get_preferences(user_id)
+            prefs = await asyncio.to_thread(self._memory.get_preferences, user_id)
             timeframe = prefs.default_timeframe
             explicit_tf_provided = False
             explicit_symbols: list[str] = []
@@ -305,8 +323,8 @@ class BotService:
                         "Gunakan: /screen [long|short|all] [min_volume_juta_usd] "
                         "(contoh: /screen long 10)",
                     )
-                if val <= 0:
-                    return ("Minimum volume harus lebih besar dari 0.",)
+                if not math.isfinite(val) or val <= 0:
+                    return ("Minimum volume harus berupa angka valid lebih besar dari 0.",)
                 min_vol_usd = val * 1_000_000.0 if val < 10_000.0 else val
 
         try:
@@ -338,12 +356,13 @@ class BotService:
             min_volume_usd=min_volume_usd,
         )
         rendered = render_momentum_screener_report(report, html_mode=True)
-        self._memory.record_user_message(user_id, user_text)
+        await asyncio.to_thread(self._memory.record_user_message, user_id, user_text)
         ready_syms = (
             ", ".join(s.symbol for s in (*report.long_signals, *report.short_signals))
             or "tidak ada"
         )
-        self._memory.record_assistant_text(
+        await asyncio.to_thread(
+            self._memory.record_assistant_text,
             user_id,
             f"[SCREEN 15m] Sisi={side}; READY: {ready_syms}.",
         )
@@ -409,7 +428,7 @@ class BotService:
             timeframes=timeframes,
         )
         rendered = render_market_scan_report(report, html_mode=True)
-        self._memory.record_user_message(user_id, user_text)
+        await asyncio.to_thread(self._memory.record_user_message, user_id, user_text)
         ready_syms = (
             ", ".join(
                 f"{item.symbol} [{format_trading_style_short(item.timeframe)}]"
@@ -417,7 +436,8 @@ class BotService:
             )
             or "tidak ada"
         )
-        self._memory.record_assistant_text(
+        await asyncio.to_thread(
+            self._memory.record_assistant_text,
             user_id,
             f"[SCAN {timeframe.value}] Dipindai {report.scanned_count} koin; "
             f"READY ({len(report.ready_setups)}): {ready_syms}.",
@@ -446,23 +466,27 @@ class BotService:
             parsed = parse_watchlist_args(args)
             note: str | None = None
             if parsed.action is WatchlistAction.LIST:
-                prefs = self._memory.get_preferences(user_id)
+                prefs = await asyncio.to_thread(self._memory.get_preferences, user_id)
             elif parsed.action is WatchlistAction.ADD and parsed.symbol is not None:
-                prefs, added = self._memory.add_to_watchlist(user_id, parsed.symbol)
+                prefs, added = await asyncio.to_thread(
+                    self._memory.add_to_watchlist, user_id, parsed.symbol
+                )
                 note = (
                     f"{parsed.symbol} ditambahkan ke daftar pantau."
                     if added
                     else f"{parsed.symbol} sudah ada di daftar pantau."
                 )
             elif parsed.symbol is not None:
-                prefs, removed = self._memory.remove_from_watchlist(user_id, parsed.symbol)
+                prefs, removed = await asyncio.to_thread(
+                    self._memory.remove_from_watchlist, user_id, parsed.symbol
+                )
                 note = (
                     f"{parsed.symbol} dihapus dari daftar pantau."
                     if removed
                     else f"{parsed.symbol} tidak ditemukan di daftar pantau."
                 )
             else:
-                prefs = self._memory.get_preferences(user_id)
+                prefs = await asyncio.to_thread(self._memory.get_preferences, user_id)
             rendered = render_watchlist_message(prefs.watchlist, note=note, html_mode=True)
             return split_telegram_message(rendered, TELEGRAM_MAX_MESSAGE_LENGTH)
         except CommandParseError as exc:
@@ -476,6 +500,127 @@ class BotService:
             )
             return ("Gagal mengakses preferensi watchlist di database.",)
 
+    async def handle_whale(
+        self,
+        user_id: int | None,
+        args: Sequence[str],
+    ) -> tuple[str, ...]:
+        request_id = f"req-{uuid.uuid4().hex[:12]}"
+        denied = self._authorize(user_id, request_id, "whale")
+        if denied is not None or user_id is None:
+            return denied or _deny_chunks("not_allowlisted")
+
+        try:
+            parsed = parse_whale_args(args)
+            intent = WhaleIntent(
+                action=parsed.action,
+                symbol=parsed.symbol,
+                address=parsed.address,
+                label=parsed.label,
+            )
+            return await self._execute_whale(
+                user_id=user_id,
+                request_id=request_id,
+                intent=intent,
+            )
+        except CommandParseError as exc:
+            return split_telegram_message(
+                html.escape(str(exc), quote=False),
+                TELEGRAM_MAX_MESSAGE_LENGTH,
+            )
+
+    async def _execute_whale(
+        self,
+        *,
+        user_id: int | None,
+        request_id: str,
+        intent: WhaleIntent,
+    ) -> tuple[str, ...]:
+        if intent.action == WhaleAction.LIST:
+            entries = await asyncio.to_thread(self._whale_watchlist.list_entries, user_id)
+            rendered = format_whale_watchlist_telegram(entries, html_mode=True)
+            return split_telegram_message(rendered, TELEGRAM_MAX_MESSAGE_LENGTH)
+
+        if intent.action == WhaleAction.ADD:
+            if not intent.address:
+                return ("Format salah: alamat dompet diperlukan.",)
+            try:
+                entry = await asyncio.to_thread(
+                    self._whale_watchlist.add_entry,
+                    intent.address,
+                    intent.label or "Whale",
+                    user_id=user_id,
+                )
+                safe_addr = html.escape(entry.address, quote=False)
+                safe_label = html.escape(entry.label, quote=False)
+                msg = (
+                    f"✅ Alamat <code>{safe_addr}</code> berhasil ditambahkan ke watchlist whale "
+                    f"dengan label <b>{safe_label}</b>."
+                )
+                return (msg,)
+            except ValueError as exc:
+                return (f"❌ {html.escape(str(exc), quote=False)}",)
+
+        if intent.action == WhaleAction.REMOVE:
+            if not intent.address:
+                return ("Format salah: alamat dompet diperlukan.",)
+            removed = await asyncio.to_thread(
+                self._whale_watchlist.remove_entry, intent.address, user_id=user_id
+            )
+            safe_addr = html.escape(intent.address.strip(), quote=False)
+            if removed:
+                return (
+                    f"✅ Alamat <code>{safe_addr}</code> berhasil dihapus dari watchlist whale.",
+                )
+            return (f"[Info] Alamat <code>{safe_addr}</code> tidak ditemukan di watchlist.",)
+
+        if intent.action == WhaleAction.WALLET:
+            if not intent.address:
+                return ("Alamat wallet diperlukan.",)
+            try:
+                profile = await self._whale_provider.get_wallet_profile(intent.address)
+            except Exception as exc:
+                logger.warning(
+                    "request_id=%s user_id=%s action=whale_wallet provider_error=%s",
+                    request_id,
+                    user_id,
+                    exc,
+                )
+                return (
+                    "Maaf, data dompet whale dari provider eksternal sedang tidak dapat diakses "
+                    "saat ini. Coba lagi beberapa saat.",
+                )
+            rendered = format_whale_wallet_telegram(profile, html_mode=True)
+            return split_telegram_message(rendered, TELEGRAM_MAX_MESSAGE_LENGTH)
+
+        symbol = intent.symbol or "BTC"
+        clean_sym = symbol.upper()
+        if "/" in clean_sym:
+            clean_sym = clean_sym.split("/")[0]
+        elif clean_sym.endswith("USDT") and len(clean_sym) > 4:
+            clean_sym = clean_sym[:-4]
+
+        tracked_entries = await asyncio.to_thread(self._whale_watchlist.list_entries, user_id)
+        targets = [(e.address, e.label) for e in tracked_entries if e.network == NetworkType.EVM]
+        try:
+            positions = await self._whale_provider.get_positions_for_symbol(
+                clean_sym, wallets=targets
+            )
+        except Exception as exc:
+            logger.warning(
+                "request_id=%s user_id=%s action=whale_overview provider_error=%s",
+                request_id,
+                user_id,
+                exc,
+            )
+            return (
+                "Maaf, data posisi whale dari provider eksternal sedang tidak dapat diakses "
+                "saat ini. Coba lagi beberapa saat.",
+            )
+        overview = aggregate_whale_positions(clean_sym, positions)
+        rendered = format_whale_overview_telegram(overview, html_mode=True)
+        return split_telegram_message(rendered, TELEGRAM_MAX_MESSAGE_LENGTH)
+
     async def handle_memory(self, user_id: int | None) -> tuple[str, ...]:
         request_id = f"req-{uuid.uuid4().hex[:12]}"
         denied = self._authorize(user_id, request_id, "memory")
@@ -483,8 +628,8 @@ class BotService:
             return denied or _deny_chunks("not_allowlisted")
 
         try:
-            prefs = self._memory.get_preferences(user_id)
-            recent = self._memory.get_recent_messages(user_id)
+            prefs = await asyncio.to_thread(self._memory.get_preferences, user_id)
+            recent = await asyncio.to_thread(self._memory.get_recent_messages, user_id)
             logger.info("request_id=%s user_id=%s action=memory", request_id, user_id)
             return split_telegram_message(
                 render_memory_message(prefs, recent, html_mode=True),
@@ -501,7 +646,7 @@ class BotService:
             return denied or _deny_chunks("not_allowlisted")
 
         try:
-            result = self._memory.forget_user(user_id)
+            result = await asyncio.to_thread(self._memory.forget_user, user_id)
             logger.info("request_id=%s user_id=%s action=forget completed", request_id, user_id)
             return split_telegram_message(
                 render_forget_message(result, html_mode=True),
@@ -538,8 +683,8 @@ class BotService:
             return denied or _deny_chunks("not_allowlisted")
 
         try:
-            prefs = self._memory.get_preferences(user_id)
-            recent = self._memory.get_recent_messages(user_id)
+            prefs = await asyncio.to_thread(self._memory.get_preferences, user_id)
+            recent = await asyncio.to_thread(self._memory.get_recent_messages, user_id)
             intent = resolve_followup_intent(
                 text,
                 recent_messages=recent,
@@ -556,14 +701,23 @@ class BotService:
 
             if isinstance(intent, RefusalIntent):
                 return (html.escape(intent.message, quote=False),)
-            if isinstance(intent, ScreenIntent):
-                return await self._execute_screen(
+            if isinstance(intent, WhaleIntent):
+                return await self._execute_whale(
                     user_id=user_id,
                     request_id=request_id,
-                    side=intent.side,
-                    min_volume_usd=intent.min_volume_usd,
-                    user_text=text,
+                    intent=intent,
                 )
+            if isinstance(intent, ScreenIntent):
+                try:
+                    return await self._execute_screen(
+                        user_id=user_id,
+                        request_id=request_id,
+                        side=intent.side,
+                        min_volume_usd=intent.min_volume_usd,
+                        user_text=text,
+                    )
+                except ValueError as exc:
+                    return (html.escape(str(exc), quote=False),)
             if isinstance(intent, ScanIntent):
                 return await self._execute_scan(
                     user_id=user_id,
@@ -623,6 +777,7 @@ class BotService:
         | PineIntent
         | ScanIntent
         | ScreenIntent
+        | WhaleIntent
         | ChatQaIntent
         | RefusalIntent
     ):
@@ -632,8 +787,28 @@ class BotService:
             user_id=user_id,
             recent_symbols=recent_syms,
         )
-        if classified is None or classified.intent == "unsupported":
-            return fallback_refusal
+        if classified is None:
+            return ChatQaIntent(question=text.strip())
+        if classified.intent == "unsupported":
+            return RefusalIntent(
+                message=(
+                    "Bot ini adalah asisten riset dan edukasi kripto. Eksekusi order langsung, "
+                    "perintah beli/jual wajib, jaminan profit, atau alokasi modal pribadi "
+                    "berada di luar cakupan layanan."
+                ),
+                is_hard_refusal=True,
+            )
+
+        if classified.intent == "whale":
+            w_addr = classified.whale_address
+            if not w_addr and classified.symbols:
+                return WhaleIntent(action=WhaleAction.OVERVIEW, symbol=classified.symbols[0])
+            if w_addr:
+                return WhaleIntent(action=WhaleAction.WALLET, address=w_addr)
+            return WhaleIntent(
+                action=WhaleAction(classified.whale_action or "overview"),
+                symbol=classified.symbols[0] if classified.symbols else "BTC",
+            )
 
         if classified.intent == "screen":
             return ScreenIntent(side=classified.screen_side or "all")
@@ -666,7 +841,7 @@ class BotService:
             tf = target_tf if classified.timeframe is not None or resolved_syms else recent_tf
             if target_sym is not None:
                 return PineIntent(symbol=target_sym, timeframe=tf)
-            return fallback_refusal
+            return ChatQaIntent(question=text.strip())
         if classified.intent == "compare":
             if len(resolved_syms) >= 2:
                 return CompareIntent(symbols=tuple(resolved_syms[:3]), timeframe=target_tf)
@@ -674,7 +849,7 @@ class BotService:
                 prior = next((s for s in recent_syms if s != resolved_syms[0]), None)
                 if prior is not None:
                     return CompareIntent(symbols=(prior, resolved_syms[0]), timeframe=target_tf)
-            return fallback_refusal
+            return ChatQaIntent(question=text.strip())
         if classified.intent in ("analyze", "analyze_detail"):
             is_detail = classified.intent == "analyze_detail"
             if resolved_syms:
@@ -682,10 +857,8 @@ class BotService:
             if recent_syms:
                 tf = target_tf if classified.timeframe is not None else recent_tf
                 return AnalyzeIntent(symbol=recent_syms[0], timeframe=tf, detail=is_detail)
-            return fallback_refusal
-        if classified.intent == "chat_qa":
             return ChatQaIntent(question=text.strip())
-        return fallback_refusal
+        return ChatQaIntent(question=text.strip())
 
     async def _execute_chat_qa(
         self,
@@ -694,7 +867,9 @@ class BotService:
         request_id: str,
         question: str,
     ) -> tuple[str, ...]:
-        context = self._memory.build_context_for_llm(user_id, current_question=question)
+        context = await asyncio.to_thread(
+            self._memory.build_context_for_llm, user_id, current_question=question
+        )
         answer = await self._narrator.answer_research_question(
             question,
             user_id=user_id,
@@ -705,8 +880,21 @@ class BotService:
                 "Maaf, layanan diskusi AI sedang mencapai batas kuota atau sibuk saat ini. "
                 "Anda tetap bisa menyebut nama koin (mis. 'analisa BTC') atau /scan.",
             )
-        self._memory.record_user_message(user_id, question)
-        self._memory.record_assistant_text(user_id, answer)
+        guard = validate_conversational_answer(answer)
+        if not guard.is_valid:
+            logger.warning(
+                "request_id=%s user_id=%s action=chat_qa guard_rejected=%s",
+                request_id,
+                user_id,
+                ",".join(guard.reasons),
+            )
+            return (
+                "Maaf, jawaban tidak lolos filter keamanan riset (mengandung klaim kepastian, "
+                "instruksi eksekusi langsung, atau tautan terlarang). Silakan ajukan pertanyaan "
+                "edukasi lain atau gunakan /analyze BTC.",
+            )
+        await asyncio.to_thread(self._memory.record_user_message, user_id, question)
+        await asyncio.to_thread(self._memory.record_assistant_text, user_id, answer)
         logger.info("request_id=%s user_id=%s action=chat_qa", request_id, user_id)
         return split_telegram_message(
             html.escape(answer, quote=False),
@@ -723,20 +911,28 @@ class BotService:
         user_text: str,
         compact: bool = True,
     ) -> tuple[str, ...]:
-        context = self._memory.build_context_for_llm(user_id, current_question=user_text)
+        context = await asyncio.to_thread(
+            self._memory.build_context_for_llm, user_id, current_question=user_text
+        )
         snapshot = await self._analysis_service.analyze(symbol, timeframe)
         outcome = await self._narrator.narrate_snapshot(
             snapshot,
             user_id=user_id,
             user_context=context,
         )
-        self._memory.record_user_message(user_id, user_text)
-        self._memory.record_assistant_turn(
+        await asyncio.to_thread(self._memory.record_user_message, user_id, user_text)
+        await asyncio.to_thread(
+            self._memory.record_assistant_turn,
             user_id,
             snapshot=snapshot,
             narration=outcome.response.narration,
         )
-        self._memory.record_llm_outcome(user_id=user_id, request_id=request_id, outcome=outcome)
+        await asyncio.to_thread(
+            self._memory.record_llm_outcome,
+            user_id=user_id,
+            request_id=request_id,
+            outcome=outcome,
+        )
         logger.info(
             "request_id=%s user_id=%s action=analyze snapshot_id=%s quality=%s narration=%s",
             request_id,
@@ -757,7 +953,9 @@ class BotService:
         timeframe: Timeframe,
         user_text: str,
     ) -> tuple[str, ...]:
-        context = self._memory.build_context_for_llm(user_id, current_question=user_text)
+        context = await asyncio.to_thread(
+            self._memory.build_context_for_llm, user_id, current_question=user_text
+        )
         responses: list[AnalysisResponse] = []
         snapshots = []
         narrations = []
@@ -768,7 +966,12 @@ class BotService:
                 user_id=user_id,
                 user_context=context,
             )
-            self._memory.record_llm_outcome(user_id=user_id, request_id=request_id, outcome=outcome)
+            await asyncio.to_thread(
+                self._memory.record_llm_outcome,
+                user_id=user_id,
+                request_id=request_id,
+                outcome=outcome,
+            )
             logger.info(
                 "request_id=%s user_id=%s action=compare snapshot_id=%s quality=%s narration=%s",
                 request_id,
@@ -781,8 +984,9 @@ class BotService:
             snapshots.append(snap)
             narrations.append(outcome.response.narration)
 
-        self._memory.record_user_message(user_id, user_text)
-        self._memory.record_comparison_turn(
+        await asyncio.to_thread(self._memory.record_user_message, user_id, user_text)
+        await asyncio.to_thread(
+            self._memory.record_comparison_turn,
             user_id,
             snapshots=snapshots,
             narrations=narrations,
@@ -838,6 +1042,10 @@ def register_handlers(
     async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         uid = update.effective_user.id if update.effective_user else None
         await _reply_chunks(update, await bot_service.handle_screen(uid, context.args or []))
+
+    async def whale_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        uid = update.effective_user.id if update.effective_user else None
+        await _reply_chunks(update, await bot_service.handle_whale(uid, context.args or []))
 
     async def watchlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         uid = update.effective_user.id if update.effective_user else None
@@ -895,6 +1103,7 @@ def register_handlers(
     application.add_handler(CommandHandler("pine", pine_cmd))
     application.add_handler(CommandHandler("scan", scan_cmd))
     application.add_handler(CommandHandler("screen", screen_cmd))
+    application.add_handler(CommandHandler("whale", whale_cmd))
     application.add_handler(CommandHandler("watchlist", watchlist_cmd))
     application.add_handler(CommandHandler("memory", memory_cmd))
     application.add_handler(CommandHandler("forget", forget_cmd))

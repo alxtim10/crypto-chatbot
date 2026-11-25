@@ -11,7 +11,7 @@ import logging
 import math
 import ssl
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -518,7 +518,16 @@ class TradingViewWebhookProcessor:
         self._clock: Callable[[], datetime] = clock or (lambda: datetime.now(UTC))
         self._monotonic: Callable[[], float] = monotonic_clock or time.monotonic
         self._ip_windows: dict[str, deque[float]] = {}
-        self._seen_keys: set[str] = set()
+        self._seen_keys: OrderedDict[str, None] = OrderedDict()
+        self._max_seen_keys = 10_000
+
+    def _remember_key(self, key: str) -> None:
+        if key in self._seen_keys:
+            self._seen_keys.move_to_end(key)
+            return
+        self._seen_keys[key] = None
+        if len(self._seen_keys) > self._max_seen_keys:
+            self._seen_keys.popitem(last=False)
 
     def _is_ip_allowed(self, source_ip: str) -> bool:
         addr = _normalize_ip(source_ip)
@@ -529,6 +538,10 @@ class TradingViewWebhookProcessor:
     def _check_rate_limit(self, source_ip: str) -> bool:
         now = self._monotonic()
         cutoff = now - 60.0
+        if len(self._ip_windows) > 1024:
+            stale_ips = [ip for ip, b in self._ip_windows.items() if not b or b[-1] <= cutoff]
+            for ip in stale_ips:
+                self._ip_windows.pop(ip, None)
         bucket = self._ip_windows.setdefault(source_ip, deque())
         while bucket and bucket[0] <= cutoff:
             bucket.popleft()
@@ -570,17 +583,23 @@ class TradingViewWebhookProcessor:
 
         if query_string:
             qs_params = parse_qs(query_string, keep_blank_values=True)
-            for key in qs_params:
-                if key.strip().lower() in FORBIDDEN_SECRET_PAYLOAD_KEYS:
-                    logger.warning(
-                        "Rejected TradingView webhook with query secret ?%s",
-                        query_string,
-                    )
-                    return WebhookResult(
-                        status_code=400,
-                        accepted=False,
-                        reason="query_secret_not_allowed",
-                    )
+            bad_keys = sorted(
+                {
+                    key.strip().lower()
+                    for key in qs_params
+                    if key.strip().lower() in FORBIDDEN_SECRET_PAYLOAD_KEYS
+                }
+            )
+            if bad_keys:
+                logger.warning(
+                    "Rejected TradingView webhook with forbidden query key(s): %s",
+                    ",".join(bad_keys),
+                )
+                return WebhookResult(
+                    status_code=400,
+                    accepted=False,
+                    reason="query_secret_not_allowed",
+                )
 
         try:
             decoded = raw_body.decode("utf-8")
@@ -650,7 +669,7 @@ class TradingViewWebhookProcessor:
         if self._repository is not None:
             inserted = self._repository.save_packet(packet)
             if not inserted:
-                self._seen_keys.add(packet.idempotency_key)
+                self._remember_key(packet.idempotency_key)
                 return WebhookResult(
                     status_code=200,
                     accepted=True,
@@ -659,7 +678,7 @@ class TradingViewWebhookProcessor:
                     reason="duplicate_ignored",
                 )
 
-        self._seen_keys.add(packet.idempotency_key)
+        self._remember_key(packet.idempotency_key)
         return WebhookResult(
             status_code=200,
             accepted=True,

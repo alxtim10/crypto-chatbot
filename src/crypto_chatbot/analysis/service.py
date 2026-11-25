@@ -6,6 +6,8 @@ import asyncio
 import hashlib
 import itertools
 import json
+import time
+from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -1127,7 +1129,8 @@ def _build_limitations(
             "tidak disajikan sebagai kondisi terkini."
         )
     notes.append(
-        f"Sumber data terbatas pada spot {batch.metadata.venue} untuk {batch.canonical_symbol}."
+        f"Sumber data terbatas pada {batch.metadata.market_type.value} {batch.metadata.venue} "
+        f"untuk {batch.canonical_symbol}."
     )
     notes.append(
         "Output indikator dan daftar faktor adalah pengukuran deskriptif, bukan probabilitas "
@@ -1591,6 +1594,8 @@ class AnalysisService:
         shadow_engine: ShadowInferenceEngine | None = None,
         prediction_repository: ModelPredictionRepository | None = None,
         dxy_provider: DxyMarketDataProvider | None = None,
+        cache_ttl_seconds: float = 0.0,
+        cache_max_entries: int = 256,
     ) -> None:
         self._provider = provider
         self._repository = repository
@@ -1603,6 +1608,35 @@ class AnalysisService:
         self._shadow_engine = shadow_engine
         self._prediction_repository = prediction_repository
         self._dxy_provider = dxy_provider
+        self._cache_ttl_seconds = max(0.0, float(cache_ttl_seconds))
+        self._cache_max_entries = max(1, int(cache_max_entries))
+        self._ohlcv_cache: OrderedDict[tuple[str, Timeframe, int], tuple[float, OhlcvBatch]] = (
+            OrderedDict()
+        )
+
+    async def _fetch_closed_ohlcv(
+        self,
+        symbol: str,
+        timeframe: Timeframe,
+        limit: int,
+    ) -> OhlcvBatch:
+        key = (symbol, timeframe, limit)
+        if self._cache_ttl_seconds > 0.0:
+            cached = self._ohlcv_cache.get(key)
+            if cached is not None:
+                ts, cached_batch = cached
+                if (time.monotonic() - ts) < self._cache_ttl_seconds:
+                    self._ohlcv_cache.move_to_end(key)
+                    return cached_batch
+                self._ohlcv_cache.pop(key, None)
+
+        batch = await self._provider.get_closed_ohlcv(symbol, timeframe, limit=limit)
+        if self._cache_ttl_seconds > 0.0 and not batch.has_provider_error and batch.candles:
+            self._ohlcv_cache[key] = (time.monotonic(), batch)
+            self._ohlcv_cache.move_to_end(key)
+            if len(self._ohlcv_cache) > self._cache_max_entries:
+                self._ohlcv_cache.popitem(last=False)
+        return batch
 
     async def get_futures_tickers(self) -> FuturesTickerBatch:
         """Fetch exchange-wide 24h futures tickers if the market provider supports it."""
@@ -1623,7 +1657,7 @@ class AnalysisService:
         limit: int = 100,
     ) -> OhlcvBatch:
         """Fetch normalized closed candles for one symbol/timeframe via active provider."""
-        return await self._provider.get_closed_ohlcv(symbol, timeframe, limit=limit)
+        return await self._fetch_closed_ohlcv(symbol, timeframe, limit)
 
     async def analyze_multi_style(
         self,
@@ -1654,10 +1688,10 @@ class AnalysisService:
 
         core_results = await asyncio.gather(
             *(
-                self._provider.get_closed_ohlcv(
+                self._fetch_closed_ohlcv(
                     mapping.canonical_symbol,
                     tf,
-                    limit=_fetch_limit(tf),
+                    _fetch_limit(tf),
                 )
                 for tf in core_tfs
             )
@@ -1721,7 +1755,7 @@ class AnalysisService:
 
             if self._bybit_provider is not None and include_derivatives:
                 try:
-                    bybit_funding = await self._bybit_provider.get_funding_rate(mapping.base)
+                    bybit_funding = await self._bybit_provider.get_funding_rate(effective_base)
                     bybit_context = (
                         DerivativesContext(funding=bybit_funding)
                         if bybit_funding.observation is not None
@@ -1754,10 +1788,10 @@ class AnalysisService:
         limit: int = 200,
     ) -> OhlcvBatch | None:
         try:
-            batch = await self._provider.get_closed_ohlcv(
+            batch = await self._fetch_closed_ohlcv(
                 canonical_symbol,
                 tf,
-                limit=limit,
+                limit,
             )
         except KeyError:
             return None
@@ -1777,10 +1811,10 @@ class AnalysisService:
     ) -> AnalysisSnapshot:
         """Fetch market data, build an `AnalysisSnapshot`, and optionally persist it."""
         mapping = resolve_default_perp_symbol(symbol)
-        primary = await self._provider.get_closed_ohlcv(
+        primary = await self._fetch_closed_ohlcv(
             mapping.canonical_symbol,
             timeframe,
-            limit=limit,
+            limit,
         )
 
         primary_ok = (
@@ -1846,7 +1880,7 @@ class AnalysisService:
         cross_venue: CrossVenueDerivativesSummary | None = None
         if self._bybit_provider is not None and include_derivatives and primary_ok:
             try:
-                bybit_funding = await self._bybit_provider.get_funding_rate(mapping.base)
+                bybit_funding = await self._bybit_provider.get_funding_rate(effective_base)
                 bybit_context = (
                     DerivativesContext(funding=bybit_funding)
                     if bybit_funding.observation is not None

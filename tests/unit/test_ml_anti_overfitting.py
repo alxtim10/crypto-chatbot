@@ -103,15 +103,19 @@ def _feature_rows(count: int) -> list[FeatureRow]:
 def test_generate_cpcv_paths_count_and_purge() -> None:
     rows = _feature_rows(60)
     paths = generate_cpcv_paths(rows, n_groups=6, test_groups_per_path=2, embargo_bars=3)
-    # C(6, 2) = 15 combinations; some may be dropped if purge empties training, but most remain.
-    assert len(paths) >= 10
+    # C(6, 2) = 15 combinations should all succeed with bidirectional purging (including group 0).
+    assert len(paths) == 15
     for path in paths:
         train_set = set(path.train_indices)
         test_set = set(path.test_indices)
         assert not (train_set & test_set)
-        min_test_time = min(rows[i].prediction_time for i in path.test_indices)
         for tr in path.train_indices:
-            assert rows[tr].label_end_time <= min_test_time
+            for te in path.test_indices:
+                overlaps = (
+                    rows[tr].prediction_time < rows[te].label_end_time
+                    and rows[tr].label_end_time > rows[te].prediction_time
+                )
+                assert not overlaps
 
 
 def test_generate_cpcv_paths_rejects_small_data() -> None:

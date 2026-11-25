@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
 import time
 from pathlib import Path
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -36,7 +38,30 @@ def _scrub_url(text: str, database_url: str) -> str:
     cleaned = text.replace(database_url, "[REDACTED_DATABASE_URL]")
     libpq = to_libpq_url(database_url)
     cleaned = cleaned.replace(libpq, "[REDACTED_DATABASE_URL]")
+    parsed = urlsplit(libpq)
+    if parsed.password:
+        cleaned = cleaned.replace(parsed.password, "[REDACTED]")
+        decoded = unquote(parsed.password)
+        if decoded:
+            cleaned = cleaned.replace(decoded, "[REDACTED]")
     return _URL_CREDS_RE.sub(r"\1[REDACTED]\3", cleaned)
+
+
+def _split_libpq_connection(libpq_url: str) -> tuple[list[str], dict[str, str]]:
+    """Build credential-free libpq flags and env dict carrying PGPASSWORD safely."""
+    parsed = urlsplit(libpq_url)
+    netloc = ""
+    if parsed.hostname:
+        host_part = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+        netloc = f"{host_part}:{parsed.port}" if parsed.port else host_part
+    safe_uri = urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, ""))
+    args = ["--dbname", safe_uri]
+    if parsed.username:
+        args.extend(["--username", unquote(parsed.username)])
+    env = os.environ.copy()
+    if parsed.password is not None:
+        env["PGPASSWORD"] = unquote(parsed.password)
+    return args, env
 
 
 def to_libpq_url(database_url: str) -> str:
@@ -66,6 +91,7 @@ def dump_postgres_database(
 ) -> BackupResult:
     """Create a custom-format PostgreSQL backup using `pg_dump` with `shell=False`."""
     libpq_url = to_libpq_url(database_url)
+    conn_args, conn_env = _split_libpq_connection(libpq_url)
     pg_dump_bin = _require_tool("pg_dump")
     resolved_output = Path(output_path)
     resolved_output.parent.mkdir(parents=True, exist_ok=True)
@@ -77,13 +103,13 @@ def dump_postgres_database(
         "--no-privileges",
         "--file",
         str(resolved_output),
-        "--dbname",
-        libpq_url,
+        *conn_args,
     ]
     t0 = time.monotonic()
     try:
         proc = subprocess.run(  # noqa: S603
             cmd,
+            env=conn_env,
             capture_output=True,
             text=True,
             timeout=timeout_seconds,
@@ -115,6 +141,7 @@ def restore_postgres_database(
     if not resolved_backup.is_file():
         raise BackupError(f"Backup file not found: {resolved_backup}")
     libpq_url = to_libpq_url(database_url)
+    conn_args, conn_env = _split_libpq_connection(libpq_url)
     pg_restore_bin = _require_tool("pg_restore")
 
     cmd = [
@@ -124,14 +151,14 @@ def restore_postgres_database(
         "--no-owner",
         "--no-privileges",
         "--exit-on-error",
-        "--dbname",
-        libpq_url,
+        *conn_args,
         str(resolved_backup),
     ]
     t0 = time.monotonic()
     try:
         proc = subprocess.run(  # noqa: S603
             cmd,
+            env=conn_env,
             capture_output=True,
             text=True,
             timeout=timeout_seconds,

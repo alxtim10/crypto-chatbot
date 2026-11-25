@@ -384,6 +384,21 @@ def test_fast_nlp_regex_routes_unified_mtf_scan_pine_and_preserves_refusals() ->
     assert isinstance(r_soft, RefusalIntent)
     assert r_soft.is_hard_refusal is False
 
+    # Casual Indonesian words after cues must NOT be misread as tickers
+    for casual_q in ("cek dulu dong", "entry kapan enaknya?"):
+        res_empty = resolve_followup_intent(casual_q, recent_messages=())
+        assert isinstance(res_empty, RefusalIntent)
+        assert res_empty.is_hard_refusal is False
+
+    for conceptual_q in (
+        "cek dulu dong",
+        "gimana cara atur psikologi pas loss?",
+        "bedanya RSI sama MACD apa?",
+    ):
+        res_ctx = resolve_followup_intent(conceptual_q, recent_messages=history)
+        assert isinstance(res_ctx, RefusalIntent)
+        assert res_ctx.is_hard_refusal is False
+
 
 class _LocalMemoryRepo:
     def __init__(self) -> None:
@@ -608,3 +623,33 @@ async def test_hybrid_nlp_layer2_handles_lowercase_coin_scan_and_conversational_
     # Both the VVV turn and Q&A turn are saved cleanly in memory
     recent = memory.get_recent_messages(111)
     assert any("Change of Character" in m.content for m in recent if m.role == "assistant")
+
+
+@pytest.mark.asyncio
+async def test_casual_chat_flows_to_conversational_ai_even_when_classifier_fails() -> None:
+    transport = _ScriptedHybridTransport(
+        [
+            "not-valid-json",
+            json.dumps(
+                {
+                    "answer": (
+                        "Halo! Santai bro, lagi mantau market aja nih. Kalau mau cek koin "
+                        "atau lihat ada setup apa, langsung sebut aja ya."
+                    )
+                }
+            ),
+        ]
+    )
+    narrator = GeminiNarrator(model="gemini-2.5-flash", transport=transport)
+    memory = MemoryService(_LocalMemoryRepo())
+    bot = BotService(
+        access=AccessController((111,)),
+        analysis_service=_LocalAnalysisService(),  # type: ignore[arg-type]
+        narrator=narrator,
+        memory=memory,
+    )
+
+    chunks = await bot.handle_text_message(111, "halo bro, lagi santai aja nih")
+    reply = "\n".join(chunks)
+    assert "Santai bro" in reply
+    assert "belum dapat menentukan simbol" not in reply.lower()

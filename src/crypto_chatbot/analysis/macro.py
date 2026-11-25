@@ -214,14 +214,21 @@ def build_macro_benchmark_context(
                 elif dxy_ema_20 < dxy_ema_50:
                     trend = "bearish"
 
-            # Align target returns and DXY returns by latest close_time sequence
+            # Align target returns and DXY returns by matching close_time (handles FX weekend gaps)
             corr_dxy: float | None = None
-            min_len = min(len(valid_targets), len(valid_dxy))
-            if min_len >= 4:
-                t_slice = [c.close for c in valid_targets[-min_len:]]
-                d_slice = [c.close for c in valid_dxy[-min_len:]]
-                t_rets = [t_slice[i] / t_slice[i - 1] - 1.0 for i in range(1, len(t_slice))]
-                d_rets = [d_slice[i] / d_slice[i - 1] - 1.0 for i in range(1, len(d_slice))]
+            dxy_map = {c.close_time: c.close for c in valid_dxy}
+            aligned_t_dxy: list[float] = []
+            aligned_d: list[float] = []
+            for tc in valid_targets:
+                if tc.close_time in dxy_map:
+                    aligned_t_dxy.append(tc.close)
+                    aligned_d.append(dxy_map[tc.close_time])
+            if len(aligned_t_dxy) >= 4:
+                t_rets = [
+                    aligned_t_dxy[i] / aligned_t_dxy[i - 1] - 1.0
+                    for i in range(1, len(aligned_t_dxy))
+                ]
+                d_rets = [aligned_d[i] / aligned_d[i - 1] - 1.0 for i in range(1, len(aligned_d))]
                 corr_dxy = compute_rolling_correlation(t_rets, d_rets, window=20)
 
             macro_impact: Literal["headwind", "tailwind", "neutral"] = "neutral"

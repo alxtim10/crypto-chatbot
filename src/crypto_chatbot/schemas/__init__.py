@@ -27,6 +27,8 @@ from crypto_chatbot.schemas.commands import (
     CompareCommandArgs,
     WatchlistAction,
     WatchlistCommandArgs,
+    WhaleAction,
+    WhaleCommandArgs,
 )
 from crypto_chatbot.schemas.derivatives import (
     CrossSourcePriceCheck,
@@ -99,6 +101,16 @@ from crypto_chatbot.schemas.tradingview import (
     TradingViewMetrics,
     TradingViewPacket,
 )
+from crypto_chatbot.schemas.whale import (
+    NetworkType,
+    WhaleFlowEvent,
+    WhaleFlowType,
+    WhaleMarketOverview,
+    WhalePosition,
+    WhalePositionSide,
+    WhaleWalletProfile,
+    WhaleWatchlistEntry,
+)
 
 __all__ = [
     "AI_AGENT_LENS_ATTRIBUTION",
@@ -146,6 +158,7 @@ __all__ = [
     "ModelPredictionSummary",
     "MtfRsiAlignment",
     "NarrationStatus",
+    "NetworkType",
     "NewsSourceLink",
     "NormalizedNewsArticle",
     "OpenInterestBatch",
@@ -184,4 +197,13 @@ __all__ = [
     "TradingViewPacket",
     "WatchlistAction",
     "WatchlistCommandArgs",
+    "WhaleAction",
+    "WhaleCommandArgs",
+    "WhaleFlowEvent",
+    "WhaleFlowType",
+    "WhaleMarketOverview",
+    "WhalePosition",
+    "WhalePositionSide",
+    "WhaleWalletProfile",
+    "WhaleWatchlistEntry",
 ]

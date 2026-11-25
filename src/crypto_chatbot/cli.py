@@ -16,8 +16,13 @@ import numpy as np
 
 from crypto_chatbot.analysis.backtest import (
     BacktestConfig,
+    RoundBoundaryMode,
     render_backtest_report,
+    render_dual_book_report,
+    run_dual_paper_book_backtest,
     run_setup_backtest,
+    send_round_events_webhook,
+    write_decision_log_jsonl,
 )
 from crypto_chatbot.analysis.momentum_screener import (
     DEFAULT_MIN_VOLUME_24H_USD,
@@ -33,6 +38,13 @@ from crypto_chatbot.analysis.scanner import (
 )
 from crypto_chatbot.analysis.service import AnalysisService, build_analysis_snapshot
 from crypto_chatbot.analysis.setup import evaluate_setup_against_candles
+from crypto_chatbot.analysis.whale_tracker import (
+    WhaleWatchlistManager,
+    aggregate_whale_positions,
+    format_whale_overview_telegram,
+    format_whale_wallet_telegram,
+    format_whale_watchlist_telegram,
+)
 from crypto_chatbot.app import run_bot
 from crypto_chatbot.bot.templates import render_compact_snapshot, render_deterministic_snapshot
 from crypto_chatbot.config import ConfigError, load_settings
@@ -58,6 +70,9 @@ from crypto_chatbot.market_data.symbols import (
     resolve_symbol,
 )
 from crypto_chatbot.market_data.tradingview import parse_ai_agent_lens_packet
+from crypto_chatbot.market_data.whale_provider import (
+    WhaleDataProvider,
+)
 from crypto_chatbot.ml.experiment import run_offline_experiment
 from crypto_chatbot.ml.shadow import compute_shadow_monitoring_report
 from crypto_chatbot.news.pipeline import build_sentiment_observations, deduplicate_articles
@@ -80,6 +95,7 @@ from crypto_chatbot.schemas.market import (
 from crypto_chatbot.schemas.ml import MlExperimentConfig
 from crypto_chatbot.schemas.news import RawNewsItem, SentimentObservation
 from crypto_chatbot.schemas.tradingview import TradingViewPacket
+from crypto_chatbot.schemas.whale import NetworkType
 from crypto_chatbot.storage.database import create_db_engine, init_db
 from crypto_chatbot.storage.repositories import (
     DerivativesRepository,
@@ -367,6 +383,7 @@ async def _analyze_live(
     chain = _resolve_exchange_chain_from_env()
     provider, deriv_provider = build_futures_providers(chain)
     bybit_provider = BybitDerivativesProvider() if "binance" in chain else None
+    dxy_provider = DxyMarketDataProvider() if include_derivatives else None
     try:
         service = AnalysisService(
             provider=provider,
@@ -377,7 +394,7 @@ async def _analyze_live(
             setup_repository=setup_repository,
             tradingview_repository=tradingview_repository,
             news_repository=news_repository,
-            dxy_provider=DxyMarketDataProvider() if include_derivatives else None,
+            dxy_provider=dxy_provider,
         )
         return await service.analyze(
             symbol,
@@ -391,6 +408,8 @@ async def _analyze_live(
         await deriv_provider.close()
         if bybit_provider is not None:
             await bybit_provider.close()
+        if dxy_provider is not None:
+            await dxy_provider.close()
 
 
 def _parse_primary_timeframe(timeframe_raw: str) -> Timeframe:
@@ -505,10 +524,16 @@ def _run_settle_setups(max_bars: int = 24) -> int:
         setup_repo = PostgresSetupLogRepository(engine)
         pending = setup_repo.list_pending_setups(limit=200)
         for rec in pending:
+            if rec.market_type in (MarketType.SPOT.value, MarketType.PERPETUAL.value):
+                resolved_market_type = MarketType(rec.market_type)
+            else:
+                resolved_market_type = (
+                    MarketType.PERPETUAL if ":" in rec.canonical_symbol else MarketType.SPOT
+                )
             future_candles = market_repo.load_candles(
                 venue=rec.venue,
                 canonical_symbol=rec.canonical_symbol,
-                market_type=MarketType.SPOT,
+                market_type=resolved_market_type,
                 timeframe=rec.timeframe,
                 start_open_time=rec.as_of,
             )
@@ -982,6 +1007,10 @@ def _run_backtest(
     step: int,
     fixture_path: Path | None,
     as_json: bool,
+    dual_book: bool = False,
+    boundary: str = "daily_utc",
+    log_jsonl: Path | None = None,
+    webhook_url: str | None = None,
 ) -> int:
     try:
         resolved_tf = resolve_primary_timeframe(timeframe_raw)
@@ -1022,8 +1051,53 @@ def _run_backtest(
             max_hold_bars=max_hold,
             step_bars=step,
         )
+        if dual_book:
+            dual_report = run_dual_paper_book_backtest(
+                batch.candles,
+                config=config,
+                boundary_mode=RoundBoundaryMode(boundary),
+            )
+            events = (
+                *dual_report.always_on.decision_log,
+                *dual_report.flat_at_boundary.decision_log,
+            )
+            if log_jsonl is not None:
+                write_decision_log_jsonl(events, log_jsonl)
+            if webhook_url:
+                send_round_events_webhook(
+                    webhook_url,
+                    {
+                        "mode": "dual_book",
+                        "symbol": dual_report.always_on.symbol,
+                        "timeframe": dual_report.always_on.timeframe.value,
+                        "boundary_mode": dual_report.boundary_mode.value,
+                        "summary": dual_report.summary_note,
+                        "events": [ev.model_dump(mode="json") for ev in events],
+                    },
+                )
+            if as_json:
+                print(dual_report.model_dump_json(indent=2))
+            else:
+                print(render_dual_book_report(dual_report))
+            return 0
+
         report = run_setup_backtest(batch.candles, config=config)
-    except (SymbolError, ValueError, json.JSONDecodeError) as exc:
+        if log_jsonl is not None:
+            write_decision_log_jsonl(report.decision_log, log_jsonl)
+        if webhook_url:
+            send_round_events_webhook(
+                webhook_url,
+                {
+                    "mode": "single_book",
+                    "symbol": report.symbol,
+                    "timeframe": report.timeframe.value,
+                    "book_name": report.book_name,
+                    "executed_trades": report.executed_trades,
+                    "total_net_r": report.total_net_r,
+                    "events": [ev.model_dump(mode="json") for ev in report.decision_log],
+                },
+            )
+    except (SymbolError, ValueError, OSError, json.JSONDecodeError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
@@ -1100,12 +1174,13 @@ async def _run_scan_live(
     chain = _resolve_exchange_chain_from_env()
     provider, deriv_provider = build_futures_providers(chain)
     bybit_provider = BybitDerivativesProvider() if "binance" in chain else None
+    dxy_provider = DxyMarketDataProvider()
     try:
         service = AnalysisService(
             provider=provider,
             derivatives_provider=deriv_provider,
             bybit_provider=bybit_provider,
-            dxy_provider=DxyMarketDataProvider(),
+            dxy_provider=dxy_provider,
         )
         return await scan_market_setups(
             service,
@@ -1116,6 +1191,7 @@ async def _run_scan_live(
     finally:
         await provider.close()
         await deriv_provider.close()
+        await dxy_provider.close()
         if bybit_provider is not None:
             await bybit_provider.close()
 
@@ -1165,12 +1241,13 @@ async def _run_screen_live(
     chain = _resolve_exchange_chain_from_env()
     provider, deriv_provider = build_futures_providers(chain)
     bybit_provider = BybitDerivativesProvider() if "binance" in chain else None
+    dxy_provider = DxyMarketDataProvider()
     try:
         service = AnalysisService(
             provider=provider,
             derivatives_provider=deriv_provider,
             bybit_provider=bybit_provider,
-            dxy_provider=DxyMarketDataProvider(),
+            dxy_provider=dxy_provider,
         )
         return await screen_momentum_movers(
             service,
@@ -1181,6 +1258,7 @@ async def _run_screen_live(
     finally:
         await provider.close()
         await deriv_provider.close()
+        await dxy_provider.close()
         if bybit_provider is not None:
             await bybit_provider.close()
 
@@ -1208,6 +1286,62 @@ def _run_screen(
         print(report.model_dump_json(indent=2))
     else:
         print(render_momentum_screener_report(report, html_mode=False))
+    return 0
+
+
+async def _run_whale_live(
+    *,
+    symbol: str | None,
+    wallet: str | None,
+    list_wallets: bool,
+) -> tuple[str, dict[str, Any]]:
+    manager = WhaleWatchlistManager()
+    if list_wallets:
+        entries = manager.list_entries()
+        text = format_whale_watchlist_telegram(entries, html_mode=False)
+        json_data = {"wallets": [e.model_dump(mode="json") for e in entries]}
+        return text, json_data
+
+    provider = WhaleDataProvider()
+    if wallet:
+        profile = await provider.get_wallet_profile(wallet)
+        text = format_whale_wallet_telegram(profile, html_mode=False)
+        json_data = profile.model_dump(mode="json")
+        return text, json_data
+
+    sym = symbol or "BTC"
+    entries = manager.list_entries()
+    targets = [(e.address, e.label) for e in entries if e.network == NetworkType.EVM]
+    positions = await provider.get_positions_for_symbol(sym, wallets=targets)
+    overview = aggregate_whale_positions(sym, positions)
+    text = format_whale_overview_telegram(overview, html_mode=False)
+    json_data = overview.model_dump(mode="json")
+    return text, json_data
+
+
+def _run_whale(
+    *,
+    symbol: str | None,
+    wallet: str | None,
+    list_wallets: bool,
+    as_json: bool,
+) -> int:
+    try:
+        text, json_data = asyncio.run(
+            _run_whale_live(
+                symbol=symbol,
+                wallet=wallet,
+                list_wallets=list_wallets,
+            )
+        )
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if as_json:
+        print(json.dumps(json_data, indent=2, default=str))
+    else:
+        print(text)
     return 0
 
 
@@ -1451,6 +1585,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="Print full BacktestReport JSON instead of Indonesian text report.",
     )
+    backtest_parser.add_argument(
+        "--dual-book",
+        action="store_true",
+        help="Run always-on vs flat-at-boundary dual paper books on identical candles.",
+    )
+    backtest_parser.add_argument(
+        "--boundary",
+        choices=("daily_utc", "funding_8h"),
+        default="daily_utc",
+        help="Session boundary mode for the second paper book (default: daily_utc).",
+    )
+    backtest_parser.add_argument(
+        "--log-jsonl",
+        type=Path,
+        default=None,
+        help="Optional output .jsonl path for plain-English HOLD/FILL/FEE/EXIT/FLAT log.",
+    )
+    backtest_parser.add_argument(
+        "--webhook-url",
+        default=None,
+        help="Optional HTTPS (or localhost HTTP) webhook URL to POST round log summary.",
+    )
 
     pine_parser = subcommands.add_parser(
         "pine",
@@ -1524,6 +1680,33 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Print raw MomentumScreenerReport JSON instead of Indonesian text report.",
     )
 
+    whale_parser = subcommands.add_parser(
+        "whale",
+        help="Track perpetual futures whale positioning (Hyperliquid) & on-chain wallet flows.",
+    )
+    whale_parser.add_argument(
+        "--symbol",
+        type=str,
+        default=None,
+        help="Futures symbol to aggregate whale positioning for (default: BTC).",
+    )
+    whale_parser.add_argument(
+        "--wallet",
+        type=str,
+        default=None,
+        help="Wallet address to inspect (EVM 0x... or Bitcoin bc1.../1.../3...).",
+    )
+    whale_parser.add_argument(
+        "--list",
+        action="store_true",
+        help="List all tracked whale and institutional addresses.",
+    )
+    whale_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output raw JSON instead of formatted text report.",
+    )
+
     args = parser.parse_args(argv)
     if args.command == "check-config":
         return _check_config()
@@ -1551,6 +1734,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             step=args.step,
             fixture_path=args.fixture,
             as_json=args.json,
+            dual_book=args.dual_book,
+            boundary=args.boundary,
+            log_jsonl=args.log_jsonl,
+            webhook_url=args.webhook_url,
         )
     if args.command == "pine":
         return _run_pine(
@@ -1570,6 +1757,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             side=args.side,
             min_vol=args.min_vol,
             top_per_side=args.top,
+            as_json=args.json,
+        )
+    if args.command == "whale":
+        return _run_whale(
+            symbol=args.symbol,
+            wallet=args.wallet,
+            list_wallets=args.list,
             as_json=args.json,
         )
     if args.command == "setup-stats":

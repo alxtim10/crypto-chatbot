@@ -2,8 +2,16 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import http.client
+import ipaddress
+import json
+import socket
+import urllib.parse
+from collections.abc import Callable, Sequence
 from datetime import datetime
+from enum import StrEnum
+from pathlib import Path
+from typing import Literal
 
 import numpy as np
 from pydantic import BaseModel, ConfigDict, Field
@@ -28,6 +36,32 @@ from crypto_chatbot.schemas.market import MarketCandle, Timeframe, UtcDatetime
 from crypto_chatbot.schemas.ml import CostAssumptions
 
 
+class RoundBoundaryMode(StrEnum):
+    """Session boundary rule used when flattening a paper book on schedule."""
+
+    NONE = "none"
+    FUNDING_8H = "funding_8h"
+    DAILY_UTC = "daily_utc"
+
+
+class RoundDecisionEvent(BaseModel):
+    """Plain-English audit record of a bar HOLD, FILL, FEE, EXIT, or boundary FLAT action."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    round_index: int = Field(ge=1)
+    book: str
+    timestamp: UtcDatetime
+    symbol: str
+    timeframe: Timeframe
+    action: Literal["HOLD", "FILL", "FEE", "EXIT", "FLAT"]
+    bias: SetupBias | None = None
+    price: float | None = None
+    fee_r: float | None = None
+    net_r: float | None = None
+    reason: str
+
+
 class BacktestConfig(BaseModel):
     """Configuration for deterministic point-in-time trade setup replay."""
 
@@ -42,6 +76,9 @@ class BacktestConfig(BaseModel):
     bootstrap_seed: int = 42
     include_long: bool = True
     include_short: bool = True
+    book_name: str = "always_on"
+    flat_boundary: RoundBoundaryMode = RoundBoundaryMode.NONE
+    record_decision_log: bool = True
 
 
 class BacktestTrade(BaseModel):
@@ -102,6 +139,9 @@ class BacktestReport(BaseModel):
     symbol: str
     timeframe: Timeframe
     source: str
+    book_name: str = "always_on"
+    flat_boundary: RoundBoundaryMode = RoundBoundaryMode.NONE
+    boundary_flats: int = 0
     start_time: UtcDatetime
     end_time: UtcDatetime
     total_bars: int
@@ -125,7 +165,22 @@ class BacktestReport(BaseModel):
     bootstrap: BootstrapSummary | None = None
     regime_breakdown: tuple[RegimeBreakdown, ...]
     trades: tuple[BacktestTrade, ...]
+    decision_log: tuple[RoundDecisionEvent, ...] = ()
     disclaimer: str
+
+
+class DualBookComparisonReport(BaseModel):
+    """Side-by-side paper replay: always-on book vs. flat-at-boundary book on same candles."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    boundary_mode: RoundBoundaryMode
+    always_on: BacktestReport
+    flat_at_boundary: BacktestReport
+    delta_net_expectancy_r: float
+    delta_total_net_r: float
+    delta_max_drawdown_r: float
+    summary_note: str
 
 
 def _max_drawdown_r(net_rs: Sequence[float]) -> float:
@@ -151,18 +206,30 @@ def _max_consecutive_losses(net_rs: Sequence[float]) -> int:
     return max_streak
 
 
+def _is_round_boundary(candle: MarketCandle, boundary: RoundBoundaryMode) -> bool:
+    if boundary is RoundBoundaryMode.FUNDING_8H:
+        return candle.close_time.hour in (0, 8, 16) and candle.close_time.minute == 0
+    if boundary is RoundBoundaryMode.DAILY_UTC:
+        return candle.close_time.hour == 0 and candle.close_time.minute == 0
+    return False
+
+
 def _simulate_setup_forward(
     setup: TradeSetup,
     future_candles: Sequence[MarketCandle],
     *,
     start_bar_index: int,
-) -> tuple[str, datetime | None, float, int, int] | None:
-    """Simulate a READY setup forward against future closed candles.
+    flat_boundary: RoundBoundaryMode = RoundBoundaryMode.NONE,
+) -> tuple[str, datetime, datetime, float, int, int, float, float] | None:
+    """Simulate a READY setup forward causally with scaled partial exits (40/40/20).
 
-    Returns `(outcome, exit_time, gross_r, exit_bar_idx, bars_held)` if triggered, or
-    `None` if price never touched the entry zone within `future_candles`.
-    Conservative tie-break: if any candle triggers/is in position and hits SL on the same bar
-    as a TP, SL (`-1.0R`) takes precedence.
+    Returns `(outcome, fill_time, exit_time, gross_r, exit_bar_idx, bars_held,
+    exit_price, fill_price)` if triggered, or `None` if price never touched the entry zone
+    within `future_candles`.
+    - Entry fill uses the conservative side reached inside `[entry_low, entry_high]`.
+    - Gap-through-SL at `candle.open` fills at actual `candle.open` rather than flat `-1.0R`.
+    - Partial exits: 40% at TP1 (then trail SL to breakeven `fill_price`), 40% at TP2,
+      and 20% at TP3. Never rewinds exit time/bar backward to a past TP bar.
     """
     if (
         setup.entry_low is None
@@ -184,72 +251,141 @@ def _simulate_setup_forward(
 
     is_long = setup.bias is SetupBias.LONG
     triggered = False
+    fill_time: datetime | None = None
+    fill_price = setup.entry_mid
     trigger_offset = 0
-    highest_tp = 0
-    tp_hit_times: dict[int, datetime] = {}
-    tp_hit_bars: dict[int, int] = {}
+    current_sl = setup.stop_loss
+    remaining = 1.0
+    realized_r = 0.0
+    hit_tp1 = False
+    hit_tp2 = False
 
     for offset, candle in enumerate(future_candles):
         bar_idx = start_bar_index + offset
+        just_triggered = False
         if not triggered:
             if candle.low <= setup.entry_high and candle.high >= setup.entry_low:
                 triggered = True
+                just_triggered = True
+                fill_time = candle.close_time
                 trigger_offset = offset
+                if is_long:
+                    if candle.open >= setup.entry_high:
+                        fill_price = setup.entry_high
+                    else:
+                        fill_price = candle.open
+                elif candle.open <= setup.entry_low:
+                    fill_price = setup.entry_low
+                else:
+                    fill_price = candle.open
             else:
                 continue
 
-        if is_long:
-            if candle.low <= setup.stop_loss:
-                bars_held = max(1, offset - trigger_offset + 1)
-                return "hit_sl", candle.close_time, -1.0, bar_idx, bars_held
-            if candle.high >= setup.tp3:
-                bars_held = max(1, offset - trigger_offset + 1)
-                return "hit_tp3", candle.close_time, setup.rr_tp3, bar_idx, bars_held
-            if candle.high >= setup.tp2 and highest_tp < 2:
-                highest_tp = 2
-                tp_hit_times[2] = candle.close_time
-                tp_hit_bars[2] = bar_idx
-            if candle.high >= setup.tp1 and highest_tp < 1:
-                highest_tp = 1
-                tp_hit_times[1] = candle.close_time
-                tp_hit_bars[1] = bar_idx
-        else:
-            if candle.high >= setup.stop_loss:
-                bars_held = max(1, offset - trigger_offset + 1)
-                return "hit_sl", candle.close_time, -1.0, bar_idx, bars_held
-            if candle.low <= setup.tp3:
-                bars_held = max(1, offset - trigger_offset + 1)
-                return "hit_tp3", candle.close_time, setup.rr_tp3, bar_idx, bars_held
-            if candle.low <= setup.tp2 and highest_tp < 2:
-                highest_tp = 2
-                tp_hit_times[2] = candle.close_time
-                tp_hit_bars[2] = bar_idx
-            if candle.low <= setup.tp1 and highest_tp < 1:
-                highest_tp = 1
-                tp_hit_times[1] = candle.close_time
-                tp_hit_bars[1] = bar_idx
+        if fill_time is None:
+            continue
 
-    if not triggered:
+        gap_sl = (candle.open <= current_sl) if is_long else (candle.open >= current_sl)
+        touched_sl = gap_sl or (
+            (candle.low <= current_sl) if is_long else (candle.high >= current_sl)
+        )
+        if touched_sl:
+            exit_px = candle.open if gap_sl else current_sl
+            ref_entry = (
+                setup.entry_mid if (gap_sl and just_triggered and not hit_tp1) else fill_price
+            )
+            leg_r = (exit_px - ref_entry) / risk if is_long else (ref_entry - exit_px) / risk
+            realized_r += remaining * leg_r
+            bars_held = max(1, offset - trigger_offset + 1)
+            sl_outcome = "hit_tp2" if hit_tp2 else ("hit_tp1" if hit_tp1 else "hit_sl")
+            return (
+                sl_outcome,
+                fill_time,
+                candle.close_time,
+                realized_r,
+                bar_idx,
+                bars_held,
+                exit_px,
+                fill_price,
+            )
+
+        if not hit_tp1 and ((candle.high >= setup.tp1) if is_long else (candle.low <= setup.tp1)):
+            hit_tp1 = True
+            leg_tp1 = (
+                (setup.tp1 - fill_price) / risk if is_long else (fill_price - setup.tp1) / risk
+            )
+            realized_r += 0.40 * leg_tp1
+            remaining -= 0.40
+            current_sl = fill_price
+
+        if not hit_tp2 and ((candle.high >= setup.tp2) if is_long else (candle.low <= setup.tp2)):
+            hit_tp2 = True
+            leg_tp2 = (
+                (setup.tp2 - fill_price) / risk if is_long else (fill_price - setup.tp2) / risk
+            )
+            realized_r += 0.40 * leg_tp2
+            remaining -= 0.40
+
+        if (candle.high >= setup.tp3) if is_long else (candle.low <= setup.tp3):
+            leg_tp3 = (
+                (setup.tp3 - fill_price) / risk if is_long else (fill_price - setup.tp3) / risk
+            )
+            realized_r += remaining * leg_tp3
+            bars_held = max(1, offset - trigger_offset + 1)
+            return (
+                "hit_tp3",
+                fill_time,
+                candle.close_time,
+                realized_r,
+                bar_idx,
+                bars_held,
+                setup.tp3,
+                fill_price,
+            )
+
+        if flat_boundary is not RoundBoundaryMode.NONE and _is_round_boundary(
+            candle, flat_boundary
+        ):
+            bars_held = max(1, offset - trigger_offset + 1)
+            leg_flat = (
+                (candle.close - fill_price) / risk
+                if is_long
+                else (fill_price - candle.close) / risk
+            )
+            realized_r += remaining * leg_flat
+            return (
+                "flat_boundary",
+                fill_time,
+                candle.close_time,
+                realized_r,
+                bar_idx,
+                bars_held,
+                candle.close,
+                fill_price,
+            )
+
+    if not triggered or fill_time is None:
         return None
-
-    if highest_tp == 2:
-        exit_bar = tp_hit_bars[2]
-        bars_held = max(1, (exit_bar - start_bar_index) - trigger_offset + 1)
-        return "hit_tp2", tp_hit_times[2], setup.rr_tp2, exit_bar, bars_held
-    if highest_tp == 1:
-        exit_bar = tp_hit_bars[1]
-        bars_held = max(1, (exit_bar - start_bar_index) - trigger_offset + 1)
-        return "hit_tp1", tp_hit_times[1], setup.rr_tp1, exit_bar, bars_held
 
     last_candle = future_candles[-1]
     last_bar_idx = start_bar_index + len(future_candles) - 1
     bars_held = max(1, (len(future_candles) - 1) - trigger_offset + 1)
-    realized_r = (
-        (last_candle.close - setup.entry_mid) / risk
+    leg_end = (
+        (last_candle.close - fill_price) / risk
         if is_long
-        else (setup.entry_mid - last_candle.close) / risk
+        else (fill_price - last_candle.close) / risk
     )
-    return "expired", last_candle.close_time, realized_r, last_bar_idx, bars_held
+    realized_r += remaining * leg_end
+    final_outcome = "hit_tp2" if hit_tp2 else ("hit_tp1" if hit_tp1 else "expired")
+    return (
+        final_outcome,
+        fill_time,
+        last_candle.close_time,
+        realized_r,
+        last_bar_idx,
+        bars_held,
+        last_candle.close,
+        fill_price,
+    )
 
 
 def run_setup_backtest(
@@ -267,24 +403,74 @@ def run_setup_backtest(
             f"At least {cfg.warmup_bars + 2} closed candles are required for backtest "
             f"(got {len(closed)})"
         )
+    for idx_bar in range(1, len(closed)):
+        expected_step = closed[idx_bar - 1].timeframe.duration
+        if (closed[idx_bar].open_time - closed[idx_bar - 1].open_time) != expected_step:
+            raise ValueError(
+                "Closed candle series contains time gaps or duplicate timestamps; "
+                "contiguous closed candles are required for backtest replay."
+            )
 
     evaluated_bars = 0
     wait_signals = 0
     ready_signals = 0
     untriggered_signals = 0
+    boundary_flats = 0
     trades: list[BacktestTrade] = []
+    decision_events: list[RoundDecisionEvent] = []
 
     idx = cfg.warmup_bars - 1
     max_signal_idx = len(closed) - 2
     while idx <= max_signal_idx:
         evaluated_bars += 1
+        round_idx = evaluated_bars
         history = closed[: idx + 1]
-        as_of = history[-1].close_time
+        bar_candle = history[-1]
+        as_of = bar_candle.close_time
+        sym = bar_candle.canonical_symbol
+        tf = bar_candle.timeframe
+
+        def _append_event(
+            action: Literal["HOLD", "FILL", "FEE", "EXIT", "FLAT"],
+            *,
+            ts: datetime,
+            reason: str,
+            bias: SetupBias | None = None,
+            price: float | None = None,
+            fee_r: float | None = None,
+            net_r: float | None = None,
+            round_index: int = round_idx,
+            symbol: str = sym,
+            timeframe: Timeframe = tf,
+        ) -> None:
+            if not cfg.record_decision_log:
+                return
+            decision_events.append(
+                RoundDecisionEvent(
+                    round_index=round_index,
+                    book=cfg.book_name,
+                    timestamp=ts,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    action=action,
+                    bias=bias,
+                    price=price,
+                    fee_r=fee_r,
+                    net_r=net_r,
+                    reason=reason,
+                )
+            )
 
         ind = compute_technical_metrics(history)
         reg = classify_regime(ind.metrics)
         if reg is None:
             wait_signals += 1
+            _append_event(
+                "HOLD",
+                ts=as_of,
+                price=bar_candle.close,
+                reason="HOLD: insufficient regime classification on closed history.",
+            )
             idx += cfg.step_bars
             continue
         struct = analyze_market_structure(history)
@@ -295,7 +481,7 @@ def run_setup_backtest(
             regime=reg,
             structure=struct,
             smc=smc,
-            primary_timeframe=history[-1].timeframe,
+            primary_timeframe=tf,
             ltf_candles=ltf_candles,
             as_of=as_of,
             use_available_time=use_available_time,
@@ -307,18 +493,47 @@ def run_setup_backtest(
         )
         if setup.status is not SetupStatus.READY or bias_disabled:
             wait_signals += 1
+            reason_txt = (
+                "HOLD: directional bias disabled by config."
+                if bias_disabled and setup.status is SetupStatus.READY
+                else f"HOLD: setup WAIT ({setup.wait_reason or 'conditions not met'})."
+            )
+            _append_event(
+                "HOLD",
+                ts=as_of,
+                bias=setup.bias,
+                price=bar_candle.close,
+                reason=reason_txt,
+            )
             idx += cfg.step_bars
             continue
 
         ready_signals += 1
         future = closed[idx + 1 : idx + 1 + cfg.max_hold_bars]
-        sim = _simulate_setup_forward(setup, future, start_bar_index=idx + 1)
+        sim = _simulate_setup_forward(
+            setup,
+            future,
+            start_bar_index=idx + 1,
+            flat_boundary=cfg.flat_boundary,
+        )
         if sim is None:
             untriggered_signals += 1
+            _append_event(
+                "HOLD",
+                ts=as_of,
+                bias=setup.bias,
+                price=bar_candle.close,
+                reason=(
+                    f"HOLD: READY {setup.bias.value.upper()} setup expired untriggered "
+                    f"within {cfg.max_hold_bars} bars."
+                ),
+            )
             idx += cfg.step_bars
             continue
 
-        outcome, exit_time, gross_r, exit_bar_idx, bars_held = sim
+        outcome, fill_time, exit_time, gross_r, exit_bar_idx, bars_held, exit_price, fill_price = (
+            sim
+        )
         if (
             setup.entry_low is None
             or setup.entry_high is None
@@ -332,8 +547,62 @@ def run_setup_backtest(
             continue
 
         risk = abs(setup.entry_mid - setup.stop_loss)
-        cost_r = (cfg.cost_assumptions.round_trip_cost_rate * setup.entry_mid) / risk
+        exec_costs = cfg.cost_assumptions.model_copy(update={"funding_bps_per_24h": 0.0})
+        exec_cost_r = (exec_costs.round_trip_cost_rate * fill_price) / risk
+        held_hours = bars_held * (tf.duration.total_seconds() / 3600.0)
+        funding_rate = (held_hours / 24.0) * (cfg.cost_assumptions.funding_bps_per_24h / 10_000.0)
+        funding_r = (funding_rate * fill_price) / risk
+        cost_r = exec_cost_r + funding_r
         net_r = gross_r - cost_r
+
+        _append_event(
+            "FILL",
+            ts=fill_time,
+            bias=setup.bias,
+            price=round(fill_price, 6),
+            reason=(
+                f"FILL: {setup.bias.value.upper()} entry zone touched at "
+                f"{fill_price:.4f} (SL {setup.stop_loss:.4f}, TP2 {setup.tp2:.4f})."
+            ),
+        )
+        _append_event(
+            "FEE",
+            ts=fill_time,
+            bias=setup.bias,
+            price=round(fill_price, 6),
+            fee_r=round(cost_r, 4),
+            reason=(
+                f"FEE: deducted exec+funding cost {cost_r:.4f} R "
+                f"({exec_costs.round_trip_cost_rate * 10000:.1f} bps round-trip + "
+                f"{held_hours:.1f}h funding)."
+            ),
+        )
+        if outcome == "flat_boundary":
+            boundary_flats += 1
+            _append_event(
+                "FLAT",
+                ts=exit_time,
+                bias=setup.bias,
+                price=round(exit_price, 6),
+                net_r=round(net_r, 4),
+                reason=(
+                    f"FLAT: forced flat at {cfg.flat_boundary.value} boundary "
+                    f"(close {exit_price:.4f}, gross {gross_r:+.4f} R, net {net_r:+.4f} R)."
+                ),
+            )
+        else:
+            _append_event(
+                "EXIT",
+                ts=exit_time,
+                bias=setup.bias,
+                price=round(exit_price, 6),
+                net_r=round(net_r, 4),
+                reason=(
+                    f"EXIT: {setup.bias.value.upper()} closed via {outcome} at "
+                    f"{exit_price:.4f} (gross {gross_r:+.4f} R, net {net_r:+.4f} R, "
+                    f"{bars_held} bars)."
+                ),
+            )
 
         trades.append(
             BacktestTrade(
@@ -440,6 +709,9 @@ def run_setup_backtest(
         symbol=first.canonical_symbol,
         timeframe=first.timeframe,
         source=f"{first.provider}:{first.venue}",
+        book_name=cfg.book_name,
+        flat_boundary=cfg.flat_boundary,
+        boundary_flats=boundary_flats,
         start_time=closed[cfg.warmup_bars - 1].close_time,
         end_time=last.close_time,
         total_bars=len(closed),
@@ -463,11 +735,224 @@ def run_setup_backtest(
         bootstrap=bootstrap,
         regime_breakdown=tuple(regime_breakdown),
         trades=tuple(trades),
+        decision_log=tuple(decision_events),
         disclaimer=(
             "Simulasi replay historis deterministik menggunakan candle tertutup & asumsi biaya "
             "eksekusi; hasil masa lalu bukan jaminan performa di masa depan."
         ),
     )
+
+
+def run_dual_paper_book_backtest(
+    candles: Sequence[MarketCandle],
+    *,
+    config: BacktestConfig | None = None,
+    boundary_mode: RoundBoundaryMode = RoundBoundaryMode.DAILY_UTC,
+    ltf_candles: Sequence[MarketCandle] | None = None,
+    use_available_time: bool = False,
+) -> DualBookComparisonReport:
+    """Run Always-On vs Flat-at-Boundary paper books over the exact same closed candles."""
+    if boundary_mode is RoundBoundaryMode.NONE:
+        raise ValueError("boundary_mode must be 'daily_utc' or 'funding_8h' for dual book replay")
+
+    base_cfg = config or BacktestConfig()
+    always_cfg = base_cfg.model_copy(
+        update={
+            "book_name": "always_on",
+            "flat_boundary": RoundBoundaryMode.NONE,
+        }
+    )
+    flat_cfg = base_cfg.model_copy(
+        update={
+            "book_name": f"flat_{boundary_mode.value}",
+            "flat_boundary": boundary_mode,
+        }
+    )
+
+    always_report = run_setup_backtest(
+        candles,
+        config=always_cfg,
+        ltf_candles=ltf_candles,
+        use_available_time=use_available_time,
+    )
+    flat_report = run_setup_backtest(
+        candles,
+        config=flat_cfg,
+        ltf_candles=ltf_candles,
+        use_available_time=use_available_time,
+    )
+
+    delta_exp = round(flat_report.net_expectancy_r - always_report.net_expectancy_r, 4)
+    delta_total = round(flat_report.total_net_r - always_report.total_net_r, 4)
+    delta_dd = round(flat_report.max_drawdown_r - always_report.max_drawdown_r, 4)
+
+    exp_desc = (
+        f"meningkat {delta_exp:+.4f} R/trade"
+        if delta_exp > 0
+        else (f"turun {delta_exp:+.4f} R/trade" if delta_exp < 0 else "sama persis")
+    )
+    dd_desc = (
+        f"turun {abs(delta_dd):.2f} R"
+        if delta_dd < 0
+        else (f"naik {delta_dd:.2f} R" if delta_dd > 0 else "tidak berubah")
+    )
+    summary_note = (
+        f"Book flat di batas {boundary_mode.value} mencatat {flat_report.boundary_flats} "
+        f"penutupan paksa; net expectancy {exp_desc} dan max drawdown {dd_desc} "
+        "dibanding always-on."
+    )
+
+    return DualBookComparisonReport(
+        boundary_mode=boundary_mode,
+        always_on=always_report,
+        flat_at_boundary=flat_report,
+        delta_net_expectancy_r=delta_exp,
+        delta_total_net_r=delta_total,
+        delta_max_drawdown_r=delta_dd,
+        summary_note=summary_note,
+    )
+
+
+def render_dual_book_report(report: DualBookComparisonReport) -> str:
+    """Render side-by-side Indonesian comparison report for dual paper book replay."""
+    a = report.always_on
+    b = report.flat_at_boundary
+    lines = [
+        "=====================================================================",
+        "         DUAL PAPER BOOK BACKTEST (ALWAYS-ON VS BOUNDARY FLAT)       ",
+        "=====================================================================",
+        f"Simbol: {a.symbol} ({a.timeframe.value}) | Batas Flat: {report.boundary_mode.value}",
+        (
+            f"Periode: {a.start_time.strftime('%Y-%m-%d %H:%M UTC')} s/d "
+            f"{a.end_time.strftime('%Y-%m-%d %H:%M UTC')}"
+        ),
+        "---------------------------------------------------------------------",
+        f"Metrik              | Always-On          | Flat ({report.boundary_mode.value})",
+        "--------------------+--------------------+---------------------------",
+        f"Trades Tereksekusi  | {a.executed_trades:<18} | {b.executed_trades}",
+        f"Win Rate            | {a.win_rate * 100.0:>16.2f}% | {b.win_rate * 100.0:.2f}%",
+        (
+            f"Net Expectancy / Tr | {a.net_expectancy_r:>+16.4f} R | "
+            f"{b.net_expectancy_r:+.4f} R (delta {report.delta_net_expectancy_r:+.4f})"
+        ),
+        (
+            f"Total Net Return    | {a.total_net_r:>+16.2f} R | "
+            f"{b.total_net_r:+.2f} R (delta {report.delta_total_net_r:+.2f})"
+        ),
+        (
+            f"Max Drawdown        | {a.max_drawdown_r:>16.2f} R | "
+            f"{b.max_drawdown_r:.2f} R (delta {report.delta_max_drawdown_r:+.2f})"
+        ),
+        f"Forced Boundary Flat| {a.boundary_flats:<18} | {b.boundary_flats}",
+        "---------------------------------------------------------------------",
+        f"Ringkasan: {report.summary_note}",
+        f"Decision Log Events: Always-On={len(a.decision_log)}, Flat={len(b.decision_log)}",
+        f"Disclaimer: {a.disclaimer}",
+        "=====================================================================",
+    ]
+    return "\n".join(lines)
+
+
+def write_decision_log_jsonl(events: Sequence[RoundDecisionEvent], path: Path) -> int:
+    """Write plain-English decision events (`HOLD`, `FILL`, `FEE`, `EXIT`, `FLAT`) to JSONL."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [event.model_dump_json() for event in events]
+    content = "\n".join(lines) + ("\n" if lines else "")
+    path.write_text(content, encoding="utf-8")
+    return len(lines)
+
+
+def _is_blocked_webhook_ip(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    return (
+        ip_obj.is_private
+        or ip_obj.is_loopback
+        or ip_obj.is_link_local
+        or ip_obj.is_reserved
+        or ip_obj.is_multicast
+        or ip_obj.is_unspecified
+    )
+
+
+def send_round_events_webhook(
+    url: str,
+    payload: dict[str, object],
+    *,
+    timeout_seconds: float = 10.0,
+    allow_localhost: bool = False,
+    sender: Callable[[str, bytes, dict[str, str], float], int] | None = None,
+) -> int:
+    """POST structured round events & summary JSON to a validated external webhook."""
+    parsed = urllib.parse.urlparse(url.strip())
+    scheme = parsed.scheme.lower()
+    host = (parsed.hostname or "").lower()
+    if not host:
+        raise ValueError("Webhook URL must include a valid hostname.")
+
+    is_explicit_local = host in {"localhost", "127.0.0.1", "::1"}
+    if scheme != "https" and not (scheme == "http" and allow_localhost and is_explicit_local):
+        raise ValueError(
+            "Webhook URL must use https:// (or http://localhost with allow_localhost=True)."
+        )
+    if is_explicit_local and not allow_localhost:
+        raise ValueError("Localhost/loopback webhook targets require allow_localhost=True.")
+
+    if (host.endswith((".local", ".internal")) or host == "metadata.google.internal") and not (
+        allow_localhost and is_explicit_local
+    ):
+        raise ValueError(f"Webhook host '{host}' is blocked by SSRF policy.")
+
+    try:
+        literal_ip = ipaddress.ip_address(host)
+    except ValueError:
+        literal_ip = None
+
+    if (
+        literal_ip is not None
+        and _is_blocked_webhook_ip(literal_ip)
+        and not (allow_localhost and literal_ip.is_loopback)
+    ):
+        raise ValueError(f"Webhook target IP '{host}' is blocked by SSRF policy.")
+
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    if sender is not None:
+        return int(sender(url, body, headers, timeout_seconds))
+
+    target_path = parsed.path or "/"
+    if parsed.query:
+        target_path = f"{target_path}?{parsed.query}"
+    port = parsed.port or (443 if scheme == "https" else 80)
+
+    if literal_ip is None and not (allow_localhost and is_explicit_local):
+        try:
+            addr_infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except OSError as exc:
+            raise ValueError(f"Failed to resolve webhook hostname '{host}': {exc}") from exc
+        if not addr_infos:
+            raise ValueError(f"Webhook hostname '{host}' returned no DNS addresses.")
+        for info in addr_infos:
+            raw_ip = str(info[4][0]).split("%", 1)[0]
+            resolved_ip = ipaddress.ip_address(raw_ip)
+            if _is_blocked_webhook_ip(resolved_ip):
+                raise ValueError(
+                    f"Webhook hostname '{host}' resolves to blocked IP '{resolved_ip}'."
+                )
+
+    conn: http.client.HTTPConnection = (
+        http.client.HTTPSConnection(host, port=port, timeout=timeout_seconds)
+        if scheme == "https"
+        else http.client.HTTPConnection(host, port=port, timeout=timeout_seconds)
+    )
+    try:
+        conn.request("POST", target_path, body=body, headers=headers)
+        resp = conn.getresponse()
+        resp.read()
+        return int(resp.status)
+    finally:
+        conn.close()
 
 
 def render_backtest_report(report: BacktestReport) -> str:

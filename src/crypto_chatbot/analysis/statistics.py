@@ -289,10 +289,9 @@ def compute_statistical_metrics(
         if n >= MIN_HISTORY_REALIZED_VOL
         else None
     )
+    bars_per_year = (365.0 * 86_400.0) / candles[0].timeframe.duration.total_seconds()
     rv_cc_annual = (
-        annualize_volatility(rv_cc, bars_per_year=ANNUALIZATION_TRADING_DAYS)
-        if rv_cc is not None
-        else None
+        annualize_volatility(rv_cc, bars_per_year=bars_per_year) if rv_cc is not None else None
     )
     parkinson = (
         parkinson_volatility(highs, lows, window=realized_vol_window)

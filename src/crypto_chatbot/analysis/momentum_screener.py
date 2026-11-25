@@ -18,7 +18,7 @@ from crypto_chatbot.analysis.indicators import (
 from crypto_chatbot.bot.templates import format_indonesian_number
 from crypto_chatbot.market_data.base import FuturesTickerSnapshot
 from crypto_chatbot.schemas.analysis import SetupStatus
-from crypto_chatbot.schemas.market import MarketCandle, Timeframe, UtcDatetime
+from crypto_chatbot.schemas.market import MarketCandle, QualityFlag, Timeframe, UtcDatetime
 
 if TYPE_CHECKING:
     from crypto_chatbot.analysis.service import AnalysisService
@@ -33,6 +33,20 @@ MARUBOZU_MAX_LEAD_WICK_RATIO = 0.22
 MIN_MOMENTUM_BODY_ATR_RATIO = 0.55
 SL_BUFFER_ATR_RATIO = 0.15
 SL_MIN_BUFFER_PCT = 0.001
+MAX_MOMENTUM_SL_PCT = 5.0
+MAX_MOMENTUM_SL_ATR_RATIO = 3.5
+MIN_MOMENTUM_RSI = 20.0
+MAX_MOMENTUM_RSI = 80.0
+DEFAULT_SCREENER_ROUND_TRIP_COST_RATE = 0.0032
+MIN_SCREENER_NET_RR_TP2 = 1.2
+_BLOCKING_SCREENER_FLAGS = frozenset(
+    {
+        QualityFlag.GAP,
+        QualityFlag.STALE,
+        QualityFlag.INVALID_OHLC,
+        QualityFlag.SYMBOL_MISMATCH,
+    }
+)
 
 RISK_MANAGEMENT_EDUCATIONAL_NOTE = (
     "Referensi Risk: Konservatif 1% per trade (tahan 100x loss beruntun). "
@@ -214,6 +228,7 @@ def evaluate_15m_momentum_setup(
     ind = compute_technical_metrics(closed)
     ema_20 = ind.metrics.ema_20
     ema_50 = ind.metrics.ema_50
+    rsi_14 = ind.metrics.rsi_14
     atr_14 = ind.metrics.atr_14 or max(latest.high - latest.low, latest.close * 0.002)
 
     prev = closed[-2]
@@ -273,6 +288,15 @@ def evaluate_15m_momentum_setup(
                 trend_aligned=False,
             )
 
+        if rsi_14 is not None and rsi_14 >= MAX_MOMENTUM_RSI:
+            return _wait(
+                f"RSI 15m jenuh beli ({rsi_14:.1f} >= 80); hindari mengejar blow-off top.",
+                pattern=pattern,
+                ema_20=ema_20,
+                ema_50=ema_50,
+                trend_aligned=True,
+            )
+
         buffer = max(SL_BUFFER_ATR_RATIO * atr_14, SL_MIN_BUFFER_PCT * sl_anchor)
         stop_loss = sl_anchor - buffer
         entry_price = curr.close
@@ -280,6 +304,25 @@ def evaluate_15m_momentum_setup(
         if stop_loss <= 0.0 or risk <= 0.0:
             return _wait(
                 "Jarak stop loss tidak valid.",
+                pattern=pattern,
+                ema_20=ema_20,
+                ema_50=ema_50,
+                trend_aligned=True,
+            )
+        sl_dist_pct = (risk / entry_price) * 100.0
+        if sl_dist_pct > MAX_MOMENTUM_SL_PCT or risk > MAX_MOMENTUM_SL_ATR_RATIO * atr_14:
+            return _wait(
+                "Jarak stop loss momentum 15m terlalu lebar (> 5,0% atau > 3,5x ATR).",
+                pattern=pattern,
+                ema_20=ema_20,
+                ema_50=ema_50,
+                trend_aligned=True,
+            )
+        cost_px = DEFAULT_SCREENER_ROUND_TRIP_COST_RATE * entry_price
+        net_rr_tp2 = (2.0 * risk - cost_px) / (risk + cost_px)
+        if net_rr_tp2 < MIN_SCREENER_NET_RR_TP2:
+            return _wait(
+                "Rasio Risk:Reward 15m setelah estimasi biaya terlalu rendah (< 1,2R).",
                 pattern=pattern,
                 ema_20=ema_20,
                 ema_50=ema_50,
@@ -348,6 +391,15 @@ def evaluate_15m_momentum_setup(
             trend_aligned=False,
         )
 
+    if rsi_14 is not None and rsi_14 <= MIN_MOMENTUM_RSI:
+        return _wait(
+            f"RSI 15m jenuh jual ({rsi_14:.1f} <= 20); hindari mengejar panic sell ekstrem.",
+            pattern=pattern,
+            ema_20=ema_20,
+            ema_50=ema_50,
+            trend_aligned=True,
+        )
+
     buffer = max(SL_BUFFER_ATR_RATIO * atr_14, SL_MIN_BUFFER_PCT * sl_anchor)
     stop_loss = sl_anchor + buffer
     entry_price = curr.close
@@ -355,6 +407,25 @@ def evaluate_15m_momentum_setup(
     if risk <= 0.0:
         return _wait(
             "Jarak stop loss tidak valid.",
+            pattern=pattern,
+            ema_20=ema_20,
+            ema_50=ema_50,
+            trend_aligned=True,
+        )
+    sl_dist_pct = (risk / entry_price) * 100.0
+    if sl_dist_pct > MAX_MOMENTUM_SL_PCT or risk > MAX_MOMENTUM_SL_ATR_RATIO * atr_14:
+        return _wait(
+            "Jarak stop loss momentum 15m terlalu lebar (> 5,0% atau > 3,5x ATR).",
+            pattern=pattern,
+            ema_20=ema_20,
+            ema_50=ema_50,
+            trend_aligned=True,
+        )
+    cost_px = DEFAULT_SCREENER_ROUND_TRIP_COST_RATE * entry_price
+    net_rr_tp2 = (2.0 * risk - cost_px) / (risk + cost_px)
+    if net_rr_tp2 < MIN_SCREENER_NET_RR_TP2:
+        return _wait(
+            "Rasio Risk:Reward 15m setelah estimasi biaya terlalu rendah (< 1,2R).",
             pattern=pattern,
             ema_20=ema_20,
             ema_50=ema_50,
@@ -444,7 +515,11 @@ async def screen_momentum_movers(
                 failed.append(snap.canonical_symbol)
                 return
 
-            if batch.has_provider_error or not batch.candles:
+            if (
+                batch.has_provider_error
+                or not batch.candles
+                or any(f in _BLOCKING_SCREENER_FLAGS for f in batch.quality_flags)
+            ):
                 failed.append(snap.canonical_symbol)
                 return
 
@@ -569,9 +644,6 @@ def render_momentum_screener_report(
                 f"{_b(item.side.upper())} [{_e(_pattern_label(item.pattern))}]"
             )
             lines.append(_e("   • Gaya Setup: SCALP / Quick Intraday (15m Momentum Continuation)"))
-            lines.append(
-                _e("   • Gaya Setup: SCALP / Quick Intraday (15m Momentum Continuation)")
-            )
             lines.append(_e(f"   • Entry Close 15m: {ent} | Tren EMA20/50 Selaras"))
             lines.append(_e(f"   • Stop Loss: {sl} ({sl_pct}) - {item.sl_anchor_note or ''}"))
             lines.append(

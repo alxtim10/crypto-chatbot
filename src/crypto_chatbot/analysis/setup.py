@@ -1000,6 +1000,18 @@ def build_trade_setup(
             smc=smc,
             ltf_support=ltf_sup,
         )
+        if tp3 <= 0.0 or not (entry_mid > tp1 > tp2 > tp3):
+            return _wait_setup(
+                "Target take profit SHORT melampaui batas harga positif "
+                "(volatilitas/SL terlalu lebar).",
+                risk_notes,
+                entry_timeframe=entry_tf,
+                ltf_confirmation=ltf_confirmation,
+                htf_support=htf_sup,
+                htf_resistance=htf_res,
+                ltf_support=ltf_sup,
+                ltf_resistance=ltf_res,
+            )
         rr_tp1 = (entry_mid - tp1) / risk
         rr_tp2 = (entry_mid - tp2) / risk
         rr_tp3 = (entry_mid - tp3) / risk
@@ -1044,15 +1056,24 @@ def build_trade_setup(
     net_rr_tp3 = _net_reward_risk(
         entry_mid=entry_mid, target=tp3, stop_loss=stop_loss, cost_rate=cost_rate
     )
-    if net_rr_tp2 is not None and net_rr_tp2 < MIN_RR_TP2:
-        risk_notes.append(
-            "Rasio Risk:Reward ke TP 2 setelah biaya (fee + spread + slippage) turun di bawah "
-            "1:1,5; perkecil ukuran posisi atau tunggu zona entry lebih presisi."
+    if net_rr_tp2 is None or net_rr_tp2 < MIN_RR_TP2:
+        return _wait_setup(
+            "Rasio Risk:Reward ke TP 2 setelah biaya (fee + spread + slippage) "
+            "di bawah batas minimum 1:1,5 (WAIT).",
+            risk_notes,
+            entry_timeframe=entry_tf,
+            ltf_confirmation=ltf_confirmation,
+            htf_support=htf_sup,
+            htf_resistance=htf_res,
+            ltf_support=ltf_sup,
+            ltf_resistance=ltf_res,
         )
 
     sl_dist_ratio = abs(entry_mid - stop_loss) / entry_mid
     sl_dist_pct = round(sl_dist_ratio * 100.0, 4)
-    max_theor_lev = max(1, int(0.8 / sl_dist_ratio)) if sl_dist_ratio > 0 else 1
+    max_theor_lev = (
+        min(20, max(1, int(0.75 / (sl_dist_ratio + cost_rate)))) if sl_dist_ratio > 0 else 1
+    )
 
     return TradeSetup(
         status=SetupStatus.READY,
@@ -1244,7 +1265,7 @@ def _select_short_targets(
     if tp1_match is not None:
         tp1, tp1_label = tp1_match
     else:
-        tp1 = max(1e-8, entry_mid - DEFAULT_TP1_R * risk)
+        tp1 = entry_mid - DEFAULT_TP1_R * risk
         tp1_label = "Ekspansi 1,0R"
 
     tp2_match = next(
@@ -1259,7 +1280,7 @@ def _select_short_targets(
     if tp2_match is not None:
         tp2, tp2_label = tp2_match
     else:
-        tp2 = max(1e-8, min(tp1 - 0.8 * risk, entry_mid - DEFAULT_TP2_R * risk))
+        tp2 = min(tp1 - 0.8 * risk, entry_mid - DEFAULT_TP2_R * risk)
         tp2_label = "Ekspansi 2,0R"
 
     tp3_match = next(
@@ -1273,7 +1294,7 @@ def _select_short_targets(
     if tp3_match is not None:
         tp3, tp3_label = tp3_match
     else:
-        tp3 = max(1e-8, min(tp2 - risk, entry_mid - DEFAULT_TP3_R * risk))
+        tp3 = min(tp2 - risk, entry_mid - DEFAULT_TP3_R * risk)
         tp3_label = "Ekspansi 3,0R"
 
     return tp1, tp1_label, tp2, tp2_label, tp3, tp3_label
@@ -1284,11 +1305,13 @@ def evaluate_setup_against_candles(
     future_candles: Sequence[MarketCandle],
     *,
     max_bars: int = 24,
+    cost_assumptions: CostAssumptions | None = None,
 ) -> tuple[str, datetime | None, float | None]:
     """Deterministically settle a logged setup against subsequent closed candles.
 
-    Conservative tie-break: if any candle after/at trigger touches both SL and TP,
-    SL takes precedence (`hit_sl`, `-1.0R`).
+    Uses causal scaled partial exits (40% TP1 + move SL to breakeven, 40% TP2, 20% TP3),
+    gap-through-SL pricing at `candle.open`, round-trip cost deduction, and never settles
+    partial TPs before `max_bars` candles have closed.
     """
     if setup.status != SetupStatus.READY.value:
         return "skipped_wait", None, None
@@ -1316,56 +1339,84 @@ def evaluate_setup_against_candles(
     if risk <= 0:
         return "skipped_wait", None, None
 
+    costs = cost_assumptions or CostAssumptions()
     is_long = setup.bias == SetupBias.LONG.value
     triggered = False
-    highest_tp = 0
-    tp_hit_times: dict[int, datetime] = {}
+    just_triggered_idx = -1
+    fill_price = setup.entry_mid
+    current_sl = setup.stop_loss
+    remaining = 1.0
+    realized_r = 0.0
+    hit_tp1 = False
+    hit_tp2 = False
 
-    for candle in candles:
+    for idx, candle in enumerate(candles):
         if not triggered:
             if candle.low <= setup.entry_high and candle.high >= setup.entry_low:
                 triggered = True
+                just_triggered_idx = idx
+                if is_long:
+                    fill_price = (
+                        setup.entry_high if candle.open >= setup.entry_high else candle.open
+                    )
+                elif candle.open <= setup.entry_low:
+                    fill_price = setup.entry_low
+                else:
+                    fill_price = candle.open
             else:
                 continue
 
-        if is_long:
-            if candle.low <= setup.stop_loss:
-                return "hit_sl", candle.close_time, -1.0
-            if candle.high >= setup.tp3:
-                return "hit_tp3", candle.close_time, setup.rr_tp3
-            if candle.high >= setup.tp2 and highest_tp < 2:
-                highest_tp = 2
-                tp_hit_times[2] = candle.close_time
-            if candle.high >= setup.tp1 and highest_tp < 1:
-                highest_tp = 1
-                tp_hit_times[1] = candle.close_time
-        else:
-            if candle.high >= setup.stop_loss:
-                return "hit_sl", candle.close_time, -1.0
-            if candle.low <= setup.tp3:
-                return "hit_tp3", candle.close_time, setup.rr_tp3
-            if candle.low <= setup.tp2 and highest_tp < 2:
-                highest_tp = 2
-                tp_hit_times[2] = candle.close_time
-            if candle.low <= setup.tp1 and highest_tp < 1:
-                highest_tp = 1
-                tp_hit_times[1] = candle.close_time
+        gap_sl = (candle.open <= current_sl) if is_long else (candle.open >= current_sl)
+        touched_sl = gap_sl or (
+            (candle.low <= current_sl) if is_long else (candle.high >= current_sl)
+        )
+        if touched_sl:
+            exit_px = candle.open if gap_sl else current_sl
+            ref_entry = (
+                setup.entry_mid
+                if (gap_sl and just_triggered_idx == idx and not hit_tp1)
+                else fill_price
+            )
+            leg_r = (exit_px - ref_entry) / risk if is_long else (ref_entry - exit_px) / risk
+            realized_r += remaining * leg_r
+            cost_r = (costs.round_trip_cost_rate * fill_price) / risk
+            sl_outcome = "hit_tp2" if hit_tp2 else ("hit_tp1" if hit_tp1 else "hit_sl")
+            return sl_outcome, candle.close_time, realized_r - cost_r
 
-    if highest_tp == 2:
-        return "hit_tp2", tp_hit_times[2], setup.rr_tp2
-    if highest_tp == 1:
-        return "hit_tp1", tp_hit_times[1], setup.rr_tp1
+        if not hit_tp1 and ((candle.high >= setup.tp1) if is_long else (candle.low <= setup.tp1)):
+            hit_tp1 = True
+            leg_tp1 = (
+                (setup.tp1 - fill_price) / risk if is_long else (fill_price - setup.tp1) / risk
+            )
+            realized_r += 0.40 * leg_tp1
+            remaining -= 0.40
+            current_sl = fill_price
+
+        if not hit_tp2 and ((candle.high >= setup.tp2) if is_long else (candle.low <= setup.tp2)):
+            hit_tp2 = True
+            leg_tp2 = (
+                (setup.tp2 - fill_price) / risk if is_long else (fill_price - setup.tp2) / risk
+            )
+            realized_r += 0.40 * leg_tp2
+            remaining -= 0.40
+
+        if (candle.high >= setup.tp3) if is_long else (candle.low <= setup.tp3):
+            leg_tp3 = (
+                (setup.tp3 - fill_price) / risk if is_long else (fill_price - setup.tp3) / risk
+            )
+            realized_r += remaining * leg_tp3
+            cost_r = (costs.round_trip_cost_rate * fill_price) / risk
+            return "hit_tp3", candle.close_time, realized_r - cost_r
 
     if len(candles) >= max_bars:
         if not triggered:
             return "expired", candles[-1].close_time, 0.0
         last_close = candles[-1].close
-        realized_r = (
-            (last_close - setup.entry_mid) / risk
-            if is_long
-            else (setup.entry_mid - last_close) / risk
-        )
-        return "expired", candles[-1].close_time, realized_r
+        leg_end = (last_close - fill_price) / risk if is_long else (fill_price - last_close) / risk
+        realized_r += remaining * leg_end
+        cost_r = (costs.round_trip_cost_rate * fill_price) / risk
+        final_outcome = "hit_tp2" if hit_tp2 else ("hit_tp1" if hit_tp1 else "expired")
+        return final_outcome, candles[-1].close_time, realized_r - cost_r
 
     if triggered:
         return "entry_triggered", None, None

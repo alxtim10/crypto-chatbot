@@ -297,14 +297,15 @@ class _PtbHarness:
                 "pine": 4,
                 "scan": 5,
                 "screen": 6,
-                "watchlist": 7,
-                "memory": 8,
-                "forget": 9,
+                "whale": 7,
+                "watchlist": 8,
+                "memory": 9,
+                "forget": 10,
             }
-            idx = cmd_map.get(cmd, 10)
+            idx = cmd_map.get(cmd, 11)
             ctx: Any = SimpleNamespace(args=args)
         else:
-            idx = 11
+            idx = 12
             ctx = SimpleNamespace(args=[])
 
         await self._handlers[idx].callback(update, ctx)

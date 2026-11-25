@@ -392,3 +392,103 @@ def test_templates_rendering_with_macro_and_perpetual() -> None:
     assert "BENCHMARK BTC" in rendered.upper()
     assert "Jarak Stop Loss: 4,95%" in rendered
     assert "16x" in rendered
+
+
+@pytest.mark.asyncio
+async def test_dxy_4h_resampling_per_tf_cache_and_weekend_close_time_alignment() -> None:
+    import httpx
+
+    from crypto_chatbot.market_data.macro_provider import DxyMarketDataProvider
+
+    # 8 closed 1h DXY bars across 2 UTC 4h buckets (00:00..04:00 and 04:00..08:00)
+    t0 = datetime(2026, 11, 20, 0, 0, tzinfo=UTC)
+    hourly_ts = [int((t0 + timedelta(hours=h)).timestamp()) for h in range(8)]
+    payload = {
+        "chart": {
+            "result": [
+                {
+                    "timestamp": hourly_ts,
+                    "indicators": {
+                        "quote": [
+                            {
+                                "open": [104.0, 104.1, 104.2, 104.3, 105.0, 105.1, 105.2, 105.3],
+                                "high": [104.5, 104.4, 104.6, 104.8, 105.5, 105.6, 105.7, 105.8],
+                                "low": [103.8, 103.9, 104.0, 104.1, 104.8, 104.9, 105.0, 105.1],
+                                "close": [104.1, 104.2, 104.3, 104.7, 105.1, 105.2, 105.3, 105.6],
+                                "volume": [10.0] * 8,
+                            }
+                        ]
+                    },
+                }
+            ]
+        }
+    }
+
+    now_open = t0 + timedelta(hours=8, minutes=1)
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(200, json=payload)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_handler)) as client:
+        provider = DxyMarketDataProvider(client=client)
+        h4_candles = await provider.get_dxy_candles(Timeframe.H4, limit=10, now=now_open)
+        assert len(h4_candles) == 2
+        assert h4_candles[0].timeframe is Timeframe.H4
+        assert h4_candles[0].open_time == t0
+        assert h4_candles[0].close_time == t0 + timedelta(hours=4)
+        assert h4_candles[0].open == 104.0
+        assert h4_candles[0].high == 104.8
+        assert h4_candles[0].low == 103.8
+        assert h4_candles[0].close == 104.7
+        assert h4_candles[1].close_time == t0 + timedelta(hours=8)
+
+        # Cache isolation: requesting D1 when cached H4 exists returns D1 cache only
+        h1_candles = await provider.get_dxy_candles(Timeframe.H1, limit=10, now=now_open)
+        assert all(c.timeframe is Timeframe.H1 for c in h1_candles)
+        assert Timeframe.H4 in provider._cached_candles
+        assert Timeframe.H1 in provider._cached_candles
+
+    # Timestamp-aligned DXY correlation skips unmatched crypto weekend bars cleanly
+    base = datetime(2026, 11, 16, 0, 0, tzinfo=UTC)
+    target_all: list[MarketCandle] = []
+    t_px = 100.0
+    for i in range(40):
+        t_px = t_px * (1.012 if i % 2 == 0 else 0.995)
+        target_all.append(_make_candle(i, t_px, base_time=base, timeframe=Timeframe.H4))
+    # Only include DXY bars on a subset of close_times (simulating weekend FX gap)
+    dxy_subset: list[MarketCandle] = []
+    d_px = 100.0
+    for idx, c in enumerate(target_all[:25]):
+        d_px = d_px * (0.994 if idx % 2 == 0 else 1.003)
+        dxy_subset.append(
+            MarketCandle(
+                provider="yahoo",
+                venue="nyb",
+                canonical_symbol="DXY/USD",
+                provider_symbol="DX-Y.NYB",
+                market_type=MarketType.SPOT,
+                timeframe=Timeframe.H4,
+                open_time=c.open_time,
+                close_time=c.close_time,
+                received_time=c.close_time,
+                available_time=c.close_time,
+                open=d_px * 0.998,
+                high=d_px * 1.01,
+                low=d_px * 0.99,
+                close=d_px,
+                base_volume=10.0,
+                base_unit="DXY",
+                quote_currency="USD",
+                is_closed=True,
+            )
+        )
+    ctx = build_macro_benchmark_context(
+        target_candles=target_all,
+        target_canonical_symbol="BTC/USDT:USDT",
+        as_of=target_all[-1].close_time,
+        dxy_candles=dxy_subset,
+    )
+    assert ctx.dxy is not None
+    assert ctx.dxy.rolling_corr_20 is not None
+    assert math.isfinite(ctx.dxy.rolling_corr_20)

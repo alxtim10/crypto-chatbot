@@ -9,11 +9,14 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from crypto_chatbot.market_data.symbols import resolve_default_perp_symbol
+from crypto_chatbot.market_data.whale_provider import detect_network_type
 from crypto_chatbot.schemas.commands import (
     AnalyzeCommandArgs,
     CompareCommandArgs,
     WatchlistAction,
     WatchlistCommandArgs,
+    WhaleAction,
+    WhaleCommandArgs,
 )
 from crypto_chatbot.schemas.market import (
     MULTI_STYLE_SCAN_TIMEFRAMES,
@@ -322,6 +325,72 @@ _NON_TICKER_ACRONYMS: frozenset[str] = frozenset(
         "PELUANG",
         "LIST",
         "DAFTAR",
+        "KAPAN",
+        "AJA",
+        "SAJA",
+        "YUK",
+        "BRO",
+        "MIN",
+        "BOT",
+        "BANG",
+        "GAN",
+        "HALO",
+        "HAI",
+        "SIANG",
+        "THANKS",
+        "MAKASIH",
+        "TERIMA",
+        "MANTAP",
+        "KEREN",
+        "WADUH",
+        "TAPI",
+        "SOALNYA",
+        "MENURUT",
+        "KAMU",
+        "ANDA",
+        "SAYA",
+        "AKU",
+        "GUE",
+        "CRYPTO",
+        "KRIPTO",
+        "TRADING",
+        "TRADE",
+        "CHART",
+        "CANDLE",
+        "TIMEFRAME",
+        "STRATEGI",
+        "MINDSET",
+        "PSIKOLOGI",
+        "MODAL",
+        "LOSS",
+        "PROFIT",
+        "CUAN",
+        "NYANGKUT",
+        "LEVERAGE",
+        "MARGIN",
+        "FUTURE",
+        "BESOK",
+        "NANTI",
+        "TADI",
+        "BARU",
+        "NGGAK",
+        "ENGGAK",
+        "JUGA",
+        "BGT",
+        "BANGET",
+        "KAN",
+        "YAH",
+        "MANA",
+        "SIAPA",
+        "BERAPA",
+        "PAKAI",
+        "PAKE",
+        "BINGUNG",
+        "SUSAH",
+        "GAMPANG",
+        "ENAKNYA",
+        "BAIKNYA",
+        "COCOK",
     }
 )
 _NON_USDT_PAIR_RE = re.compile(r"\b([A-Z0-9]{2,12}/(?!USDT\b)[A-Z]{2,10})\b", re.IGNORECASE)
@@ -340,6 +409,14 @@ _SCREEN_INTENT_RE = re.compile(
 )
 _SCREEN_LONG_HINT_RE = re.compile(r"\b(?:gainer|gainers|long|buy|naik)\b", re.IGNORECASE)
 _SCREEN_SHORT_HINT_RE = re.compile(r"\b(?:loser|losers|short|sell|turun)\b", re.IGNORECASE)
+_WHALE_INTENT_RE = re.compile(
+    r"(?:\bwhale\b|\bpaus\b|\bsmart\s*money\b|\bdompet\b|\bwallet\b)",
+    re.IGNORECASE,
+)
+_WALLET_ADDRESS_RE = re.compile(
+    r"\b(0x[a-fA-F0-9]{40}|1[a-km-zA-HJ-NP-Z1-9]{25,34}|3[a-km-zA-HJ-NP-Z1-9]{25,34}|bc1[a-zA-HJ-NP-Z0-9]{39,59})\b",
+    re.IGNORECASE,
+)
 _SCAN_INTENT_RE = re.compile(
     r"(?:\b(?:ada\s+(?:token|koin|coin|setup|sinyal|peluang)|"
     r"(?:setup|sinyal)\s+apa|"
@@ -354,6 +431,12 @@ _CONTEXT_TOPIC_RE = re.compile(
     r"support|resistance|level|struktur|analisis|analisa|kondisi|bagaimana|"
     r"gimana|kenapa|mengapa|jelaskan|lanjut|kesimpulan|risiko|"
     r"entry|sl|tp|smc|fvg|order\s*block|setup|plan|likuiditas|liquidity|funding|oi|dxy|benchmark)\b",
+    re.IGNORECASE,
+)
+_CONCEPTUAL_QA_RE = re.compile(
+    r"(?:\b(?:apa\s+itu|apa\s+arti|artinya\s+apa|bedanya|perbedaan|"
+    r"maksudnya|gimana\s+cara|bagaimana\s+cara|cara\s+atur|cara\s+pakai|"
+    r"kenapa\s+(?:tadi|barusan|kok)|tips\s+trading|psikologi\s+trading)\b)",
     re.IGNORECASE,
 )
 _ORDER_OR_ADVICE_RE = re.compile(
@@ -414,6 +497,16 @@ class ScreenIntent(BaseModel):
     min_volume_usd: float = 5_000_000.0
 
 
+class WhaleIntent(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    kind: Literal["whale"] = "whale"
+    action: WhaleAction = WhaleAction.OVERVIEW
+    symbol: str | None = None
+    address: str | None = None
+    label: str | None = None
+
+
 class ChatQaIntent(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -435,6 +528,7 @@ FollowupIntent = (
     | PineIntent
     | ScanIntent
     | ScreenIntent
+    | WhaleIntent
     | ChatQaIntent
     | RefusalIntent
 )
@@ -565,6 +659,46 @@ def parse_watchlist_args(args: Sequence[str]) -> WatchlistCommandArgs:
         "- /watchlist add <SIMBOL>\n"
         "- /watchlist remove <SIMBOL>"
     )
+
+
+def parse_whale_args(args: Sequence[str]) -> WhaleCommandArgs:
+    """Parse arguments for the /whale command."""
+    if not args:
+        return WhaleCommandArgs(action=WhaleAction.OVERVIEW, symbol="BTC")
+
+    first = args[0].strip()
+    first_lower = first.lower()
+
+    if first_lower == "list":
+        return WhaleCommandArgs(action=WhaleAction.LIST)
+
+    if first_lower == "add":
+        if len(args) < 2:
+            raise CommandParseError("Penggunaan: /whale add <alamat_wallet> [label]")
+        addr = args[1].strip()
+        net = detect_network_type(addr)
+        if net is None:
+            raise CommandParseError(
+                f"Alamat wallet '{addr}' tidak valid. "
+                "Harus format EVM (0x...), Bitcoin, atau Solana."
+            )
+        label = " ".join(args[2:]).strip() if len(args) > 2 else f"Whale-{addr[:6]}"
+        return WhaleCommandArgs(action=WhaleAction.ADD, address=addr, label=label)
+
+    if first_lower == "remove":
+        if len(args) < 2:
+            raise CommandParseError("Penggunaan: /whale remove <alamat_wallet>")
+        addr = args[1].strip()
+        return WhaleCommandArgs(action=WhaleAction.REMOVE, address=addr)
+
+    # Check if first argument is a wallet address
+    net = detect_network_type(first)
+    if net is not None:
+        return WhaleCommandArgs(action=WhaleAction.WALLET, address=first)
+
+    # Otherwise treat as ticker symbol
+    clean_sym = first.upper()
+    return WhaleCommandArgs(action=WhaleAction.OVERVIEW, symbol=clean_sym)
 
 
 def _extract_mvp_symbols(text: str) -> list[str]:
@@ -736,6 +870,21 @@ def resolve_followup_intent(
             timeframes=MULTI_STYLE_SCAN_TIMEFRAMES,
         )
 
+    addr_match = _WALLET_ADDRESS_RE.search(cleaned)
+    if addr_match is not None:
+        extracted_addr = addr_match.group(1)
+        if re.search(r"\b(?:tambah|add)\b", cleaned, re.IGNORECASE):
+            return WhaleIntent(action=WhaleAction.ADD, address=extracted_addr, label="User Tracked")
+        if re.search(r"\b(?:hapus|remove|delete)\b", cleaned, re.IGNORECASE):
+            return WhaleIntent(action=WhaleAction.REMOVE, address=extracted_addr)
+        return WhaleIntent(action=WhaleAction.WALLET, address=extracted_addr)
+
+    if _WHALE_INTENT_RE.search(cleaned):
+        if re.search(r"\b(?:list|daftar|watchlist)\b", cleaned, re.IGNORECASE):
+            return WhaleIntent(action=WhaleAction.LIST)
+        target_sym = mentioned[0] if mentioned else (recent_symbols[0] if recent_symbols else "BTC")
+        return WhaleIntent(action=WhaleAction.OVERVIEW, symbol=target_sym)
+
     if is_pine:
         if mentioned:
             return PineIntent(symbol=mentioned[0], timeframe=new_query_tf)
@@ -752,7 +901,11 @@ def resolve_followup_intent(
                 return CompareIntent(symbols=(prior, mentioned[0]), timeframe=followup_tf)
         return AnalyzeIntent(symbol=mentioned[0], timeframe=new_query_tf, detail=is_detail)
 
-    if recent_symbols and (_CONTEXT_TOPIC_RE.search(cleaned) or is_compare or is_detail):
+    if (
+        recent_symbols
+        and (_CONTEXT_TOPIC_RE.search(cleaned) or is_compare or is_detail)
+        and _CONCEPTUAL_QA_RE.search(cleaned) is None
+    ):
         if is_compare and len(recent_symbols) >= 2:
             return CompareIntent(symbols=tuple(recent_symbols[:2]), timeframe=followup_tf)
         return AnalyzeIntent(symbol=recent_symbols[0], timeframe=followup_tf, detail=is_detail)

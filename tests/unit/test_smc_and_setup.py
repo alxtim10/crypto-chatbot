@@ -34,6 +34,7 @@ from crypto_chatbot.schemas.analysis import (
 )
 from crypto_chatbot.schemas.llm import AnalysisResponse, LlmAnalysisNarration, NarrationStatus
 from crypto_chatbot.schemas.market import MarketCandle, MarketType, Timeframe
+from crypto_chatbot.schemas.ml import CostAssumptions
 from crypto_chatbot.storage.repositories import TradeSetupRecord
 
 FIXTURE_1000 = Path(__file__).resolve().parents[1] / "fixtures" / "parity_1000_candles.json"
@@ -320,15 +321,29 @@ def test_evaluate_setup_against_candles_outcomes_and_sl_tiebreak() -> None:
         rr_tp3=3.0,
     )
 
-    # 1. Trigger then hit TP2
+    # 1. Trigger then hit TP2: does not settle prematurely before max_bars horizon completes
     tp2_candles = [
-        _candle(0, open_p=104.0, high_p=105.0, low_p=100.5, close_p=102.0),  # fills 100.5 <= 101
-        _candle(1, open_p=102.0, high_p=111.0, low_p=101.0, close_p=110.5),  # hits TP2
+        _candle(0, open_p=104.0, high_p=104.5, low_p=100.5, close_p=102.0),  # fills at 101.0
+        _candle(1, open_p=102.0, high_p=111.0, low_p=101.5, close_p=110.5),  # hits TP1+TP2
     ]
-    st, settled_at, r_val = evaluate_setup_against_candles(record, tp2_candles, max_bars=24)
+    st_unfinished, settled_unfinished, r_unfinished = evaluate_setup_against_candles(
+        record, tp2_candles, max_bars=24
+    )
+    assert st_unfinished == "entry_triggered"
+    assert settled_unfinished is None
+    assert r_unfinished is None
+
+    # Once horizon completes at max_bars=2, scaled 40/40/20 partial exit settles minus cost
+    st, settled_at, r_val = evaluate_setup_against_candles(record, tp2_candles, max_bars=2)
     assert st == "hit_tp2"
     assert settled_at == tp2_candles[1].close_time
-    assert r_val == pytest.approx(2.0)
+    expected_gross = (
+        0.40 * ((105.0 - 101.0) / 5.0)
+        + 0.40 * ((110.0 - 101.0) / 5.0)
+        + 0.20 * ((110.5 - 101.0) / 5.0)
+    )
+    expected_cost = (0.0032 * 101.0) / 5.0
+    assert r_val == pytest.approx(expected_gross - expected_cost)
 
     # 2. Conservative tie-break: same candle touches both SL (95) and TP3 (115) -> hit_sl!
     tie_candles = [
@@ -336,7 +351,8 @@ def test_evaluate_setup_against_candles_outcomes_and_sl_tiebreak() -> None:
     ]
     st_tie, _, r_tie = evaluate_setup_against_candles(record, tie_candles, max_bars=24)
     assert st_tie == "hit_sl"
-    assert r_tie == pytest.approx(-1.0)
+    expected_sl_net = ((95.0 - 100.5) / 5.0) - ((0.0032 * 100.5) / 5.0)
+    assert r_tie == pytest.approx(expected_sl_net)
 
     # 3. Never reaches entry zone within horizon -> expired (0.0R)
     unfilled = [
@@ -488,6 +504,7 @@ def test_top_down_15m_refinement_and_direct_15m_htf_filter() -> None:
         primary_timeframe=Timeframe.H4,
         ltf_candles=ltf_candles,
         as_of=as_of,
+        cost_assumptions=CostAssumptions(execution_style="maker"),
     )
     assert refined.status is SetupStatus.READY
     assert refined.entry_timeframe is Timeframe.M15
@@ -760,3 +777,111 @@ def test_trade_setup_sl_guarded_strictly_below_ltf_support() -> None:
         if setup.ltf_support is not None:
             # Must strictly be below LTF support
             assert setup.stop_loss < setup.ltf_support
+
+
+def test_setup_short_extreme_vol_no_crash_net_rr_wait_and_leverage_cap() -> None:
+    from crypto_chatbot.schemas.ml import CostAssumptions
+
+    # 1. Extreme ATR/SL on SHORT where 3x risk > entry_mid -> clean WAIT (no ValidationError)
+    t_piv = ANCHOR - timedelta(hours=12)
+    struct_bear = StructureAnalysis(
+        pivots=(),
+        market_structure=MarketStructure.BEARISH,
+        last_swing_highs=(
+            StructureEvent(
+                event_type=StructureEventType.SWING_HIGH,
+                event_time=t_piv,
+                confirmation_time=t_piv,
+                level=140.0,
+            ),
+        ),
+        last_swing_lows=(
+            StructureEvent(
+                event_type=StructureEventType.SWING_LOW,
+                event_time=t_piv,
+                confirmation_time=t_piv,
+                level=60.0,
+            ),
+        ),
+    )
+    metrics_extreme = TechnicalMetrics(
+        last_close=100.0,
+        ema_20=102.0,
+        ema_50=110.0,
+        atr_14=25.0,
+        adx_14=32.0,
+        rsi_14=42.0,
+    )
+    smc_bear = SmcSummary(
+        dealing_range_high=125.0,
+        dealing_range_low=75.0,
+        equilibrium=100.0,
+        dealing_zone=DealingZone.PREMIUM,
+    )
+    extreme_short = build_trade_setup(
+        metrics=metrics_extreme,
+        regime=Regime.TRENDING_DOWN,
+        structure=struct_bear,
+        smc=smc_bear,
+    )
+    assert extreme_short.status is SetupStatus.WAIT
+    assert extreme_short.wait_reason is not None
+
+    # 2. Tight SL setup: high friction pushes net_rr_tp2 < 1.5 -> WAIT gate
+    struct_bull = StructureAnalysis(
+        pivots=(),
+        market_structure=MarketStructure.BULLISH,
+        last_swing_highs=(
+            StructureEvent(
+                event_type=StructureEventType.SWING_HIGH,
+                event_time=t_piv,
+                confirmation_time=t_piv,
+                level=112.0,
+            ),
+        ),
+        last_swing_lows=(
+            StructureEvent(
+                event_type=StructureEventType.SWING_LOW,
+                event_time=t_piv,
+                confirmation_time=t_piv,
+                level=98.5,
+            ),
+        ),
+    )
+    metrics_tight = TechnicalMetrics(
+        last_close=100.0,
+        ema_20=99.5,
+        ema_50=97.0,
+        atr_14=0.6,
+        adx_14=28.0,
+        rsi_14=56.0,
+    )
+    smc_bull = SmcSummary(
+        dealing_range_high=112.0,
+        dealing_range_low=96.0,
+        equilibrium=104.0,
+        dealing_zone=DealingZone.DISCOUNT,
+    )
+    high_cost = CostAssumptions(
+        fee_bps_per_side=30.0, spread_bps=20.0, slippage_bps=20.0, funding_bps_per_24h=10.0
+    )
+    net_wait = build_trade_setup(
+        metrics=metrics_tight,
+        regime=Regime.TRENDING_UP,
+        structure=struct_bull,
+        smc=smc_bull,
+        cost_assumptions=high_cost,
+    )
+    assert net_wait.status is SetupStatus.WAIT
+
+    # 3. Normal cost READY setup caps max_theoretical_leverage <= 20
+    low_cost_ready = build_trade_setup(
+        metrics=metrics_tight,
+        regime=Regime.TRENDING_UP,
+        structure=struct_bull,
+        smc=smc_bull,
+        cost_assumptions=CostAssumptions(),
+    )
+    if low_cost_ready.status is SetupStatus.READY:
+        assert low_cost_ready.max_theoretical_leverage is not None
+        assert low_cost_ready.max_theoretical_leverage <= 20

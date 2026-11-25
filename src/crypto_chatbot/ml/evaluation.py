@@ -130,12 +130,15 @@ def compute_evaluation_summary(
     if not (n > 0 and len(p_model) == n and len(p_naive) == n and len(fwd_ret) == n):
         raise ValueError("evaluation arrays must be non-empty and share identical lengths")
 
+    round_trip_cost = cost_assumptions.round_trip_cost_rate
     naive_brier = float(np.mean((p_naive - y_true) ** 2))
     model_brier = float(np.mean((p_model - y_true) ** 2))
     skill = 1.0 - (model_brier / naive_brier) if naive_brier > 0.0 else 0.0
     bss = compute_brier_skill_score(model_brier, naive_brier)
     ece = compute_ece(y_true, p_model, n_bins=5)
-    cal_bins = compute_calibration_bins(y_true, p_model, net_returns=fwd_ret, n_bins=5)
+    cal_bins = compute_calibration_bins(
+        y_true, p_model, net_returns=fwd_ret - round_trip_cost, n_bins=5
+    )
 
     y_pred = p_model >= prob_threshold
     y_pos = y_true >= 0.5
@@ -151,7 +154,6 @@ def compute_evaluation_summary(
     precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
     recall = tpr
 
-    round_trip_cost = cost_assumptions.round_trip_cost_rate
     maker_cost_rate = cost_assumptions.model_copy(
         update={"execution_style": "maker"}
     ).round_trip_cost_rate

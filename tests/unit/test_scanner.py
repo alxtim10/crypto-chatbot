@@ -313,3 +313,85 @@ async def test_scan_market_setups_reports_honest_empty_state_when_all_wait() -> 
     assert "Belum ada koin dari daftar pantau yang berstatus READY" in rendered
     assert "(2 koin) Rezim ranging." in rendered
     assert "bukan saran transaksi" in rendered.lower()
+
+
+@pytest.mark.asyncio
+async def test_analysis_service_ohlcv_ttl_cache_deduplicates_calls() -> None:
+    from crypto_chatbot.analysis.service import AnalysisService
+    from crypto_chatbot.market_data.base import OhlcvBatch
+    from crypto_chatbot.schemas.market import MarketCandle, ProviderMetadata, QualityFlag
+
+    t0 = NOW - timedelta(hours=8)
+    candle = MarketCandle(
+        provider="ccxt",
+        venue="binance",
+        canonical_symbol="BTC/USDT:USDT",
+        provider_symbol="BINANCE:BTCUSDT.P",
+        market_type=MarketType.PERPETUAL,
+        timeframe=Timeframe.H4,
+        open_time=t0,
+        close_time=t0 + timedelta(hours=4),
+        received_time=NOW,
+        available_time=NOW,
+        open=90_000.0,
+        high=90_500.0,
+        low=89_500.0,
+        close=90_200.0,
+        base_volume=100.0,
+        base_unit="BTC",
+        quote_currency="USDT",
+        is_closed=True,
+    )
+    meta = ProviderMetadata(
+        provider="ccxt",
+        venue="binance",
+        market_type=MarketType.PERPETUAL,
+        base_unit="BTC",
+        quote_currency="USDT",
+    )
+
+    class _CountingProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.fail = False
+
+        async def get_closed_ohlcv(
+            self, symbol: str, timeframe: Timeframe, limit: int = 100
+        ) -> OhlcvBatch:
+            del limit
+            self.calls += 1
+            if self.fail:
+                return OhlcvBatch(
+                    metadata=meta,
+                    canonical_symbol=symbol,
+                    provider_symbol="BINANCE:BTCUSDT.P",
+                    timeframe=timeframe,
+                    received_time=NOW,
+                    candles=(),
+                    quality_flags=(QualityFlag.PROVIDER_ERROR,),
+                    error_message="err",
+                )
+            return OhlcvBatch(
+                metadata=meta,
+                canonical_symbol=symbol,
+                provider_symbol="BINANCE:BTCUSDT.P",
+                timeframe=timeframe,
+                received_time=NOW,
+                candles=(candle,),
+                quality_flags=(),
+            )
+
+        async def close(self) -> None:
+            return None
+
+    prov = _CountingProvider()
+    svc = AnalysisService(provider=prov, cache_ttl_seconds=45.0)
+    await svc.get_closed_ohlcv("BTC/USDT:USDT", Timeframe.H4, limit=100)
+    await svc.get_closed_ohlcv("BTC/USDT:USDT", Timeframe.H4, limit=100)
+    assert prov.calls == 1
+
+    # Error responses are never cached
+    prov.fail = True
+    await svc.get_closed_ohlcv("ETH/USDT:USDT", Timeframe.H4, limit=100)
+    await svc.get_closed_ohlcv("ETH/USDT:USDT", Timeframe.H4, limit=100)
+    assert prov.calls == 3

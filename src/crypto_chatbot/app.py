@@ -9,6 +9,7 @@ from typing import Any
 from telegram.ext import Application, ApplicationBuilder
 
 from crypto_chatbot.analysis.service import AnalysisService
+from crypto_chatbot.analysis.whale_tracker import WhaleWatchlistManager
 from crypto_chatbot.bot.access import AccessController
 from crypto_chatbot.bot.handlers import (
     BotService,
@@ -36,6 +37,7 @@ from crypto_chatbot.storage.repositories import (
     PostgresSetupLogRepository,
     PostgresTradingViewRepository,
     PostgresUserMemoryRepository,
+    PostgresWhaleWatchlistRepository,
 )
 
 
@@ -87,6 +89,7 @@ def build_telegram_application(
         tradingview_repository=tradingview_repo,
         news_repository=news_repo,
         dxy_provider=dxy_provider,
+        cache_ttl_seconds=45.0,
     )
 
     transport = GoogleGenAiTransport(
@@ -109,17 +112,22 @@ def build_telegram_application(
         settings.allowed_telegram_user_ids,
         rate_limit_per_minute=settings.rate_limit_per_minute,
     )
+    whale_watchlist = WhaleWatchlistManager(
+        store=PostgresWhaleWatchlistRepository(engine),
+    )
     bot_service = BotService(
         access=access_controller,
         analysis_service=analysis_service,
         narrator=narrator,
         memory=memory_service,
+        whale_watchlist=whale_watchlist,
     )
 
     async def on_shutdown(app: Application[Any, Any, Any, Any, Any, Any]) -> None:
         del app
         await provider.close()
         await derivatives_provider.close()
+        await dxy_provider.close()
         if bybit_provider is not None:
             await bybit_provider.close()
         engine.dispose()

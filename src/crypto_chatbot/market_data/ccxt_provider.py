@@ -271,6 +271,16 @@ class CcxtMarketDataProvider:
                     f"1000{mapping.base}",
                     market_type=MarketType.PERPETUAL,
                 )
+                if self._exchange_id != "binance":
+                    fallback_mapping = fallback_mapping.model_copy(
+                        update={
+                            "venue": self._exchange_id,
+                            "provider_symbol": (
+                                f"{self._exchange_id.upper()}:"
+                                f"{fallback_mapping.base}{fallback_mapping.quote}.P"
+                            ),
+                        }
+                    )
                 try:
                     raw_rows = await self._fetch_with_retries(
                         fallback_mapping.ccxt_symbol,

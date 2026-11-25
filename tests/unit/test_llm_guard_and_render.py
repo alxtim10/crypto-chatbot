@@ -209,3 +209,22 @@ def test_prompt_payload_sanitizes_and_fences_untrusted_text(
     assert payload.count("<untrusted_data>") == 2
     assert payload.count("</untrusted_data>") == 2
     assert "[filtered_tag]" in payload
+
+
+def test_conversational_answer_guard_blocks_unsafe_claims_and_allows_education() -> None:
+    from crypto_chatbot.llm.guard import validate_conversational_answer
+
+    ok = validate_conversational_answer(
+        "RSI 14 mengukur kecepatan momentum dalam skala 0 sampai 100 dan bukan prediksi harga."
+    )
+    assert ok.is_valid is True
+
+    for unsafe in (
+        "BTC pasti naik malam ini!",
+        "Wajib beli sekarang dan all-in.",
+        "Kunjungi https://scam.example untuk sinyal.",
+        "Gunakan kunci AIzaSyDummySecretValue1234567890abcd",
+        "Harga saat ini sekitar $99999 segera eksekusi order.",
+    ):
+        res = validate_conversational_answer(unsafe)
+        assert res.is_valid is False

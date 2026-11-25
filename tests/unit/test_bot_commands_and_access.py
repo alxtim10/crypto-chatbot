@@ -235,3 +235,77 @@ def test_template_escaping_and_splitting_on_hostile_input() -> None:
     chunks = split_telegram_message("\n".join(f"item {i}: baris panjang" for i in range(500)))
     assert len(chunks) > 1
     assert all(len(c) <= 4096 for c in chunks)
+
+
+def test_memory_service_uses_atomic_update_watchlist_when_available() -> None:
+    from typing import Literal
+
+    from crypto_chatbot.memory.service import MemoryService
+
+    class _AtomicMockRepo:
+        def __init__(self) -> None:
+            self.calls: list[tuple[int, str, str]] = []
+            self._wl: list[str] = ["BTC/USDT:USDT"]
+
+        def ensure_user(self, telegram_user_id: int) -> None:
+            del telegram_user_id
+
+        def get_preferences(self, telegram_user_id: int) -> UserPreferences:
+            del telegram_user_id
+            return UserPreferences(watchlist=tuple(self._wl))
+
+        def save_preferences(self, telegram_user_id: int, prefs: UserPreferences) -> None:
+            raise AssertionError("save_preferences must not be called when update_watchlist exists")
+
+        def update_watchlist(
+            self,
+            telegram_user_id: int,
+            symbol: str,
+            *,
+            action: Literal["add", "remove"],
+        ) -> tuple[UserPreferences, bool]:
+            self.calls.append((telegram_user_id, symbol, action))
+            if action == "add":
+                if symbol in self._wl:
+                    return UserPreferences(watchlist=tuple(self._wl)), False
+                self._wl.append(symbol)
+                return UserPreferences(watchlist=tuple(self._wl)), True
+            if symbol not in self._wl:
+                return UserPreferences(watchlist=tuple(self._wl)), False
+            self._wl = [s for s in self._wl if s != symbol]
+            return UserPreferences(watchlist=tuple(self._wl)), True
+
+        def append_message(self, *args: object, **kwargs: object) -> StoredMessage:
+            raise NotImplementedError
+
+        def get_recent_messages(
+            self, telegram_user_id: int, *, limit: int = 20
+        ) -> tuple[StoredMessage, ...]:
+            del telegram_user_id, limit
+            return ()
+
+        def record_llm_interaction(self, record: object) -> None:
+            del record
+
+        def forget_user_data(self, telegram_user_id: int) -> ForgetResult:
+            del telegram_user_id
+            return ForgetResult(
+                deleted_messages=0,
+                deleted_conversations=0,
+                deleted_preferences=0,
+                deleted_interactions=0,
+            )
+
+        def purge_expired(self, *, now: datetime | None = None) -> object:
+            del now
+            return None
+
+    repo = _AtomicMockRepo()
+    mem = MemoryService(repo)  # type: ignore[arg-type]
+    prefs_add, added = mem.add_to_watchlist(111, "eth")
+    assert added is True
+    assert "ETH/USDT:USDT" in prefs_add.watchlist
+    prefs_rem, removed = mem.remove_from_watchlist(111, "eth")
+    assert removed is True
+    assert "ETH/USDT:USDT" not in prefs_rem.watchlist
+    assert len(repo.calls) == 2

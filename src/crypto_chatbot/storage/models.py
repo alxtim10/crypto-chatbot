@@ -400,6 +400,7 @@ class TradeSetupRow(Base):
     snapshot_id: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
     venue: Mapped[str] = mapped_column(String(64), nullable=False)
     canonical_symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    market_type: Mapped[str] = mapped_column(String(16), nullable=False, default="spot")
     timeframe: Mapped[str] = mapped_column(String(16), nullable=False)
     as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(
@@ -605,3 +606,25 @@ class ModelPredictionRow(Base):
     realized_return: Mapped[float | None] = mapped_column(Double, nullable=True)
     realized_label: Mapped[int | None] = mapped_column(Integer, nullable=True)
     settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class WhaleWatchlistRow(Base):
+    """Per-user whale wallet watchlist (`whale_watchlists`)."""
+
+    __tablename__ = "whale_watchlists"
+    __table_args__ = (
+        UniqueConstraint("telegram_user_id", "address", name="uq_whale_watchlist_user_addr"),
+        Index("ix_whale_watchlists_user", "telegram_user_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    telegram_user_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("users.telegram_user_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    address: Mapped[str] = mapped_column(String(128), nullable=False)
+    network: Mapped[str] = mapped_column(String(16), nullable=False)
+    label: Mapped[str] = mapped_column(String(128), nullable=False)
+    added_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)

@@ -53,7 +53,7 @@ class DxyMarketDataProvider:
             timeout=timeout,
             headers={"User-Agent": DEFAULT_USER_AGENT},
         )
-        self._cached_candles: list[MarketCandle] = []
+        self._cached_candles: dict[Timeframe, list[MarketCandle]] = {}
 
     async def close(self) -> None:
         """Close internal HTTP client if owned."""
@@ -90,21 +90,79 @@ class DxyMarketDataProvider:
                 params={"interval": interval, "range": query_range},
             )
             if resp.status_code == 200:
-                candles = self._parse_yahoo_chart_response(
-                    resp.json(),
-                    timeframe=timeframe,
-                    now=current_time,
-                )
+                if timeframe is Timeframe.H4:
+                    hourly = self._parse_yahoo_chart_response(
+                        resp.json(),
+                        timeframe=Timeframe.H1,
+                        now=current_time,
+                    )
+                    candles = self._resample_to_4h(hourly, now=current_time)
+                else:
+                    candles = self._parse_yahoo_chart_response(
+                        resp.json(),
+                        timeframe=timeframe,
+                        now=current_time,
+                    )
                 if candles:
-                    self._cached_candles = list(candles)
+                    self._cached_candles[timeframe] = list(candles)
                     return candles[-limit:]
         except Exception as exc:
             logger.warning("Failed to fetch DXY candles from Yahoo Finance: %s", exc)
 
-        # Fallback to cached candles with weekend/closed flag if applicable
-        if self._cached_candles:
-            return tuple(self._cached_candles[-limit:])
+        # Fallback to cached candles for this exact timeframe
+        cached = self._cached_candles.get(timeframe)
+        if cached:
+            return tuple(cached[-limit:])
         return ()
+
+    @staticmethod
+    def _resample_to_4h(
+        hourly_candles: tuple[MarketCandle, ...],
+        *,
+        now: datetime,
+    ) -> tuple[MarketCandle, ...]:
+        """Resample closed 1h DXY candles into closed 4h UTC buckets cleanly."""
+        if not hourly_candles:
+            return ()
+        buckets: dict[datetime, list[MarketCandle]] = {}
+        for candle in hourly_candles:
+            utc_open = candle.open_time.astimezone(UTC)
+            bucket_hour = (utc_open.hour // 4) * 4
+            bucket_open = utc_open.replace(hour=bucket_hour, minute=0, second=0, microsecond=0)
+            buckets.setdefault(bucket_open, []).append(candle)
+
+        out: list[MarketCandle] = []
+        for bucket_open in sorted(buckets):
+            bucket_close = bucket_open + Timeframe.H4.duration
+            if bucket_close > now:
+                continue
+            group = sorted(buckets[bucket_open], key=lambda c: c.open_time)
+            out.append(
+                MarketCandle(
+                    provider=group[0].provider,
+                    venue=group[0].venue,
+                    canonical_symbol=group[0].canonical_symbol,
+                    provider_symbol=group[0].provider_symbol,
+                    market_type=group[0].market_type,
+                    timeframe=Timeframe.H4,
+                    open_time=bucket_open,
+                    close_time=bucket_close,
+                    received_time=now,
+                    available_time=bucket_close,
+                    open=group[0].open,
+                    high=max(c.high for c in group),
+                    low=min(c.low for c in group),
+                    close=group[-1].close,
+                    base_volume=sum(c.base_volume for c in group),
+                    quote_volume=None,
+                    taker_buy_base_volume=None,
+                    base_unit=group[0].base_unit,
+                    quote_currency=group[0].quote_currency,
+                    is_closed=True,
+                    quality_flags=(),
+                )
+            )
+        return tuple(out)
 
     def _parse_yahoo_chart_response(
         self,

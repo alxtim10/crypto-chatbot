@@ -123,3 +123,49 @@ class WatchlistCommandArgs(BaseModel):
         if self.action in (WatchlistAction.ADD, WatchlistAction.REMOVE) and self.symbol is None:
             raise ValueError(f"{self.action.value} action requires a symbol")
         return self
+
+
+class WhaleAction(StrEnum):
+    OVERVIEW = "overview"
+    WALLET = "wallet"
+    ADD = "add"
+    REMOVE = "remove"
+    LIST = "list"
+
+
+class WhaleCommandArgs(BaseModel):
+    """Arguments for the /whale command and whale tracker CLI."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    action: WhaleAction = WhaleAction.OVERVIEW
+    symbol: str | None = None
+    address: str | None = None
+    label: str | None = None
+
+    @field_validator("action", mode="before")
+    @classmethod
+    def _normalize_action(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.strip().lower()
+        return value
+
+    @field_validator("symbol", mode="before")
+    @classmethod
+    def _normalize_symbol(cls, value: object) -> str | None:
+        if value is None or not isinstance(value, str) or not value.strip():
+            return None
+        # Clean ticker e.g. "BTC/USDT:USDT" -> "BTC", "BTC" -> "BTC"
+        raw = value.strip().upper()
+        if "/" in raw:
+            raw = raw.split("/")[0]
+        elif raw.endswith("USDT") and len(raw) > 4:
+            raw = raw[:-4]
+        return raw
+
+    @field_validator("address", mode="before")
+    @classmethod
+    def _normalize_address(cls, value: object) -> str | None:
+        if value is None or not isinstance(value, str) or not value.strip():
+            return None
+        return value.strip()

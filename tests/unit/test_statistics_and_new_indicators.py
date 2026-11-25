@@ -241,3 +241,14 @@ def test_vwap_equals_typical_price_when_constant() -> None:
     # typical price = (102+98+100)/3 = 100
     assert vwap[-1] == pytest.approx(100.0)
     assert z[-1] == pytest.approx(0.0)
+
+
+def test_compute_statistical_metrics_annualizes_by_candle_timeframe() -> None:
+    rng = np.random.default_rng(7)
+    closes = list(100.0 * np.exp(np.cumsum(rng.normal(0.0, 0.01, 60))))
+    h1_candles = _series_from_closes(closes)
+    stats = compute_statistical_metrics(h1_candles)
+    assert stats.realized_vol_cc is not None
+    assert stats.realized_vol_cc_annualized == pytest.approx(
+        stats.realized_vol_cc * np.sqrt(365.0 * 24.0)
+    )

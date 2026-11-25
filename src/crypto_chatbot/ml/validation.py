@@ -188,7 +188,13 @@ def generate_cpcv_paths(
             test_spans.append((lo, hi))
 
         test_set = set(test_indices)
-        min_test_time = min(rows[i].prediction_time for i in test_indices)
+        test_time_spans = [
+            (
+                min(rows[i].prediction_time for i in range(lo, hi)),
+                max(rows[i].label_end_time for i in range(lo, hi)),
+            )
+            for lo, hi in test_spans
+        ]
         embargo_blocked: set[int] = set()
         for _lo, hi in test_spans:
             embargo_blocked.update(range(hi, min(n, hi + embargo_bars)))
@@ -198,7 +204,10 @@ def generate_cpcv_paths(
             for i in range(n)
             if i not in test_set
             and i not in embargo_blocked
-            and rows[i].label_end_time <= min_test_time
+            and not any(
+                rows[i].prediction_time < span_end and rows[i].label_end_time > span_start
+                for span_start, span_end in test_time_spans
+            )
         )
         if not train_indices:
             continue

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from collections.abc import Callable, Sequence
 from datetime import UTC, date, datetime
@@ -13,7 +14,7 @@ from google import genai
 from google.genai import types
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 
-from crypto_chatbot.llm.guard import validate_narration
+from crypto_chatbot.llm.guard import validate_conversational_answer, validate_narration
 from crypto_chatbot.llm.prompts import (
     ANALYSIS_SYSTEM_PROMPT,
     CONVERSATIONAL_QA_SYSTEM_PROMPT,
@@ -29,6 +30,8 @@ from crypto_chatbot.schemas.llm import (
     NarrationStatus,
 )
 from crypto_chatbot.schemas.market import QualityStatus
+
+logger = logging.getLogger(__name__)
 
 
 class RawGeminiOutput(BaseModel):
@@ -167,6 +170,7 @@ class NlpIntentClassification(BaseModel):
         "pine",
         "scan",
         "screen",
+        "whale",
         "chat_qa",
         "unsupported",
     ]
@@ -175,6 +179,8 @@ class NlpIntentClassification(BaseModel):
         None
     )
     screen_side: Literal["all", "long", "short"] | None = None
+    whale_action: Literal["overview", "wallet", "add", "remove", "list"] | None = None
+    whale_address: str | None = None
 
 
 class ConversationalAnswer(BaseModel):
@@ -405,8 +411,16 @@ class GeminiNarrator:
             )
             if not raw.text or not raw.text.strip():
                 return None
+            raw_obj = json.loads(raw.text)
+            if isinstance(raw_obj, dict):
+                if isinstance(raw_obj.get("timeframe"), str):
+                    raw_obj["timeframe"] = raw_obj["timeframe"].strip().lower() or None
+                if isinstance(raw_obj.get("screen_side"), str):
+                    raw_obj["screen_side"] = raw_obj["screen_side"].strip().lower() or None
+                return NlpIntentClassification.model_validate(raw_obj)
             return NlpIntentClassification.model_validate_json(raw.text)
-        except Exception:
+        except Exception as exc:
+            logger.debug("Gemini classify_intent fallback: %s", exc)
             return None
 
     async def answer_research_question(
@@ -449,6 +463,15 @@ class GeminiNarrator:
             if not raw.text or not raw.text.strip():
                 return None
             parsed = ConversationalAnswer.model_validate_json(raw.text)
-            return parsed.answer.strip()
+            answer = parsed.answer.strip()
+            guard = validate_conversational_answer(answer)
+            if not guard.is_valid:
+                logger.warning(
+                    "Blocked conversational QA response by guard user_id=%s reasons=%s",
+                    user_id,
+                    ",".join(guard.reasons),
+                )
+                return None
+            return answer
         except Exception:
             return None

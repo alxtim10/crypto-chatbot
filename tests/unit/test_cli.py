@@ -318,3 +318,69 @@ def test_cli_backtest_and_pine_from_fixture(
     pine_content = out_pine.read_text(encoding="utf-8")
     assert "//@version=6" in pine_content
     assert "if barstate.islast" in pine_content
+
+
+def test_cli_settle_setups_respects_perpetual_market_type(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from datetime import UTC, datetime
+
+    from crypto_chatbot.schemas.market import MarketType, Timeframe
+    from crypto_chatbot.storage.repositories import TradeSetupRecord
+
+    seen_market_types: list[MarketType] = []
+
+    class _FakeEngine:
+        def dispose(self) -> None:
+            return None
+
+    class _FakeMarketRepo:
+        def __init__(self, engine: object) -> None:
+            del engine
+
+        def load_candles(self, *, market_type: MarketType, **kwargs: object) -> list[object]:
+            del kwargs
+            seen_market_types.append(market_type)
+            return []
+
+    class _FakeSetupRepo:
+        def __init__(self, engine: object) -> None:
+            del engine
+
+        def list_pending_setups(self, *, limit: int = 200) -> tuple[TradeSetupRecord, ...]:
+            del limit
+            return (
+                TradeSetupRecord(
+                    snapshot_id="snap-perp-1",
+                    venue="bybit",
+                    canonical_symbol="BTC/USDT:USDT",
+                    market_type="perpetual",
+                    timeframe=Timeframe.H4,
+                    as_of=datetime(2026, 11, 20, 0, 0, tzinfo=UTC),
+                    status="ready",
+                    bias="long",
+                    reference_price=90_000.0,
+                    entry_low=89_500.0,
+                    entry_high=90_000.0,
+                    entry_mid=89_750.0,
+                    stop_loss=88_000.0,
+                    tp1=91_500.0,
+                    tp2=93_250.0,
+                    tp3=95_000.0,
+                    rr_tp1=1.0,
+                    rr_tp2=2.0,
+                    rr_tp3=3.0,
+                ),
+            )
+
+    monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://u:pw@localhost/db")
+    monkeypatch.setattr("crypto_chatbot.cli.create_db_engine", lambda url: _FakeEngine())
+    monkeypatch.setattr("crypto_chatbot.cli.init_db", lambda eng: None)
+    monkeypatch.setattr("crypto_chatbot.cli.PostgresMarketRepository", _FakeMarketRepo)
+    monkeypatch.setattr("crypto_chatbot.cli.PostgresSetupLogRepository", _FakeSetupRepo)
+
+    rc = cli.main(["settle-setups"])
+    assert rc == 0
+    assert seen_market_types == [MarketType.PERPETUAL]
+    assert "checked=1, updated=0" in capsys.readouterr().out

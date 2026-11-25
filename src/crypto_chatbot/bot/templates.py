@@ -929,7 +929,16 @@ def render_compact_snapshot(
     if setup is not None and setup.risk_notes:
         lines.append(f"• Risiko: {_esc(setup.risk_notes[0], html_mode)}")
     elif snapshot.derivatives is not None:
-        lines.append("• Risiko: Data derivatif hanya berasal dari satu venue (Binance).")
+        deriv_venue = (
+            snapshot.derivatives.funding_venue
+            or snapshot.derivatives.open_interest_venue
+            or snapshot.derivatives.orderbook_venue
+            or snapshot.venue
+        ).capitalize()
+        lines.append(
+            "• Risiko: Data derivatif hanya berasal dari satu venue "
+            f"({_esc(deriv_venue, html_mode)})."
+        )
 
     _append_ml_prediction_lines(lines, snapshot, html_mode=html_mode)
 
@@ -995,7 +1004,7 @@ def render_start_message() -> str:
         "<b>Selamat datang di Crypto Research Assistant</b>",
         (
             "Bot ini adalah asisten riset dan edukasi pasar kripto berbasis data candle "
-            "tertutup Binance spot dan perhitungan indikator deterministik."
+            "tertutup futures perpetual &amp; spot serta perhitungan indikator deterministik."
         ),
         "",
         "<b>Cakupan Analisis:</b>",
@@ -1059,8 +1068,12 @@ def render_help_message() -> str:
             "- /screen [long|short|all] [min_vol_juta] — "
             "screener Top Gainers/Losers (Vol 24j >= $5M) + momentum Engulfing/Marubozu 15m"
         ),
+        (
+            "- /whale [SIMBOL|alamat|add|remove|list] — "
+            "pantau posisi perpetual whale (Hyperliquid) &amp; pelacak dompet on-chain / aliran CEX"
+        ),
         "- /watchlist — tampilkan daftar pantau",
-        "- /watchlist add &lt;SIMBOL&gt; — tambah pair spot /USDT ke daftar pantau",
+        "- /watchlist add &lt;SIMBOL&gt; — tambah pair futures /USDT:USDT ke daftar pantau",
         "- /watchlist remove &lt;SIMBOL&gt; — hapus dari daftar pantau",
         "- /memory — periksa preferensi eksplisit dan pesan tersimpan (maksimal 20 pesan)",
         "- /forget — hapus seluruh preferensi dan memori percakapan Anda",

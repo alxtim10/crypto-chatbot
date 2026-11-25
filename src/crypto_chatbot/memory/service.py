@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import Literal, Protocol, runtime_checkable
 
 from crypto_chatbot.llm.gemini import NarrationOutcome
 from crypto_chatbot.llm.guard import validate_narration
@@ -19,6 +20,17 @@ from crypto_chatbot.storage.repositories import (
 
 MAX_RECENT_MESSAGES = 20
 MAX_STORED_USER_MESSAGE_CHARS = 1000
+
+
+@runtime_checkable
+class _AtomicWatchlistRepo(Protocol):
+    def update_watchlist(
+        self,
+        telegram_user_id: int,
+        symbol: str,
+        *,
+        action: Literal["add", "remove"],
+    ) -> tuple[UserPreferences, bool]: ...
 
 
 class MemoryService:
@@ -48,6 +60,8 @@ class MemoryService:
     def add_to_watchlist(self, user_id: int, raw_symbol: str) -> tuple[UserPreferences, bool]:
         """Add an MVP perpetual symbol to user's explicit watchlist idempotently."""
         canonical = resolve_default_perp_symbol(raw_symbol).canonical_symbol
+        if isinstance(self._repository, _AtomicWatchlistRepo):
+            return self._repository.update_watchlist(user_id, canonical, action="add")
         prefs = self._repository.get_preferences(user_id)
         if canonical in prefs.watchlist:
             return prefs, False
@@ -58,6 +72,8 @@ class MemoryService:
     def remove_from_watchlist(self, user_id: int, raw_symbol: str) -> tuple[UserPreferences, bool]:
         """Remove an MVP perpetual symbol from user's watchlist if present."""
         canonical = resolve_default_perp_symbol(raw_symbol).canonical_symbol
+        if isinstance(self._repository, _AtomicWatchlistRepo):
+            return self._repository.update_watchlist(user_id, canonical, action="remove")
         prefs = self._repository.get_preferences(user_id)
         if canonical not in prefs.watchlist:
             return prefs, False

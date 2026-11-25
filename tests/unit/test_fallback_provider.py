@@ -305,3 +305,47 @@ async def test_build_futures_providers_returns_single_or_fallback() -> None:
     assert isinstance(d_fb, FallbackDerivativesLiquidityProvider)
     await p_fb.close()
     await d_fb.close()
+
+
+@pytest.mark.asyncio
+async def test_ccxt_1000_perp_fallback_preserves_non_binance_venue_metadata() -> None:
+    import ccxt
+
+    from crypto_chatbot.market_data.ccxt_provider import CcxtMarketDataProvider
+
+    class _FakeGateClient:
+        id = "gateio"
+
+        def __init__(self) -> None:
+            self.symbols_called: list[str] = []
+
+        async def fetch_ohlcv(
+            self,
+            symbol: str,
+            timeframe: str = "4h",
+            since: int | None = None,
+            limit: int | None = 100,
+        ) -> list[list[Any]]:
+            del timeframe, since, limit
+            self.symbols_called.append(symbol)
+            if symbol == "PEPE/USDT:USDT":
+                raise ccxt.BadSymbol("PEPE/USDT:USDT not found")
+            t_ms = int((NOW - timedelta(hours=8)).timestamp() * 1000)
+            return [[t_ms, 0.01, 0.012, 0.009, 0.011, 5000.0]]
+
+        async def close(self) -> None:
+            return None
+
+    client = _FakeGateClient()
+    prov = CcxtMarketDataProvider(
+        exchange_id="gate",
+        market_type=MarketType.PERPETUAL,
+        client=client,
+        clock=lambda: NOW,
+    )
+    batch = await prov.get_closed_ohlcv("PEPE", Timeframe.H4, limit=5)
+    assert client.symbols_called == ["PEPE/USDT:USDT", "1000PEPE/USDT:USDT"]
+    assert batch.metadata.venue == "gate"
+    assert batch.provider_symbol == "GATE:1000PEPEUSDT.P"
+    assert len(batch.candles) == 1
+    assert batch.candles[0].venue == "gate"

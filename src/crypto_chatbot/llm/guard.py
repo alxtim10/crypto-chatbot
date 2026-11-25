@@ -230,3 +230,50 @@ def validate_narration(
 
     unique_reasons = tuple(dict.fromkeys(reasons))
     return GuardResult(is_valid=not unique_reasons, reasons=unique_reasons)
+
+
+_QA_UNSAFE_ADVICE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "direct_execution_instruction",
+        re.compile(
+            r"\b(?:eksekusi\s+order|open\s+(?:long|short)\s+sekarang|"
+            r"masuk\s+(?:long|short)\s+sekarang|taruh\s+\d+%\s+modal|"
+            r"alokasikan\s+\d+%)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "fabricated_live_price",
+        re.compile(
+            r"\bharga\s+(?:saat\s+ini|sekarang|live|terkini)\s+"
+            r"(?:adalah|berada\s+di|sekitar)\s+\$?\d",
+            re.IGNORECASE,
+        ),
+    ),
+)
+
+
+def validate_conversational_answer(text: str) -> GuardResult:
+    """Validate free-form conversational QA answers against safety and compliance rules."""
+    cleaned = text.strip()
+    if not cleaned:
+        return GuardResult(is_valid=False, reasons=("empty_response",))
+
+    reasons: list[str] = []
+    normalized = " ".join(cleaned.split())
+    for term, pattern in OVERCONFIDENCE_PATTERNS:
+        if pattern.search(normalized):
+            reasons.append(f"overconfidence_lexicon:{term}")
+
+    for label, pattern in _QA_UNSAFE_ADVICE_PATTERNS:
+        if pattern.search(normalized):
+            reasons.append(label)
+
+    if _URL_RE.search(cleaned):
+        reasons.append("url_not_allowed")
+
+    if any(secret_re.search(cleaned) for secret_re in _SECRET_PATTERNS):
+        reasons.append("secret_pattern_detected")
+
+    unique_reasons = tuple(dict.fromkeys(reasons))
+    return GuardResult(is_valid=not unique_reasons, reasons=unique_reasons)

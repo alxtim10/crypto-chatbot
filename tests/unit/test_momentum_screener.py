@@ -72,17 +72,18 @@ def _uptrend_history(
 ) -> list[MarketCandle]:
     total = count + 2
     candles: list[MarketCandle] = []
-    step = 0.002
-    price = last_two[0][0] - count * step
+    # Alternating +0.0025 / -0.002 keeps uptrend EMA alignment & healthy RSI (~55)
+    price = last_two[0][0] - (count // 2) * 0.0005 - (count % 2) * 0.0025
     for i in range(count):
+        delta = 0.0025 if i % 2 == 0 else -0.002
         o = price
-        c = price + step
+        c = price + delta
         candles.append(
             _candle_15m(
                 i,
                 o=o,
-                h=c + 0.002,
-                low_p=o - 0.002,
+                h=max(o, c) + 0.005,
+                low_p=min(o, c) - 0.005,
                 c=c,
                 symbol=symbol,
                 total=total,
@@ -108,17 +109,18 @@ def _downtrend_history(
 ) -> list[MarketCandle]:
     total = count + 2
     candles: list[MarketCandle] = []
-    step = 0.003
-    price = last_two[0][0] + count * step
+    # Alternating -0.011 / +0.010 keeps downtrend EMA alignment & healthy RSI (~47 before dump)
+    price = last_two[0][0] + (count // 2) * 0.001 + (count % 2) * 0.011
     for i in range(count):
+        delta = -0.011 if i % 2 == 0 else 0.010
         o = price
-        c = price - step
+        c = price + delta
         candles.append(
             _candle_15m(
                 i,
                 o=o,
-                h=o + 0.003,
-                low_p=c - 0.003,
+                h=max(o, c) + 0.006,
+                low_p=min(o, c) - 0.006,
                 c=c,
                 symbol=symbol,
                 total=total,
@@ -437,3 +439,82 @@ async def test_fallback_provider_falls_back_for_futures_tickers() -> None:
     assert not batch.has_provider_error
     assert batch.venue == "bingx"
     assert len(batch.tickers) == 1
+
+
+@pytest.mark.asyncio
+async def test_screener_rejects_quality_flags_exhausted_rsi_and_wide_sl() -> None:
+    # 1. RSI exhaustion (>= 80) -> WAIT instead of chasing blow-off top
+    blowoff: list[MarketCandle] = []
+    p = 1.0
+    for i in range(160):
+        blowoff.append(_candle_15m(i, o=p, h=p + 0.003, low_p=p - 0.001, c=p + 0.002, total=162))
+        p += 0.002
+    blowoff.append(_candle_15m(160, o=p, h=p + 0.002, low_p=p - 0.005, c=p - 0.003, total=162))
+    blowoff.append(
+        _candle_15m(161, o=p - 0.004, h=p + 0.012, low_p=p - 0.006, c=p + 0.010, total=162)
+    )
+    rsi_res = evaluate_15m_momentum_setup(
+        blowoff, side="long", change_24h_pct=25.0, quote_volume_24h_usd=30_000_000.0
+    )
+    assert rsi_res.status is SetupStatus.WAIT
+    assert rsi_res.wait_reason is not None
+    assert "RSI" in rsi_res.wait_reason
+
+    # 2. Wide stop loss (> 5%) -> WAIT
+    wide = _uptrend_history(
+        last_two=(
+            (1.245, 1.248, 1.150, 1.236),
+            (1.235, 1.262, 1.140, 1.258),
+        )
+    )
+    wide_res = evaluate_15m_momentum_setup(
+        wide, side="long", change_24h_pct=15.0, quote_volume_24h_usd=15_000_000.0
+    )
+    assert wide_res.status is SetupStatus.WAIT
+    assert wide_res.wait_reason is not None
+    assert "lebar" in wide_res.wait_reason
+
+    # 3. Screener skips batches carrying STALE/GAP quality flags
+    ticker_batch = FuturesTickerBatch(
+        venue="gate",
+        received_time=NOW,
+        tickers=(
+            FuturesTickerSnapshot(
+                venue="gate",
+                canonical_symbol="SUI/USDT:USDT",
+                provider_symbol="GATE:SUIUSDT.P",
+                last_price=1.25,
+                change_24h_pct=15.0,
+                quote_volume_24h_usd=20_000_000.0,
+                observed_time=NOW,
+            ),
+        ),
+    )
+
+    class _GapStubService:
+        async def get_futures_tickers(self) -> FuturesTickerBatch:
+            return ticker_batch
+
+        async def get_closed_ohlcv(
+            self, symbol: str, timeframe: Timeframe, limit: int = 200
+        ) -> OhlcvBatch:
+            del timeframe, limit
+            return OhlcvBatch(
+                metadata=ProviderMetadata(
+                    provider="ccxt",
+                    venue="gate",
+                    market_type=MarketType.PERPETUAL,
+                    base_unit="SUI",
+                    quote_currency="USDT",
+                ),
+                canonical_symbol=symbol,
+                provider_symbol="GATE:SUIUSDT.P",
+                timeframe=Timeframe.M15,
+                received_time=NOW,
+                candles=tuple(wide),
+                quality_flags=(QualityFlag.STALE, QualityFlag.GAP),
+            )
+
+    rep = await screen_momentum_movers(_GapStubService())  # type: ignore[arg-type]
+    assert rep.long_signals == ()
+    assert "SUI/USDT:USDT" in rep.failed_symbols
