@@ -27,9 +27,3 @@ def init_db(engine: Engine) -> None:
         conn.execute(
             text("ALTER TABLE trade_setups ADD COLUMN IF NOT EXISTS market_type VARCHAR(16);")
         )
-        conn.execute(
-            text(
-                "ALTER TABLE trade_setups "
-                "ADD COLUMN IF NOT EXISTS market_type VARCHAR(16);"
-            )
-        )
