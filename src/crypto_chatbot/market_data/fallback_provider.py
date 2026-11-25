@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable, Sequence
+from datetime import UTC, datetime
 from types import TracebackType
 from typing import TypeVar
 
 from crypto_chatbot.market_data.base import (
     DEFAULT_CANDLE_LIMIT,
     DerivativesLiquidityProvider,
+    FuturesTickerBatch,
+    FuturesTickerProvider,
     MarketDataProvider,
     OhlcvBatch,
 )
@@ -89,6 +92,30 @@ class FallbackMarketDataProvider:
             raise RuntimeError("FallbackMarketDataProvider has no providers configured")
         summary = " | ".join(errors) if errors else "All OHLCV providers failed"
         return last_batch.model_copy(update={"error_message": summary})
+
+    async def get_futures_tickers(self) -> FuturesTickerBatch:
+        errors: list[str] = []
+        last_batch: FuturesTickerBatch | None = None
+        for provider in self._providers:
+            if not isinstance(provider, FuturesTickerProvider):
+                continue
+            batch = await provider.get_futures_tickers()
+            last_batch = batch
+            if not batch.has_provider_error and batch.tickers:
+                return batch
+            err = batch.error_message or "empty tickers"
+            errors.append(f"{batch.venue}: {err}")
+            logger.warning("Fallback futures tickers provider %s failed: %s", batch.venue, err)
+
+        if last_batch is not None:
+            summary = " | ".join(errors) if errors else "All ticker providers failed"
+            return last_batch.model_copy(update={"error_message": summary})
+        return FuturesTickerBatch(
+            venue="unknown",
+            received_time=datetime.now(UTC),
+            quality_flags=(QualityFlag.PROVIDER_ERROR,),
+            error_message="No FuturesTickerProvider configured in fallback chain",
+        )
 
     async def close(self) -> None:
         for provider in self._providers:

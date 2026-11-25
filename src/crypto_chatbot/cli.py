@@ -19,7 +19,18 @@ from crypto_chatbot.analysis.backtest import (
     render_backtest_report,
     run_setup_backtest,
 )
+from crypto_chatbot.analysis.momentum_screener import (
+    DEFAULT_MIN_VOLUME_24H_USD,
+    DEFAULT_TOP_PER_SIDE,
+    render_momentum_screener_report,
+    screen_momentum_movers,
+)
 from crypto_chatbot.analysis.pine_export import generate_pine_script
+from crypto_chatbot.analysis.scanner import (
+    DEFAULT_SCAN_BASKET,
+    render_market_scan_report,
+    scan_market_setups,
+)
 from crypto_chatbot.analysis.service import AnalysisService, build_analysis_snapshot
 from crypto_chatbot.analysis.setup import evaluate_setup_against_candles
 from crypto_chatbot.app import run_bot
@@ -58,7 +69,14 @@ from crypto_chatbot.ops import (
 )
 from crypto_chatbot.schemas.analysis import AnalysisSnapshot
 from crypto_chatbot.schemas.derivatives import DerivativesContext
-from crypto_chatbot.schemas.market import MarketType, QualityStatus, Timeframe
+from crypto_chatbot.schemas.market import (
+    MULTI_STYLE_SCAN_TIMEFRAMES,
+    PRIMARY_TIMEFRAMES,
+    MarketType,
+    QualityStatus,
+    Timeframe,
+    resolve_primary_timeframe,
+)
 from crypto_chatbot.schemas.ml import MlExperimentConfig
 from crypto_chatbot.schemas.news import RawNewsItem, SentimentObservation
 from crypto_chatbot.schemas.tradingview import TradingViewPacket
@@ -375,6 +393,18 @@ async def _analyze_live(
             await bybit_provider.close()
 
 
+def _parse_primary_timeframe(timeframe_raw: str) -> Timeframe:
+    resolved = resolve_primary_timeframe(timeframe_raw)
+    if resolved is not None:
+        return resolved
+    supported = ", ".join(
+        tf.value for tf in sorted(PRIMARY_TIMEFRAMES, key=lambda item: item.duration)
+    )
+    raise ValueError(
+        f"unsupported timeframe '{timeframe_raw}' (supported: {supported}, scalp, intraday, swing)"
+    )
+
+
 def _run_analyze(
     *,
     symbol_raw: str,
@@ -396,13 +426,7 @@ def _run_analyze(
             if fixture_path is not None
             else resolve_default_perp_symbol(symbol_raw)
         )
-        try:
-            timeframe = Timeframe(timeframe_raw.strip().lower())
-        except ValueError:
-            supported = ", ".join(tf.value for tf in Timeframe)
-            raise ValueError(
-                f"unsupported timeframe '{timeframe_raw}' (supported: {supported})"
-            ) from None
+        timeframe = _parse_primary_timeframe(timeframe_raw)
 
         repository: MarketRepository | None = None
         derivatives_repository: DerivativesRepository | None = None
@@ -960,13 +984,17 @@ def _run_backtest(
     as_json: bool,
 ) -> int:
     try:
-        try:
-            timeframe = Timeframe(timeframe_raw.strip().lower())
-        except ValueError:
-            supported = ", ".join(tf.value for tf in Timeframe)
-            raise ValueError(
-                f"unsupported timeframe '{timeframe_raw}' (supported: {supported})"
-            ) from None
+        resolved_tf = resolve_primary_timeframe(timeframe_raw)
+        if resolved_tf is not None:
+            timeframe = resolved_tf
+        else:
+            try:
+                timeframe = Timeframe(timeframe_raw.strip().lower())
+            except ValueError:
+                supported = ", ".join(tf.value for tf in Timeframe)
+                raise ValueError(
+                    f"unsupported timeframe '{timeframe_raw}' (supported: {supported})"
+                ) from None
 
         if fixture_path is not None:
             mapping = resolve_mvp_spot_symbol(symbol_raw)
@@ -1019,13 +1047,7 @@ def _run_pine(
             if fixture_path is not None
             else resolve_default_perp_symbol(symbol_raw)
         )
-        try:
-            timeframe = Timeframe(timeframe_raw.strip().lower())
-        except ValueError:
-            supported = ", ".join(tf.value for tf in Timeframe)
-            raise ValueError(
-                f"unsupported timeframe '{timeframe_raw}' (supported: {supported})"
-            ) from None
+        timeframe = _parse_primary_timeframe(timeframe_raw)
 
         if fixture_path is not None:
             snapshot = _analyze_from_fixture(
@@ -1066,6 +1088,126 @@ def _run_pine(
         print(f"Pine Script written to {out_path}")
     else:
         print(script, end="")
+    return 0
+
+
+async def _run_scan_live(
+    *,
+    symbols: Sequence[str],
+    timeframe: Timeframe,
+    timeframes: Sequence[Timeframe] | None = None,
+) -> Any:
+    chain = _resolve_exchange_chain_from_env()
+    provider, deriv_provider = build_futures_providers(chain)
+    bybit_provider = BybitDerivativesProvider() if "binance" in chain else None
+    try:
+        service = AnalysisService(
+            provider=provider,
+            derivatives_provider=deriv_provider,
+            bybit_provider=bybit_provider,
+            dxy_provider=DxyMarketDataProvider(),
+        )
+        return await scan_market_setups(
+            service,
+            symbols,
+            timeframe=timeframe,
+            timeframes=timeframes,
+        )
+    finally:
+        await provider.close()
+        await deriv_provider.close()
+        if bybit_provider is not None:
+            await bybit_provider.close()
+
+
+def _run_scan(
+    *,
+    symbols_raw: str | None,
+    timeframe_raw: str,
+    as_json: bool,
+) -> int:
+    try:
+        tf_norm = timeframe_raw.strip().lower()
+        if tf_norm in ("all", "multi"):
+            timeframe = Timeframe.H4
+            scan_tfs: tuple[Timeframe, ...] | None = MULTI_STYLE_SCAN_TIMEFRAMES
+        else:
+            timeframe = _parse_primary_timeframe(timeframe_raw)
+            scan_tfs = None
+        if symbols_raw and symbols_raw.strip():
+            targets = [part.strip() for part in symbols_raw.split(",") if part.strip()]
+        else:
+            targets = list(DEFAULT_SCAN_BASKET)
+        report = asyncio.run(
+            _run_scan_live(
+                symbols=targets,
+                timeframe=timeframe,
+                timeframes=scan_tfs,
+            )
+        )
+    except (SymbolError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if as_json:
+        print(report.model_dump_json(indent=2))
+    else:
+        print(render_market_scan_report(report, html_mode=False))
+    return 0
+
+
+async def _run_screen_live(
+    *,
+    side: Any,
+    min_vol: float,
+    top_per_side: int,
+) -> Any:
+    chain = _resolve_exchange_chain_from_env()
+    provider, deriv_provider = build_futures_providers(chain)
+    bybit_provider = BybitDerivativesProvider() if "binance" in chain else None
+    try:
+        service = AnalysisService(
+            provider=provider,
+            derivatives_provider=deriv_provider,
+            bybit_provider=bybit_provider,
+            dxy_provider=DxyMarketDataProvider(),
+        )
+        return await screen_momentum_movers(
+            service,
+            side=side,
+            min_volume_usd=min_vol,
+            top_per_side=top_per_side,
+        )
+    finally:
+        await provider.close()
+        await deriv_provider.close()
+        if bybit_provider is not None:
+            await bybit_provider.close()
+
+
+def _run_screen(
+    *,
+    side: Any,
+    min_vol: float,
+    top_per_side: int,
+    as_json: bool,
+) -> int:
+    try:
+        report = asyncio.run(
+            _run_screen_live(
+                side=side,
+                min_vol=min_vol,
+                top_per_side=top_per_side,
+            )
+        )
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if as_json:
+        print(report.model_dump_json(indent=2))
+    else:
+        print(render_momentum_screener_report(report, html_mode=False))
     return 0
 
 
@@ -1334,6 +1476,54 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Optional output .pine file path (prints to stdout if omitted).",
     )
 
+    scan_parser = subcommands.add_parser(
+        "scan",
+        help="Scan multiple futures pairs concurrently to surface READY unified MTF setups.",
+    )
+    scan_parser.add_argument(
+        "--symbols",
+        default=None,
+        help="Comma-separated symbols (default: liquid perpetual basket).",
+    )
+    scan_parser.add_argument(
+        "--timeframe",
+        default="4h",
+        help="Primary timeframe, style, or 'all' for multi-style (default: 4h).",
+    )
+    scan_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print raw MarketScanReport JSON instead of Indonesian text report.",
+    )
+
+    screen_parser = subcommands.add_parser(
+        "screen",
+        help="Screen Top Gainers/Losers (>= $5M vol) for 15m Engulfing/Marubozu momentum setups.",
+    )
+    screen_parser.add_argument(
+        "--side",
+        choices=("all", "long", "short"),
+        default="all",
+        help="Filter side: all (gainers + losers), long (gainers), or short (losers).",
+    )
+    screen_parser.add_argument(
+        "--min-vol",
+        type=float,
+        default=DEFAULT_MIN_VOLUME_24H_USD,
+        help="Minimum 24h quote volume in USD (default: 5000000).",
+    )
+    screen_parser.add_argument(
+        "--top",
+        type=int,
+        default=DEFAULT_TOP_PER_SIDE,
+        help="Maximum top movers per side to inspect on 15m (default: 8).",
+    )
+    screen_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print raw MomentumScreenerReport JSON instead of Indonesian text report.",
+    )
+
     args = parser.parse_args(argv)
     if args.command == "check-config":
         return _check_config()
@@ -1368,6 +1558,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             timeframe_raw=args.timeframe,
             fixture_path=args.fixture,
             out_path=args.out,
+        )
+    if args.command == "scan":
+        return _run_scan(
+            symbols_raw=args.symbols,
+            timeframe_raw=args.timeframe,
+            as_json=args.json,
+        )
+    if args.command == "screen":
+        return _run_screen(
+            side=args.side,
+            min_vol=args.min_vol,
+            top_per_side=args.top,
+            as_json=args.json,
         )
     if args.command == "setup-stats":
         return _run_setup_stats(

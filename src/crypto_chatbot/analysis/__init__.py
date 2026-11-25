@@ -51,12 +51,28 @@ from crypto_chatbot.analysis.indicators import (
     true_range_series,
     validate_closed_candles,
 )
+from crypto_chatbot.analysis.momentum_screener import (
+    DEFAULT_MIN_VOLUME_24H_USD,
+    MomentumPattern,
+    MomentumScreenerReport,
+    MomentumSetupResult,
+    evaluate_15m_momentum_setup,
+    render_momentum_screener_report,
+    screen_momentum_movers,
+)
 from crypto_chatbot.analysis.pine_export import generate_pine_script
 from crypto_chatbot.analysis.regimes import (
     HIGH_VOLATILITY_ATR_PERCENTILE,
     RANGING_ADX_MAX,
     TRENDING_ADX_MIN,
     classify_regime,
+)
+from crypto_chatbot.analysis.scanner import (
+    DEFAULT_SCAN_BASKET,
+    MarketScanReport,
+    ScannedSetupItem,
+    render_market_scan_report,
+    scan_market_setups,
 )
 from crypto_chatbot.analysis.service import (
     AnalysisService,
@@ -79,7 +95,9 @@ from crypto_chatbot.analysis.structure import (
 __all__ = [
     "CALC_VERSION",
     "DEFAULT_FAILED_BREAKOUT_WINDOW",
+    "DEFAULT_MIN_VOLUME_24H_USD",
     "DEFAULT_PIVOT_K",
+    "DEFAULT_SCAN_BASKET",
     "DERIVATIVES_PARAMETERS",
     "HIGH_VOLATILITY_ATR_PERCENTILE",
     "INDICATOR_PARAMETERS",
@@ -104,9 +122,14 @@ __all__ = [
     "BootstrapSummary",
     "DerivativesAnalysisResult",
     "IndicatorResult",
+    "MarketScanReport",
+    "MomentumPattern",
+    "MomentumScreenerReport",
+    "MomentumSetupResult",
     "MtfRsiResult",
     "PreviousPeriodLevels",
     "RegimeBreakdown",
+    "ScannedSetupItem",
     "StructureAnalysis",
     "adx_dmi_series",
     "analyze_market_structure",
@@ -125,14 +148,19 @@ __all__ = [
     "detect_confirmed_swings",
     "detect_failed_breakouts",
     "ema_series",
+    "evaluate_15m_momentum_setup",
     "evaluate_setup_against_candles",
     "generate_pine_script",
     "macd_series",
     "relative_volume_series",
     "render_backtest_report",
+    "render_market_scan_report",
+    "render_momentum_screener_report",
     "rma_series",
     "rsi_series",
     "run_setup_backtest",
+    "scan_market_setups",
+    "screen_momentum_movers",
     "simple_return_series",
     "true_range_series",
     "validate_closed_candles",

@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from collections.abc import Callable, Sequence
 from datetime import UTC, date, datetime
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from google import genai
 from google.genai import types
@@ -15,8 +16,11 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 from crypto_chatbot.llm.guard import validate_narration
 from crypto_chatbot.llm.prompts import (
     ANALYSIS_SYSTEM_PROMPT,
+    CONVERSATIONAL_QA_SYSTEM_PROMPT,
+    INTENT_CLASSIFIER_SYSTEM_PROMPT,
     PROMPT_VERSION,
     build_narration_user_payload,
+    sanitize_untrusted_text,
 )
 from crypto_chatbot.schemas.analysis import AnalysisSnapshot
 from crypto_chatbot.schemas.llm import (
@@ -149,6 +153,36 @@ class DailyQuotaTracker:
         self._global_count += 1
         self._user_counts[key] = self._user_counts.get(key, 0) + 1
         return True, None
+
+
+class NlpIntentClassification(BaseModel):
+    """Structured Layer-2 intent classification extracted from casual chat."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    intent: Literal[
+        "analyze",
+        "analyze_detail",
+        "compare",
+        "pine",
+        "scan",
+        "screen",
+        "chat_qa",
+        "unsupported",
+    ]
+    symbols: tuple[str, ...] = ()
+    timeframe: Literal["15m", "1h", "4h", "1d", "scalp", "scalping", "intraday", "swing"] | None = (
+        None
+    )
+    screen_side: Literal["all", "long", "short"] | None = None
+
+
+class ConversationalAnswer(BaseModel):
+    """Structured answer for educational or contextual research Q&A."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    answer: str = Field(min_length=1, max_length=2500)
 
 
 class NarrationOutcome(BaseModel):
@@ -334,3 +368,87 @@ class GeminiNarrator:
             prompt_tokens=raw.prompt_tokens,
             output_tokens=raw.output_tokens,
         )
+
+    async def classify_intent(
+        self,
+        text: str,
+        *,
+        user_id: int | str = "anonymous",
+        recent_symbols: Sequence[str] = (),
+    ) -> NlpIntentClassification | None:
+        """Classify natural-language chat intent into structured backend routing metadata."""
+        if not text.strip():
+            return None
+        if self._quota_tracker is not None:
+            allowed, _ = self._quota_tracker.try_consume(user_id)
+            if not allowed:
+                return None
+
+        payload = json.dumps(
+            {
+                "recent_symbols": list(recent_symbols[:3]),
+                "user_message": f"<untrusted_data>{sanitize_untrusted_text(text)}</untrusted_data>",
+            },
+            ensure_ascii=False,
+        )
+        try:
+            raw = await asyncio.wait_for(
+                self._transport.generate_json(
+                    model=self._model,
+                    system_instruction=INTENT_CLASSIFIER_SYSTEM_PROMPT,
+                    contents=payload,
+                    response_json_schema=NlpIntentClassification.model_json_schema(),
+                    max_output_tokens=200,
+                    temperature=0.0,
+                ),
+                timeout=self._timeout_seconds,
+            )
+            if not raw.text or not raw.text.strip():
+                return None
+            return NlpIntentClassification.model_validate_json(raw.text)
+        except Exception:
+            return None
+
+    async def answer_research_question(
+        self,
+        question: str,
+        *,
+        user_id: int | str = "anonymous",
+        user_context: str | None = None,
+    ) -> str | None:
+        """Answer an educational or contextual follow-up question safely."""
+        if not question.strip():
+            return None
+        if self._quota_tracker is not None:
+            allowed, _ = self._quota_tracker.try_consume(user_id)
+            if not allowed:
+                return None
+
+        context_block = (
+            f"<untrusted_data>\n{sanitize_untrusted_text(user_context)}\n</untrusted_data>"
+            if user_context and user_context.strip()
+            else "(belum ada riwayat analisa)"
+        )
+        safe_q = sanitize_untrusted_text(question)
+        payload = (
+            f"Konteks percakapan sebelumnya:\n{context_block}\n\n"
+            f"Pertanyaan pengguna:\n<untrusted_data>{safe_q}</untrusted_data>"
+        )
+        try:
+            raw = await asyncio.wait_for(
+                self._transport.generate_json(
+                    model=self._model,
+                    system_instruction=CONVERSATIONAL_QA_SYSTEM_PROMPT,
+                    contents=payload,
+                    response_json_schema=ConversationalAnswer.model_json_schema(),
+                    max_output_tokens=self._max_output_tokens,
+                    temperature=0.3,
+                ),
+                timeout=self._timeout_seconds,
+            )
+            if not raw.text or not raw.text.strip():
+                return None
+            parsed = ConversationalAnswer.model_validate_json(raw.text)
+            return parsed.answer.strip()
+        except Exception:
+            return None

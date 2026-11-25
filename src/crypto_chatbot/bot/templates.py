@@ -16,7 +16,11 @@ from crypto_chatbot.schemas.analysis import (
     SetupBias,
     SetupStatus,
 )
-from crypto_chatbot.schemas.market import QualityStatus, Timeframe
+from crypto_chatbot.schemas.market import (
+    QualityStatus,
+    Timeframe,
+    format_trading_style_label,
+)
 from crypto_chatbot.storage.repositories import (
     ForgetResult,
     StoredMessage,
@@ -779,8 +783,9 @@ def render_compact_snapshot(
         lines.append(_esc("Konteks Makro & Posisi: " + " | ".join(macro_parts), html_mode))
 
     if len(snapshot.mtf_overview) >= 2:
+        tf_chain = " → ".join(ov.timeframe.value for ov in snapshot.mtf_overview)
         lines.append("")
-        lines.append(_bold("Alur Top-Down Multi-Timeframe (1d → 4h → 1h → 15m)", html_mode))
+        lines.append(_bold(f"Alur Top-Down Multi-Timeframe ({tf_chain})", html_mode))
         dz_map = {
             DealingZone.DISCOUNT: "Discount",
             DealingZone.EQUILIBRIUM: "Equilibrium",
@@ -813,6 +818,12 @@ def render_compact_snapshot(
     # Skenario Setup (Deterministik)
     lines.append("")
     lines.append(_bold("Skenario Setup (Deterministik — Bukan Probabilitas)", html_mode))
+    lines.append(
+        _esc(
+            f"• Gaya / Mode: {format_trading_style_label(snapshot.timeframe)}",
+            html_mode,
+        )
+    )
     setup = snapshot.trade_setup
     sh_htf = _fmt_fact(by_label.get("High dealing range")) or _fmt_fact(
         by_label.get("Swing high terkonfirmasi")
@@ -988,13 +999,28 @@ def render_start_message() -> str:
         ),
         "",
         "<b>Cakupan Analisis:</b>",
-        "- Simbol spot Binance /USDT (mis. BTC, ETH, SOL, DOGE, SUI, PEPE, dll.)",
-        "- Timeframe: 15m, 1h, 4h, 1d (dengan refinement entry 15m untuk analisis 1h/4h/1d)",
+        "- Simbol futures perpetual /USDT:USDT (mis. BTC, ETH, SOL, DOGE, SUI, PEPE, VVV, dll.)",
+        "- Unified Multi-Timeframe (1d → 4h → 1h → 15m → 5m) berjalan otomatis dalam 1 setup",
         "",
-        "<b>Perintah Utama:</b>",
-        "- /analyze BTC 4h — ringkasan key points + Entry/SL/TP1-3 kondisional",
-        "- /analyze SUI 15m — analisis langsung timeframe 15 menit (dengan filter HTF)",
-        "- /analyze BTC 4h detail — rincian seluruh metrik dan fakta backend",
+        "<b>Cara Pakai (Chat Natural atau Perintah):</b>",
+        '- Ketik santai: <i>"coba analisa btc sekarang"</i> (default: mode Swing 4h)',
+        (
+            "- Pilih gaya trading: sebut <b>scalp</b> (15m), <b>intraday</b> (1h), "
+            'atau <b>swing</b> (4h) — misal <i>"analisa sol buat scalp"</i>'
+        ),
+        (
+            '- Pindai koin: <i>"ada token yang bisa disetup buat scalp gak?"</i> '
+            "atau /scan [scalp|intraday|swing]"
+        ),
+        (
+            '- Screener 15m: <i>"screening top gainers dan top losers dong"</i> '
+            "atau /screen [long|short]"
+        ),
+        (
+            "- /analyze BTC [scalp|intraday|swing|15m|1h|4h|1d] — "
+            "ringkasan key points + Entry/SL/TP1-3"
+        ),
+        "- /pine BTC [scalp|intraday|swing] — export TradingView Pine Script v6",
         "- /compare BTC ETH 1d — perbandingan deskriptif antar koin",
         "- /watchlist — lihat atau kelola daftar pantau eksplisit",
         "- /memory — lihat preferensi dan batas memori percakapan",
@@ -1014,16 +1040,24 @@ def render_help_message() -> str:
     lines = [
         "<b>Panduan Perintah</b>",
         (
-            "- /analyze &lt;SIMBOL&gt; [15m|1h|4h|1d] [detail] — contoh: "
-            "/analyze DOGE 4h atau /analyze SUI 15m"
+            "- /analyze &lt;SIMBOL&gt; [scalp|intraday|swing|15m|1h|4h|1d] [detail] — contoh: "
+            "/analyze DOGE swing atau /analyze SUI scalp"
         ),
         (
-            "- /compare &lt;SIMBOL1&gt; &lt;SIMBOL2&gt; [SIMBOL3] [15m|1h|4h|1d] "
-            "— contoh: /compare BTC ETH 1d"
+            "- /compare &lt;SIMBOL1&gt; &lt;SIMBOL2&gt; [SIMBOL3] "
+            "[scalp|intraday|swing|15m|1h|4h|1d] — contoh: /compare BTC ETH swing"
         ),
         (
-            "- /pine &lt;SIMBOL&gt; [15m|1h|4h|1d] — export TradingView Pine Script v6 "
-            "untuk Entry, SL, TP, S/R, dan zona SMC"
+            "- /pine &lt;SIMBOL&gt; [scalp|intraday|swing|15m|1h|4h|1d] — "
+            "export TradingView Pine Script v6 untuk Entry, SL, TP, S/R, dan zona SMC"
+        ),
+        (
+            "- /scan [scalp|intraday|swing|15m|1h|4h|1d] — "
+            "pindai watchlist &amp; basket futures untuk cari setup READY"
+        ),
+        (
+            "- /screen [long|short|all] [min_vol_juta] — "
+            "screener Top Gainers/Losers (Vol 24j >= $5M) + momentum Engulfing/Marubozu 15m"
         ),
         "- /watchlist — tampilkan daftar pantau",
         "- /watchlist add &lt;SIMBOL&gt; — tambah pair spot /USDT ke daftar pantau",

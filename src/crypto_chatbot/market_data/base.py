@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -14,6 +14,7 @@ from crypto_chatbot.schemas.derivatives import (
     OrderBookBatch,
 )
 from crypto_chatbot.schemas.market import (
+    FiniteFloat,
     MarketCandle,
     MarketType,
     ProviderMetadata,
@@ -51,6 +52,43 @@ class OhlcvBatch(BaseModel):
     @property
     def has_provider_error(self) -> bool:
         return QualityFlag.PROVIDER_ERROR in self.quality_flags
+
+
+class FuturesTickerSnapshot(BaseModel):
+    """Normalized 24h linear USDT perpetual ticker metrics for market screening."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    venue: str = Field(min_length=1)
+    canonical_symbol: str = Field(min_length=1)
+    provider_symbol: str = Field(min_length=1)
+    last_price: FiniteFloat = Field(gt=0)
+    change_24h_pct: FiniteFloat
+    quote_volume_24h_usd: FiniteFloat = Field(ge=0)
+    observed_time: UtcDatetime
+
+
+class FuturesTickerBatch(BaseModel):
+    """Batch wrapper for exchange-wide perpetual futures 24h tickers."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    venue: str = Field(min_length=1)
+    received_time: UtcDatetime
+    tickers: tuple[FuturesTickerSnapshot, ...] = ()
+    quality_flags: tuple[QualityFlag, ...] = ()
+    error_message: str | None = None
+
+    @property
+    def has_provider_error(self) -> bool:
+        return QualityFlag.PROVIDER_ERROR in self.quality_flags
+
+
+@runtime_checkable
+class FuturesTickerProvider(Protocol):
+    """Optional capability protocol for fetching exchange-wide 24h futures tickers."""
+
+    async def get_futures_tickers(self) -> FuturesTickerBatch: ...
 
 
 class MarketDataProvider(Protocol):

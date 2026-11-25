@@ -318,7 +318,7 @@ async def test_ptb_command_and_followup_handlers_end_to_end() -> None:
     register_handlers(app, bot)
 
     handlers = app.handlers[0]
-    assert len(handlers) == 10
+    assert len(handlers) == 12
 
     replies: list[tuple[str, Any]] = []
 
@@ -347,7 +347,7 @@ async def test_ptb_command_and_followup_handlers_end_to_end() -> None:
         assert all(len(chunk) <= TELEGRAM_MAX_MESSAGE_LENGTH for chunk, _ in replies)
         return [chunk for chunk, _ in replies]
 
-    # 0=start..3=compare, 4=pine, 5=watchlist..8=unknown, 9=text
+    # 0=start..4=pine, 5=scan, 6=screen, 7=watchlist..10=unknown, 11=text
     start_out = "\n".join(await invoke(0, "/start"))
     assert "Selamat datang" in start_out
 
@@ -359,7 +359,10 @@ async def test_ptb_command_and_followup_handlers_end_to_end() -> None:
     assert "TradingView Pine Script v6" in pine_out
     assert "//@version=6" in pine_out
 
-    followup_out = "\n".join(await invoke(9, "bandingkan momentumnya dengan ETH"))
+    scan_out = "\n".join(await invoke(5, "/scan BTC", ["BTC"]))
+    assert "Pemindai Setup Futures" in scan_out
+
+    followup_out = "\n".join(await invoke(11, "bandingkan momentumnya dengan ETH"))
     assert "Perbandingan Deskriptif (BTC/USDT:USDT, ETH/USDT:USDT - 4h)" in followup_out
     assert "BTC/USDT:USDT (4h)" in followup_out
     assert "ETH/USDT:USDT (4h)" in followup_out
@@ -370,7 +373,7 @@ async def test_ptb_command_and_followup_handlers_end_to_end() -> None:
     bad_cmd_out = "\n".join(await invoke(2, "/analyze BTC 5m", ["BTC", "5m"]))
     assert "tidak didukung" in bad_cmd_out.lower()
 
-    unknown_out = "\n".join(await invoke(8, "/tidakada"))
+    unknown_out = "\n".join(await invoke(10, "/tidakada"))
     assert "tidak dikenali" in unknown_out.lower()
 
 

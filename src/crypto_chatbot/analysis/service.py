@@ -7,7 +7,7 @@ import hashlib
 import itertools
 import json
 from collections.abc import Mapping, Sequence
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from crypto_chatbot.analysis.cross_venue import compute_cross_venue_derivatives
@@ -38,6 +38,8 @@ from crypto_chatbot.market_data.base import (
     DEFAULT_CANDLE_LIMIT,
     MIN_FULL_HISTORY_CANDLES,
     DerivativesLiquidityProvider,
+    FuturesTickerBatch,
+    FuturesTickerProvider,
     MarketDataProvider,
     OhlcvBatch,
 )
@@ -72,6 +74,7 @@ from crypto_chatbot.schemas.derivatives import (
 )
 from crypto_chatbot.schemas.macro import MacroBenchmarkContext
 from crypto_chatbot.schemas.market import (
+    MULTI_STYLE_SCAN_TIMEFRAMES,
     MarketCandle,
     MarketType,
     ProviderMetadata,
@@ -1028,7 +1031,7 @@ def _build_mtf_overview(
         Regime.TRANSITIONAL: "Transisi",
     }
     overviews: list[TimeframeOverview] = []
-    for tf in (Timeframe.D1, Timeframe.H4, Timeframe.H1, Timeframe.M15):
+    for tf in (Timeframe.D1, Timeframe.H4, Timeframe.H1, Timeframe.M15, Timeframe.M5):
         seq = by_tf.get(tf)
         if not seq:
             continue
@@ -1243,6 +1246,7 @@ def build_analysis_snapshot(
     mtf_hashes: dict[str, str] = {}
     dropped_mtf: list[Timeframe] = []
     ltf_15m_candles: tuple[MarketCandle, ...] | None = None
+    micro_5m_candles: tuple[MarketCandle, ...] | None = None
     htf_candles_by_tf: dict[Timeframe, tuple[MarketCandle, ...]] = {}
 
     if mtf_batches is not None:
@@ -1265,6 +1269,8 @@ def build_analysis_snapshot(
                     htf_candles_by_tf[tf] = mtf_batch.candles
             elif tf is Timeframe.M15 and batch.timeframe is not Timeframe.M15:
                 ltf_15m_candles = mtf_batch.candles
+            elif tf is Timeframe.M5 and batch.timeframe is not Timeframe.M5:
+                micro_5m_candles = mtf_batch.candles
 
     ind_result = compute_technical_metrics(
         batch.candles,
@@ -1414,6 +1420,7 @@ def build_analysis_snapshot(
         sentiment=sent_metrics,
         primary_timeframe=batch.timeframe,
         ltf_candles=ltf_15m_candles,
+        micro_candles=micro_5m_candles,
         htf_candles_by_tf=htf_candles_by_tf or None,
         as_of=as_of,
         use_available_time=use_available_time,
@@ -1597,15 +1604,166 @@ class AnalysisService:
         self._prediction_repository = prediction_repository
         self._dxy_provider = dxy_provider
 
-    async def _fetch_optional_ltf_15m(self, canonical_symbol: str) -> OhlcvBatch | None:
+    async def get_futures_tickers(self) -> FuturesTickerBatch:
+        """Fetch exchange-wide 24h futures tickers if the market provider supports it."""
+        if isinstance(self._provider, FuturesTickerProvider):
+            return await self._provider.get_futures_tickers()
+        return FuturesTickerBatch(
+            venue="unknown",
+            received_time=datetime.now(UTC),
+            quality_flags=(QualityFlag.PROVIDER_ERROR,),
+            error_message="Market provider does not support exchange-wide futures tickers.",
+        )
+
+    async def get_closed_ohlcv(
+        self,
+        symbol: str,
+        timeframe: Timeframe,
+        *,
+        limit: int = 100,
+    ) -> OhlcvBatch:
+        """Fetch normalized closed candles for one symbol/timeframe via active provider."""
+        return await self._provider.get_closed_ohlcv(symbol, timeframe, limit=limit)
+
+    async def analyze_multi_style(
+        self,
+        symbol: str,
+        timeframes: Sequence[Timeframe] = MULTI_STYLE_SCAN_TIMEFRAMES,
+        *,
+        limit: int = DEFAULT_CANDLE_LIMIT,
+        include_derivatives: bool = True,
+    ) -> dict[Timeframe, AnalysisSnapshot]:
+        """Evaluate multiple trading-style timeframes concurrently with a single data fetch."""
+        requested_tfs = tuple(dict.fromkeys(timeframes))
+        if not requested_tfs:
+            return {}
+
+        mapping = resolve_default_perp_symbol(symbol)
+        base_core = (Timeframe.M15, Timeframe.H1, Timeframe.H4, Timeframe.D1)
+        core_tfs: list[Timeframe] = list(base_core)
+        for tf in requested_tfs:
+            if tf not in core_tfs:
+                core_tfs.append(tf)
+
+        def _fetch_limit(tf: Timeframe) -> int:
+            if tf is Timeframe.M15:
+                return max(limit, 200)
+            if tf in requested_tfs or tf in (Timeframe.H1, Timeframe.H4):
+                return limit
+            return 100
+
+        core_results = await asyncio.gather(
+            *(
+                self._provider.get_closed_ohlcv(
+                    mapping.canonical_symbol,
+                    tf,
+                    limit=_fetch_limit(tf),
+                )
+                for tf in core_tfs
+            )
+        )
+        batches: dict[Timeframe, OhlcvBatch] = dict(zip(core_tfs, core_results, strict=True))
+
+        effective_symbol = mapping.canonical_symbol
+        effective_base = mapping.base
+        any_requested_ok = False
+        for tf in requested_tfs:
+            batch = batches.get(tf)
+            if (
+                batch is not None
+                and bool(batch.candles)
+                and determine_quality_status(len(batch.candles), batch.quality_flags)
+                is not QualityStatus.INSUFFICIENT_DATA
+            ):
+                if not any_requested_ok:
+                    effective_symbol = batch.canonical_symbol
+                    effective_base = batch.metadata.base_unit
+                any_requested_ok = True
+
+        derivatives_context: DerivativesContext | None = None
+        cross_venue: CrossVenueDerivativesSummary | None = None
+        if any_requested_ok:
+            if Timeframe.M5 not in batches:
+                m5_batch = await self._fetch_optional_ltf(
+                    effective_symbol,
+                    Timeframe.M5,
+                    limit=150,
+                )
+                if m5_batch is not None:
+                    batches[Timeframe.M5] = m5_batch
+
+            if self._derivatives_provider is not None and include_derivatives:
+                oi_tf = max(
+                    requested_tfs,
+                    key=lambda t: (
+                        Timeframe.M5,
+                        Timeframe.M15,
+                        Timeframe.H1,
+                        Timeframe.H4,
+                        Timeframe.D1,
+                    ).index(t),
+                )
+                funding_batch, oi_batch, ob_batch, liq_batch = await asyncio.gather(
+                    self._derivatives_provider.get_funding_rate(effective_base),
+                    self._derivatives_provider.get_open_interest(effective_base, oi_tf),
+                    self._derivatives_provider.get_order_book(
+                        effective_symbol,
+                        market_type=mapping.market_type,
+                    ),
+                    self._derivatives_provider.get_liquidations(effective_base),
+                )
+                derivatives_context = DerivativesContext(
+                    funding=funding_batch,
+                    open_interest=oi_batch,
+                    order_book=ob_batch,
+                    liquidations=liq_batch,
+                )
+
+            if self._bybit_provider is not None and include_derivatives:
+                try:
+                    bybit_funding = await self._bybit_provider.get_funding_rate(mapping.base)
+                    bybit_context = (
+                        DerivativesContext(funding=bybit_funding)
+                        if bybit_funding.observation is not None
+                        else None
+                    )
+                    cross_venue = compute_cross_venue_derivatives(
+                        derivatives_context,
+                        bybit_context,
+                    )
+                except Exception:
+                    cross_venue = None
+
+        snapshots: dict[Timeframe, AnalysisSnapshot] = {}
+        for tf in requested_tfs:
+            primary = batches[tf]
+            mtf_batches = {k: v for k, v in batches.items() if k is not tf}
+            snapshots[tf] = build_analysis_snapshot(
+                primary,
+                mtf_batches=mtf_batches,
+                derivatives_context=derivatives_context,
+                cross_venue_derivatives=cross_venue,
+            )
+        return snapshots
+
+    async def _fetch_optional_ltf(
+        self,
+        canonical_symbol: str,
+        tf: Timeframe,
+        *,
+        limit: int = 200,
+    ) -> OhlcvBatch | None:
         try:
-            return await self._provider.get_closed_ohlcv(
+            batch = await self._provider.get_closed_ohlcv(
                 canonical_symbol,
-                Timeframe.M15,
-                limit=200,
+                tf,
+                limit=limit,
             )
         except KeyError:
             return None
+        if batch.has_provider_error or not batch.candles:
+            return None
+        return batch
 
     async def analyze(
         self,
@@ -1646,10 +1804,26 @@ class AnalysisService:
                 )
             )
             mtf_batches = dict(zip(other_tfs, fetched, strict=True))
+            optional_tasks: list[tuple[Timeframe, Any]] = []
             if timeframe is not Timeframe.M15:
-                m15_batch = await self._fetch_optional_ltf_15m(effective_symbol)
-                if m15_batch is not None:
-                    mtf_batches[Timeframe.M15] = m15_batch
+                optional_tasks.append(
+                    (
+                        Timeframe.M15,
+                        self._fetch_optional_ltf(effective_symbol, Timeframe.M15, limit=200),
+                    )
+                )
+            if timeframe is not Timeframe.M5:
+                optional_tasks.append(
+                    (
+                        Timeframe.M5,
+                        self._fetch_optional_ltf(effective_symbol, Timeframe.M5, limit=150),
+                    )
+                )
+            if optional_tasks:
+                optional_results = await asyncio.gather(*(coro for _, coro in optional_tasks))
+                for (opt_tf, _), opt_batch in zip(optional_tasks, optional_results, strict=True):
+                    if opt_batch is not None:
+                        mtf_batches[opt_tf] = opt_batch
 
         derivatives_context: DerivativesContext | None = None
         if self._derivatives_provider is not None and include_derivatives and primary_ok:

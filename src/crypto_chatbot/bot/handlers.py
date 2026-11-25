@@ -6,21 +6,36 @@ import html
 import logging
 import uuid
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, Literal
 
 from sqlalchemy.exc import SQLAlchemyError
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
+from crypto_chatbot.analysis.momentum_screener import (
+    DEFAULT_MIN_VOLUME_24H_USD,
+    render_momentum_screener_report,
+    screen_momentum_movers,
+)
 from crypto_chatbot.analysis.pine_export import generate_pine_script
+from crypto_chatbot.analysis.scanner import (
+    DEFAULT_SCAN_BASKET,
+    render_market_scan_report,
+    scan_market_setups,
+)
 from crypto_chatbot.analysis.service import AnalysisService
 from crypto_chatbot.bot.access import AccessController
 from crypto_chatbot.bot.commands import (
     AnalyzeIntent,
+    ChatQaIntent,
     CommandParseError,
     CompareIntent,
+    PineIntent,
     RefusalIntent,
+    ScanIntent,
+    ScreenIntent,
+    _extract_recent_context,
     parse_analyze_args,
     parse_compare_args,
     parse_watchlist_args,
@@ -37,11 +52,18 @@ from crypto_chatbot.bot.templates import (
 )
 from crypto_chatbot.llm.gemini import GeminiNarrator
 from crypto_chatbot.llm.render import render_analysis_response, render_comparison_response
+from crypto_chatbot.market_data.symbols import resolve_default_perp_symbol
 from crypto_chatbot.memory.service import MemoryService
 from crypto_chatbot.ops.logging import SecretRedactingFilter as SecretRedactingFilter
 from crypto_chatbot.schemas.commands import WatchlistAction
 from crypto_chatbot.schemas.llm import AnalysisResponse
-from crypto_chatbot.schemas.market import QualityStatus, Timeframe
+from crypto_chatbot.schemas.market import (
+    MULTI_STYLE_SCAN_TIMEFRAMES,
+    QualityStatus,
+    Timeframe,
+    format_trading_style_short,
+    resolve_primary_timeframe,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -189,7 +211,10 @@ class BotService:
         try:
             default_tf = self._safe_default_timeframe(user_id)
             parsed = parse_analyze_args(args, default_timeframe=default_tf)
-            snapshot = await self._analysis_service.analyze(parsed.symbol, parsed.timeframe)
+            return await self._execute_pine(
+                symbol=parsed.symbol,
+                timeframe=parsed.timeframe,
+            )
         except CommandParseError as exc:
             return split_telegram_message(
                 html.escape(str(exc), quote=False),
@@ -199,6 +224,146 @@ class BotService:
             logger.exception("request_id=%s user_id=%s action=pine db_error", request_id, user_id)
             return ("Gagal mengakses database. Script Pine tidak dapat dibuat saat ini.",)
 
+    async def handle_scan(
+        self,
+        user_id: int | None,
+        args: Sequence[str],
+    ) -> tuple[str, ...]:
+        request_id = f"req-{uuid.uuid4().hex[:12]}"
+        denied = self._authorize(user_id, request_id, "scan")
+        if denied is not None or user_id is None:
+            return denied or _deny_chunks("not_allowlisted")
+
+        try:
+            prefs = self._memory.get_preferences(user_id)
+            timeframe = prefs.default_timeframe
+            explicit_tf_provided = False
+            explicit_symbols: list[str] = []
+            for raw_arg in args:
+                cleaned_arg = raw_arg.strip()
+                if not cleaned_arg:
+                    continue
+                tf_cand = resolve_primary_timeframe(cleaned_arg)
+                if tf_cand is not None:
+                    timeframe = tf_cand
+                    explicit_tf_provided = True
+                    continue
+                try:
+                    explicit_symbols.append(
+                        resolve_default_perp_symbol(cleaned_arg).canonical_symbol
+                    )
+                except ValueError:
+                    esc_arg = html.escape(cleaned_arg, quote=False)
+                    return (
+                        f"Argumen '{esc_arg}' tidak valid untuk /scan. "
+                        "Gunakan: /scan [scalp|intraday|swing|15m|1h|4h|1d] atau /scan BTC ETH SOL",
+                    )
+
+            return await self._execute_scan(
+                user_id=user_id,
+                request_id=request_id,
+                timeframe=timeframe,
+                timeframes=None if explicit_tf_provided else MULTI_STYLE_SCAN_TIMEFRAMES,
+                explicit_symbols=explicit_symbols or None,
+                watchlist=prefs.watchlist,
+                user_text="/scan " + " ".join(args),
+            )
+        except SQLAlchemyError:
+            logger.exception("request_id=%s user_id=%s action=scan db_error", request_id, user_id)
+            return ("Gagal mengakses database. Pemindaian tidak dapat diselesaikan saat ini.",)
+
+    async def handle_screen(
+        self,
+        user_id: int | None,
+        args: Sequence[str],
+    ) -> tuple[str, ...]:
+        request_id = f"req-{uuid.uuid4().hex[:12]}"
+        denied = self._authorize(user_id, request_id, "screen")
+        if denied is not None or user_id is None:
+            return denied or _deny_chunks("not_allowlisted")
+
+        side: Literal["all", "long", "short"] = "all"
+        min_vol_usd = DEFAULT_MIN_VOLUME_24H_USD
+
+        for raw_arg in args:
+            tok = raw_arg.strip().lower()
+            if not tok:
+                continue
+            if tok in ("long", "buy", "gainer", "gainers"):
+                side = "long"
+            elif tok in ("short", "sell", "loser", "losers"):
+                side = "short"
+            elif tok == "all":
+                side = "all"
+            else:
+                try:
+                    val = float(tok)
+                except ValueError:
+                    esc = html.escape(raw_arg, quote=False)
+                    return (
+                        f"Argumen '{esc}' tidak valid untuk /screen. "
+                        "Gunakan: /screen [long|short|all] [min_volume_juta_usd] "
+                        "(contoh: /screen long 10)",
+                    )
+                if val <= 0:
+                    return ("Minimum volume harus lebih besar dari 0.",)
+                min_vol_usd = val * 1_000_000.0 if val < 10_000.0 else val
+
+        try:
+            return await self._execute_screen(
+                user_id=user_id,
+                request_id=request_id,
+                side=side,
+                min_volume_usd=min_vol_usd,
+                user_text="/screen " + " ".join(args),
+            )
+        except ValueError as exc:
+            return (html.escape(str(exc), quote=False),)
+        except SQLAlchemyError:
+            logger.exception("request_id=%s user_id=%s action=screen db_error", request_id, user_id)
+            return ("Gagal mengakses database. Screening tidak dapat diselesaikan saat ini.",)
+
+    async def _execute_screen(
+        self,
+        *,
+        user_id: int,
+        request_id: str,
+        side: Literal["all", "long", "short"],
+        min_volume_usd: float,
+        user_text: str,
+    ) -> tuple[str, ...]:
+        report = await screen_momentum_movers(
+            self._analysis_service,
+            side=side,
+            min_volume_usd=min_volume_usd,
+        )
+        rendered = render_momentum_screener_report(report, html_mode=True)
+        self._memory.record_user_message(user_id, user_text)
+        ready_syms = (
+            ", ".join(s.symbol for s in (*report.long_signals, *report.short_signals))
+            or "tidak ada"
+        )
+        self._memory.record_assistant_text(
+            user_id,
+            f"[SCREEN 15m] Sisi={side}; READY: {ready_syms}.",
+        )
+        logger.info(
+            "request_id=%s user_id=%s action=screen side=%s long=%d short=%d",
+            request_id,
+            user_id,
+            side,
+            len(report.long_signals),
+            len(report.short_signals),
+        )
+        return split_telegram_message(rendered, TELEGRAM_MAX_MESSAGE_LENGTH)
+
+    async def _execute_pine(
+        self,
+        *,
+        symbol: str,
+        timeframe: Timeframe,
+    ) -> tuple[str, ...]:
+        snapshot = await self._analysis_service.analyze(symbol, timeframe)
         if snapshot.quality_status is QualityStatus.INSUFFICIENT_DATA:
             return (
                 f"Data tidak mencukupi (INSUFFICIENT_DATA) untuk membuat Pine Script "
@@ -220,6 +385,52 @@ class BotService:
         for extra in code_chunks[1:]:
             chunks.append(f"<pre>{html.escape(extra, quote=False)}</pre>")
         return tuple(chunks)
+
+    async def _execute_scan(
+        self,
+        *,
+        user_id: int,
+        request_id: str,
+        timeframe: Timeframe,
+        timeframes: Sequence[Timeframe] | None = None,
+        explicit_symbols: Sequence[str] | None,
+        watchlist: Sequence[str],
+        user_text: str,
+    ) -> tuple[str, ...]:
+        if explicit_symbols:
+            targets = list(dict.fromkeys(explicit_symbols))
+        else:
+            targets = list(dict.fromkeys((*watchlist, *DEFAULT_SCAN_BASKET)))[:10]
+
+        report = await scan_market_setups(
+            self._analysis_service,
+            targets,
+            timeframe=timeframe,
+            timeframes=timeframes,
+        )
+        rendered = render_market_scan_report(report, html_mode=True)
+        self._memory.record_user_message(user_id, user_text)
+        ready_syms = (
+            ", ".join(
+                f"{item.symbol} [{format_trading_style_short(item.timeframe)}]"
+                for item in report.ready_setups
+            )
+            or "tidak ada"
+        )
+        self._memory.record_assistant_text(
+            user_id,
+            f"[SCAN {timeframe.value}] Dipindai {report.scanned_count} koin; "
+            f"READY ({len(report.ready_setups)}): {ready_syms}.",
+        )
+        logger.info(
+            "request_id=%s user_id=%s action=scan tf=%s scanned=%d ready=%d",
+            request_id,
+            user_id,
+            timeframe.value,
+            report.scanned_count,
+            len(report.ready_setups),
+        )
+        return split_telegram_message(rendered, TELEGRAM_MAX_MESSAGE_LENGTH)
 
     async def handle_watchlist(
         self,
@@ -334,8 +545,40 @@ class BotService:
                 recent_messages=recent,
                 default_timeframe=prefs.default_timeframe,
             )
+            if isinstance(intent, RefusalIntent) and not intent.is_hard_refusal:
+                intent = await self._resolve_via_llm_fallback(
+                    text=text,
+                    user_id=user_id,
+                    recent_messages=recent,
+                    default_timeframe=prefs.default_timeframe,
+                    fallback_refusal=intent,
+                )
+
             if isinstance(intent, RefusalIntent):
                 return (html.escape(intent.message, quote=False),)
+            if isinstance(intent, ScreenIntent):
+                return await self._execute_screen(
+                    user_id=user_id,
+                    request_id=request_id,
+                    side=intent.side,
+                    min_volume_usd=intent.min_volume_usd,
+                    user_text=text,
+                )
+            if isinstance(intent, ScanIntent):
+                return await self._execute_scan(
+                    user_id=user_id,
+                    request_id=request_id,
+                    timeframe=intent.timeframe,
+                    timeframes=intent.timeframes,
+                    explicit_symbols=intent.symbols,
+                    watchlist=prefs.watchlist,
+                    user_text=text,
+                )
+            if isinstance(intent, PineIntent):
+                return await self._execute_pine(
+                    symbol=intent.symbol,
+                    timeframe=intent.timeframe,
+                )
             if isinstance(intent, AnalyzeIntent):
                 return await self._execute_single_analysis(
                     user_id=user_id,
@@ -343,7 +586,7 @@ class BotService:
                     symbol=intent.symbol,
                     timeframe=intent.timeframe,
                     user_text=text,
-                    compact=True,
+                    compact=not intent.detail,
                 )
             if isinstance(intent, CompareIntent):
                 return await self._execute_comparison(
@@ -353,12 +596,122 @@ class BotService:
                     timeframe=intent.timeframe,
                     user_text=text,
                 )
+            if isinstance(intent, ChatQaIntent):
+                return await self._execute_chat_qa(
+                    user_id=user_id,
+                    request_id=request_id,
+                    question=intent.question,
+                )
             return ("Permintaan tidak dapat diproses. Gunakan /help.",)  # pragma: no cover
         except SQLAlchemyError:
             logger.exception(
                 "request_id=%s user_id=%s action=followup db_error", request_id, user_id
             )
             return ("Layanan database sedang bermasalah. Coba beberapa saat lagi.",)
+
+    async def _resolve_via_llm_fallback(
+        self,
+        *,
+        text: str,
+        user_id: int,
+        recent_messages: Sequence[Any],
+        default_timeframe: Timeframe,
+        fallback_refusal: RefusalIntent,
+    ) -> (
+        AnalyzeIntent
+        | CompareIntent
+        | PineIntent
+        | ScanIntent
+        | ScreenIntent
+        | ChatQaIntent
+        | RefusalIntent
+    ):
+        recent_syms, recent_tf = _extract_recent_context(recent_messages, default_timeframe)
+        classified = await self._narrator.classify_intent(
+            text,
+            user_id=user_id,
+            recent_symbols=recent_syms,
+        )
+        if classified is None or classified.intent == "unsupported":
+            return fallback_refusal
+
+        if classified.intent == "screen":
+            return ScreenIntent(side=classified.screen_side or "all")
+
+        resolved_cls_tf = (
+            resolve_primary_timeframe(classified.timeframe)
+            if classified.timeframe is not None
+            else None
+        )
+        target_tf = resolved_cls_tf if resolved_cls_tf is not None else default_timeframe
+        resolved_syms: list[str] = []
+        for raw_sym in classified.symbols:
+            try:
+                canon = resolve_default_perp_symbol(raw_sym).canonical_symbol
+            except ValueError:
+                continue
+            if canon not in resolved_syms:
+                resolved_syms.append(canon)
+
+        if classified.intent == "scan":
+            return ScanIntent(
+                timeframe=target_tf,
+                timeframes=(None if resolved_cls_tf is not None else MULTI_STYLE_SCAN_TIMEFRAMES),
+                symbols=tuple(resolved_syms) if resolved_syms else None,
+            )
+        if classified.intent == "pine":
+            target_sym = (
+                resolved_syms[0] if resolved_syms else (recent_syms[0] if recent_syms else None)
+            )
+            tf = target_tf if classified.timeframe is not None or resolved_syms else recent_tf
+            if target_sym is not None:
+                return PineIntent(symbol=target_sym, timeframe=tf)
+            return fallback_refusal
+        if classified.intent == "compare":
+            if len(resolved_syms) >= 2:
+                return CompareIntent(symbols=tuple(resolved_syms[:3]), timeframe=target_tf)
+            if len(resolved_syms) == 1 and recent_syms:
+                prior = next((s for s in recent_syms if s != resolved_syms[0]), None)
+                if prior is not None:
+                    return CompareIntent(symbols=(prior, resolved_syms[0]), timeframe=target_tf)
+            return fallback_refusal
+        if classified.intent in ("analyze", "analyze_detail"):
+            is_detail = classified.intent == "analyze_detail"
+            if resolved_syms:
+                return AnalyzeIntent(symbol=resolved_syms[0], timeframe=target_tf, detail=is_detail)
+            if recent_syms:
+                tf = target_tf if classified.timeframe is not None else recent_tf
+                return AnalyzeIntent(symbol=recent_syms[0], timeframe=tf, detail=is_detail)
+            return fallback_refusal
+        if classified.intent == "chat_qa":
+            return ChatQaIntent(question=text.strip())
+        return fallback_refusal
+
+    async def _execute_chat_qa(
+        self,
+        *,
+        user_id: int,
+        request_id: str,
+        question: str,
+    ) -> tuple[str, ...]:
+        context = self._memory.build_context_for_llm(user_id, current_question=question)
+        answer = await self._narrator.answer_research_question(
+            question,
+            user_id=user_id,
+            user_context=context,
+        )
+        if answer is None:
+            return (
+                "Maaf, layanan diskusi AI sedang mencapai batas kuota atau sibuk saat ini. "
+                "Anda tetap bisa menyebut nama koin (mis. 'analisa BTC') atau /scan.",
+            )
+        self._memory.record_user_message(user_id, question)
+        self._memory.record_assistant_text(user_id, answer)
+        logger.info("request_id=%s user_id=%s action=chat_qa", request_id, user_id)
+        return split_telegram_message(
+            html.escape(answer, quote=False),
+            TELEGRAM_MAX_MESSAGE_LENGTH,
+        )
 
     async def _execute_single_analysis(
         self,
@@ -478,6 +831,14 @@ def register_handlers(
         uid = update.effective_user.id if update.effective_user else None
         await _reply_chunks(update, await bot_service.handle_pine(uid, context.args or []))
 
+    async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        uid = update.effective_user.id if update.effective_user else None
+        await _reply_chunks(update, await bot_service.handle_scan(uid, context.args or []))
+
+    async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        uid = update.effective_user.id if update.effective_user else None
+        await _reply_chunks(update, await bot_service.handle_screen(uid, context.args or []))
+
     async def watchlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         uid = update.effective_user.id if update.effective_user else None
         await _reply_chunks(update, await bot_service.handle_watchlist(uid, context.args or []))
@@ -532,6 +893,8 @@ def register_handlers(
     application.add_handler(CommandHandler("analyze", analyze_cmd))
     application.add_handler(CommandHandler("compare", compare_cmd))
     application.add_handler(CommandHandler("pine", pine_cmd))
+    application.add_handler(CommandHandler("scan", scan_cmd))
+    application.add_handler(CommandHandler("screen", screen_cmd))
     application.add_handler(CommandHandler("watchlist", watchlist_cmd))
     application.add_handler(CommandHandler("memory", memory_cmd))
     application.add_handler(CommandHandler("forget", forget_cmd))

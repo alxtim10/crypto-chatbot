@@ -78,6 +78,17 @@ class MemoryService:
             max_messages=self._max_messages,
         )
 
+    def record_assistant_text(self, user_id: int, text: str) -> StoredMessage:
+        """Persist a bounded assistant Q&A/scan summary turn without snapshot attachment."""
+        trimmed = text.strip()[:MAX_STORED_USER_MESSAGE_CHARS]
+        return self._repository.append_message(
+            user_id,
+            role="assistant",
+            content=trimmed,
+            snapshot_id=None,
+            max_messages=self._max_messages,
+        )
+
     def record_assistant_turn(
         self,
         user_id: int,

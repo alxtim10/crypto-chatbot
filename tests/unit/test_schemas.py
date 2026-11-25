@@ -224,7 +224,7 @@ def test_candle_rejects_invalid_ohlc_and_volume(overrides: dict[str, Any]) -> No
         {"market_type": MarketType.SPOT, "canonical_symbol": "BTC/USDT:USDT"},
         {"market_type": MarketType.SPOT, "provider_symbol": "BINANCE:BTCUSDT.P"},
         {"market_type": MarketType.PERPETUAL, "canonical_symbol": "BTC/USDT"},
-        {"timeframe": "5m"},
+        {"timeframe": "2m"},
         {"market_type": "futures"},
         {"quality_flags": ("UNKNOWN_FLAG",)},
     ],

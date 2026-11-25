@@ -605,6 +605,59 @@ def _build_htf_levels_and_sl(
     )
 
 
+def _evaluate_micro_5m_confirmation(
+    *,
+    bias: SetupBias,
+    micro_candles: Sequence[MarketCandle] | None,
+    as_of: datetime | None,
+    use_available_time: bool,
+) -> str | None:
+    """Evaluate causal 5m micro-confirmation inside/near setup entry without tightening SL."""
+    if not micro_candles or bias not in (SetupBias.LONG, SetupBias.SHORT):
+        return None
+    filtered = _filter_causal_candles(micro_candles, as_of, use_available_time=use_available_time)
+    if len(filtered) < 15 or filtered[0].timeframe is not Timeframe.M5:
+        return None
+
+    m5_struct = analyze_market_structure(filtered)
+    m5_smc = analyze_smc(filtered, structure=m5_struct)
+    m5_brk = m5_smc.latest_structure_break.event_type if m5_smc.latest_structure_break else None
+    m5_swp = m5_smc.latest_sweep.event_type if m5_smc.latest_sweep else None
+
+    if bias is SetupBias.LONG:
+        if (
+            m5_swp is StructureEventType.LIQUIDITY_SWEEP_BULLISH
+            and m5_brk is StructureEventType.CHOCH_BULLISH
+        ):
+            return "5m CHoCH+Sweep searah (micro trigger kuat)"
+        if m5_brk in (StructureEventType.BOS_BULLISH, StructureEventType.CHOCH_BULLISH):
+            return "5m CHoCH/BOS searah terkonfirmasi"
+        if m5_struct.market_structure is MarketStructure.BULLISH:
+            return "5m struktur searah"
+        if (
+            m5_brk in (StructureEventType.BOS_BEARISH, StructureEventType.CHOCH_BEARISH)
+            or m5_struct.market_structure is MarketStructure.BEARISH
+        ):
+            return "5m masih koreksi (tunggu CHoCH 5m di zona entry)"
+        return "5m konsolidasi"
+
+    if (
+        m5_swp is StructureEventType.LIQUIDITY_SWEEP_BEARISH
+        and m5_brk is StructureEventType.CHOCH_BEARISH
+    ):
+        return "5m CHoCH+Sweep searah (micro trigger kuat)"
+    if m5_brk in (StructureEventType.BOS_BEARISH, StructureEventType.CHOCH_BEARISH):
+        return "5m CHoCH/BOS searah terkonfirmasi"
+    if m5_struct.market_structure is MarketStructure.BEARISH:
+        return "5m struktur searah"
+    if (
+        m5_brk in (StructureEventType.BOS_BULLISH, StructureEventType.CHOCH_BULLISH)
+        or m5_struct.market_structure is MarketStructure.BULLISH
+    ):
+        return "5m masih koreksi (tunggu CHoCH 5m di zona entry)"
+    return "5m konsolidasi"
+
+
 def build_trade_setup(
     *,
     metrics: TechnicalMetrics,
@@ -615,6 +668,7 @@ def build_trade_setup(
     sentiment: SentimentMetrics | None = None,
     primary_timeframe: Timeframe = Timeframe.H4,
     ltf_candles: Sequence[MarketCandle] | None = None,
+    micro_candles: Sequence[MarketCandle] | None = None,
     htf_candles_by_tf: Mapping[Timeframe, Sequence[MarketCandle]] | None = None,
     as_of: datetime | None = None,
     use_available_time: bool = False,
@@ -869,6 +923,15 @@ def build_trade_setup(
                     stop_loss = ltf_ref.stop_loss
                     invalidation_reason = ltf_ref.invalidation_reason
                     entry_tf = Timeframe.M15
+
+    micro_note = _evaluate_micro_5m_confirmation(
+        bias=bias,
+        micro_candles=micro_candles,
+        as_of=as_of,
+        use_available_time=use_available_time,
+    )
+    if micro_note is not None:
+        ltf_confirmation = f"{ltf_confirmation} | {micro_note}" if ltf_confirmation else micro_note
 
     entry_mid = (entry_low + entry_high) / 2.0
     if bias is SetupBias.LONG:

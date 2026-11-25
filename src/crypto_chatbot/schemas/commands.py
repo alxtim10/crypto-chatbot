@@ -7,12 +7,28 @@ from enum import StrEnum
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from crypto_chatbot.market_data.symbols import resolve_default_perp_symbol
-from crypto_chatbot.schemas.market import Timeframe
+from crypto_chatbot.schemas.market import (
+    PRIMARY_TIMEFRAMES,
+    TRADING_STYLE_ALIASES,
+    Timeframe,
+)
 
 
 def _normalize_timeframe(value: object) -> object:
     if isinstance(value, str):
-        return value.strip().lower()
+        cleaned = value.strip().lower()
+        alias_tf = TRADING_STYLE_ALIASES.get(cleaned)
+        if alias_tf is not None:
+            return alias_tf.value
+        return cleaned
+    return value
+
+
+def _require_primary_tf(value: Timeframe) -> Timeframe:
+    if value not in PRIMARY_TIMEFRAMES:
+        ordered = sorted(PRIMARY_TIMEFRAMES, key=lambda t: t.duration)
+        supported = ", ".join(tf.value for tf in ordered)
+        raise ValueError(f"timeframe must be a primary analysis timeframe ({supported})")
     return value
 
 
@@ -34,6 +50,11 @@ class AnalyzeCommandArgs(BaseModel):
     @classmethod
     def _validate_timeframe(cls, value: object) -> object:
         return _normalize_timeframe(value)
+
+    @field_validator("timeframe", mode="after")
+    @classmethod
+    def _require_primary_timeframe(cls, value: Timeframe) -> Timeframe:
+        return _require_primary_tf(value)
 
 
 class CompareCommandArgs(BaseModel):
@@ -60,6 +81,11 @@ class CompareCommandArgs(BaseModel):
     @classmethod
     def _validate_timeframe(cls, value: object) -> object:
         return _normalize_timeframe(value)
+
+    @field_validator("timeframe", mode="after")
+    @classmethod
+    def _require_primary_timeframe(cls, value: Timeframe) -> Timeframe:
+        return _require_primary_tf(value)
 
 
 class WatchlistAction(StrEnum):

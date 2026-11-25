@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Sequence
+import math
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from types import TracebackType
 from typing import Any, Protocol
@@ -21,11 +22,14 @@ from crypto_chatbot.market_data.base import (
     DEFAULT_CANDLE_LIMIT,
     DEFAULT_FRESHNESS_GRACE,
     MAX_CANDLE_LIMIT,
+    FuturesTickerBatch,
+    FuturesTickerSnapshot,
     OhlcvBatch,
 )
 from crypto_chatbot.market_data.quality import normalize_ohlcv_rows
 from crypto_chatbot.market_data.symbols import (
     SymbolMapping,
+    resolve_default_perp_symbol,
     resolve_symbol,
 )
 from crypto_chatbot.schemas.market import (
@@ -357,6 +361,140 @@ class CcxtMarketDataProvider:
             candles=(),
             quality_flags=(QualityFlag.PROVIDER_ERROR,),
             error_message=message,
+        )
+
+    @staticmethod
+    def _to_finite_float(val: object) -> float | None:
+        if val is None or isinstance(val, bool):
+            return None
+        try:
+            num = float(val)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+        return num if math.isfinite(num) else None
+
+    async def _fetch_tickers_once(self) -> dict[str, Any]:
+        fetch_fn = getattr(self._client, "fetch_tickers", None)
+        if fetch_fn is None:
+            raise ccxt.NotSupported(f"{self._exchange_id} client does not implement fetch_tickers")
+        raw = await asyncio.wait_for(fetch_fn(), timeout=self._timeout_seconds)
+        return dict(raw) if isinstance(raw, Mapping) else {}
+
+    async def _fetch_tickers_with_retries(self) -> dict[str, Any]:
+        retrying = AsyncRetrying(
+            retry=retry_if_exception_type(_TRANSIENT_EXCEPTIONS),
+            stop=stop_after_attempt(self._max_attempts),
+            wait=wait_exponential_jitter(
+                initial=self._retry_initial_seconds,
+                max=self._retry_max_seconds,
+                jitter=min(self._retry_initial_seconds, 0.25),
+            ),
+            reraise=True,
+        )
+        async for attempt in retrying:
+            with attempt:
+                return await self._fetch_tickers_once()
+        raise RuntimeError("unreachable")  # pragma: no cover
+
+    async def get_futures_tickers(self) -> FuturesTickerBatch:
+        """Fetch 24h futures market tickers (price, % change, USD quote volume)."""
+        received_time = self._clock()
+        try:
+            raw_tickers = await self._fetch_tickers_with_retries()
+        except TimeoutError:
+            return FuturesTickerBatch(
+                venue=self._exchange_id,
+                received_time=self._clock(),
+                quality_flags=(QualityFlag.PROVIDER_ERROR,),
+                error_message=f"Provider timeout fetching futures tickers on {self._exchange_id}",
+            )
+        except ccxt.BaseError as exc:
+            return FuturesTickerBatch(
+                venue=self._exchange_id,
+                received_time=self._clock(),
+                quality_flags=(QualityFlag.PROVIDER_ERROR,),
+                error_message=(
+                    f"Provider error ({type(exc).__name__}) fetching tickers on {self._exchange_id}"
+                ),
+            )
+
+        observed_default = self._clock()
+        snapshots: list[FuturesTickerSnapshot] = []
+        seen_symbols: set[str] = set()
+
+        for ccxt_sym, payload in raw_tickers.items():
+            if not isinstance(ccxt_sym, str) or not ccxt_sym.endswith("/USDT:USDT"):
+                continue
+            if not isinstance(payload, Mapping):
+                continue
+
+            try:
+                mapping = resolve_default_perp_symbol(ccxt_sym)
+            except ValueError:
+                continue
+            if mapping.canonical_symbol in seen_symbols:
+                continue
+
+            last_price = self._to_finite_float(payload.get("last"))
+            if last_price is None or last_price <= 0.0:
+                last_price = self._to_finite_float(payload.get("close"))
+            if last_price is None or last_price <= 0.0:
+                continue
+
+            change_pct = self._to_finite_float(payload.get("percentage"))
+            if change_pct is None:
+                open_price = self._to_finite_float(payload.get("open"))
+                if open_price is not None and open_price > 0.0:
+                    change_pct = ((last_price - open_price) / open_price) * 100.0
+            if change_pct is None:
+                continue
+
+            quote_vol = self._to_finite_float(payload.get("quoteVolume"))
+            if quote_vol is None or quote_vol <= 0.0:
+                info = payload.get("info")
+                if isinstance(info, Mapping):
+                    for key in (
+                        "volume_24h_settle",
+                        "volume_24h_quote",
+                        "quoteVolume",
+                        "quote_volume",
+                        "vol24h",
+                    ):
+                        cand = self._to_finite_float(info.get(key))
+                        if cand is not None and cand > 0.0:
+                            quote_vol = cand
+                            break
+            if quote_vol is None or quote_vol <= 0.0:
+                base_vol = self._to_finite_float(payload.get("baseVolume"))
+                if base_vol is not None and base_vol > 0.0:
+                    quote_vol = base_vol * last_price
+            if quote_vol is None or quote_vol < 0.0:
+                quote_vol = 0.0
+
+            ts_ms = self._to_finite_float(payload.get("timestamp"))
+            if ts_ms is not None and ts_ms > 0.0:
+                obs_time = datetime.fromtimestamp(ts_ms / 1000.0, tz=UTC)
+            else:
+                obs_time = observed_default
+
+            provider_sym = f"{self._exchange_id.upper()}:{mapping.base}{mapping.quote}.P"
+            seen_symbols.add(mapping.canonical_symbol)
+            snapshots.append(
+                FuturesTickerSnapshot(
+                    venue=self._exchange_id,
+                    canonical_symbol=mapping.canonical_symbol,
+                    provider_symbol=provider_sym,
+                    last_price=last_price,
+                    change_24h_pct=change_pct,
+                    quote_volume_24h_usd=quote_vol,
+                    observed_time=obs_time,
+                )
+            )
+
+        return FuturesTickerBatch(
+            venue=self._exchange_id,
+            received_time=received_time,
+            tickers=tuple(snapshots),
         )
 
     async def close(self) -> None:
