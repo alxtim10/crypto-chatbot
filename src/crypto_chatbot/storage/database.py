@@ -24,3 +24,12 @@ def init_db(engine: Engine) -> None:
                 "ADD COLUMN IF NOT EXISTS taker_buy_base_volume DOUBLE PRECISION;"
             )
         )
+        conn.execute(
+            text("ALTER TABLE trade_setups ADD COLUMN IF NOT EXISTS market_type VARCHAR(16);")
+        )
+        conn.execute(
+            text(
+                "ALTER TABLE trade_setups "
+                "ADD COLUMN IF NOT EXISTS market_type VARCHAR(16);"
+            )
+        )
