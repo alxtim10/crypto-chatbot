@@ -34,6 +34,7 @@ MIN_SL_ATR = 0.5
 MIN_LTF_SL_HTF_ATR = 0.35
 MAX_SL_ATR = 3.5
 MIN_RR_TP2 = 1.5
+MAX_EXEC_COST_R = 0.15
 DEFAULT_TP1_R = 1.0
 DEFAULT_TP2_R = 2.0
 DEFAULT_TP3_R = 3.0
@@ -41,6 +42,7 @@ CROWDED_FUNDING_8H = 0.0010
 
 SETUP_PARAMETERS: dict[str, int | float | str] = {
     "trade_setup_min_rr_tp2": MIN_RR_TP2,
+    "trade_setup_max_exec_cost_r": MAX_EXEC_COST_R,
     "trade_setup_sl_atr_buffer": SL_ATR_BUFFER,
     "trade_setup_tp_levels": 3,
 }
@@ -548,8 +550,20 @@ def _resolve_bias(
         )
 
     if score >= 2:
+        if metrics.ema_200 is not None and metrics.last_close < metrics.ema_200:
+            return (
+                SetupBias.NEUTRAL,
+                "Harga masih di bawah EMA 200 (tren makro turun) tanpa konfirmasi "
+                "Liquidity Sweep + CHoCH bullish (WAIT).",
+            )
         return SetupBias.LONG, None
     if score <= -2:
+        if metrics.ema_200 is not None and metrics.last_close > metrics.ema_200:
+            return (
+                SetupBias.NEUTRAL,
+                "Harga masih di atas EMA 200 (tren makro naik) tanpa konfirmasi "
+                "Liquidity Sweep + CHoCH bearish (WAIT).",
+            )
         return SetupBias.SHORT, None
 
     return (
@@ -1046,6 +1060,22 @@ def build_trade_setup(
         )
 
     costs = cost_assumptions or CostAssumptions()
+    exec_costs = costs.model_copy(update={"funding_bps_per_24h": 0.0})
+    exec_cost_r = (exec_costs.round_trip_cost_rate * entry_mid) / risk if risk > 0.0 else None
+    if exec_cost_r is None or exec_cost_r > MAX_EXEC_COST_R:
+        pct_text = f"{exec_cost_r * 100:.1f}%" if exec_cost_r is not None else "tak terhingga"
+        return _wait_setup(
+            f"Biaya eksekusi round-trip ({pct_text} dari 1R) melebihi batas maksimal 15,0% "
+            "dari jarak Stop Loss (WAIT).",
+            risk_notes,
+            entry_timeframe=entry_tf,
+            ltf_confirmation=ltf_confirmation,
+            htf_support=htf_sup,
+            htf_resistance=htf_res,
+            ltf_support=ltf_sup,
+            ltf_resistance=ltf_res,
+        )
+
     cost_rate = costs.round_trip_cost_rate
     net_rr_tp1 = _net_reward_risk(
         entry_mid=entry_mid, target=tp1, stop_loss=stop_loss, cost_rate=cost_rate

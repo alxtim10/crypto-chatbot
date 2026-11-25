@@ -25,6 +25,7 @@ from crypto_chatbot.schemas.market import (
 
 DEFAULT_CANDLE_LIMIT = 1000
 MAX_CANDLE_LIMIT = 1000
+MAX_HISTORY_CANDLE_LIMIT = 10_000
 MIN_FULL_HISTORY_CANDLES = 600
 MIN_DEGRADED_HISTORY_CANDLES = 150
 DEFAULT_FRESHNESS_GRACE = timedelta(minutes=5)
@@ -89,6 +90,18 @@ class FuturesTickerProvider(Protocol):
     """Optional capability protocol for fetching exchange-wide 24h futures tickers."""
 
     async def get_futures_tickers(self) -> FuturesTickerBatch: ...
+
+
+@runtime_checkable
+class HistoryMarketDataProvider(Protocol):
+    """Optional capability protocol for fetching paginated closed OHLCV history."""
+
+    async def get_closed_ohlcv_history(
+        self,
+        symbol: str,
+        timeframe: Timeframe,
+        limit: int = DEFAULT_CANDLE_LIMIT,
+    ) -> OhlcvBatch: ...
 
 
 class MarketDataProvider(Protocol):

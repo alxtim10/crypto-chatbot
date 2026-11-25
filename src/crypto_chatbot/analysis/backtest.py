@@ -68,6 +68,7 @@ class BacktestConfig(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     warmup_bars: int = Field(default=200, ge=50)
+    max_lookback_bars: int = Field(default=1000, ge=200)
     step_bars: int = Field(default=1, ge=1)
     max_hold_bars: int = Field(default=24, ge=1)
     cooldown_bars: int = Field(default=1, ge=0)
@@ -424,7 +425,7 @@ def run_setup_backtest(
     while idx <= max_signal_idx:
         evaluated_bars += 1
         round_idx = evaluated_bars
-        history = closed[: idx + 1]
+        history = closed[max(0, idx + 1 - cfg.max_lookback_bars) : idx + 1]
         bar_candle = history[-1]
         as_of = bar_candle.close_time
         sym = bar_candle.canonical_symbol

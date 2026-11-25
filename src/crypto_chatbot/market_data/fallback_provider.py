@@ -13,6 +13,7 @@ from crypto_chatbot.market_data.base import (
     DerivativesLiquidityProvider,
     FuturesTickerBatch,
     FuturesTickerProvider,
+    HistoryMarketDataProvider,
     MarketDataProvider,
     OhlcvBatch,
 )
@@ -54,12 +55,33 @@ class FallbackMarketDataProvider:
         timeframe: Timeframe,
         limit: int = DEFAULT_CANDLE_LIMIT,
     ) -> OhlcvBatch:
+        return await self._get_ohlcv_chain(symbol, timeframe, limit=limit, use_history=False)
+
+    async def get_closed_ohlcv_history(
+        self,
+        symbol: str,
+        timeframe: Timeframe,
+        limit: int = DEFAULT_CANDLE_LIMIT,
+    ) -> OhlcvBatch:
+        return await self._get_ohlcv_chain(symbol, timeframe, limit=limit, use_history=True)
+
+    async def _get_ohlcv_chain(
+        self,
+        symbol: str,
+        timeframe: Timeframe,
+        *,
+        limit: int,
+        use_history: bool,
+    ) -> OhlcvBatch:
         errors: list[str] = []
         last_batch: OhlcvBatch | None = None
         first_empty_valid: OhlcvBatch | None = None
 
         for provider in self._providers:
-            batch = await provider.get_closed_ohlcv(symbol, timeframe, limit=limit)
+            if use_history and isinstance(provider, HistoryMarketDataProvider):
+                batch = await provider.get_closed_ohlcv_history(symbol, timeframe, limit=limit)
+            else:
+                batch = await provider.get_closed_ohlcv(symbol, timeframe, limit=limit)
             last_batch = batch
             if not batch.has_provider_error:
                 if batch.candles:

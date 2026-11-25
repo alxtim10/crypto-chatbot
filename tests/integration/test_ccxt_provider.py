@@ -9,6 +9,7 @@ from typing import Any
 import ccxt
 import pytest
 
+from crypto_chatbot.market_data.base import MAX_HISTORY_CANDLE_LIMIT
 from crypto_chatbot.market_data.ccxt_provider import (
     DEFAULT_BINANCE_PUBLIC_API_URL,
     CcxtMarketDataProvider,
@@ -244,6 +245,59 @@ async def test_ccxt_provider_falls_back_to_1000_perp_contract_on_bad_symbol() ->
     assert batch.provider_symbol == "BINANCE:1000PEPEUSDT.P"
     assert batch.metadata.base_unit == "1000PEPE"
     assert len(batch.candles) == 10
+
+
+@pytest.mark.asyncio
+async def test_ccxt_provider_paginated_history_and_deduplication() -> None:
+    step_ms = int(Timeframe.H4.duration.total_seconds() * 1000)
+    base_dt = datetime(2025, 1, 1, 0, 0, tzinfo=UTC)
+    base_ms = int(base_dt.timestamp() * 1000)
+    # 1500 closed candles + 1 overlapping boundary row + 1 open candle at end
+    total_closed = 1500
+    all_rows = [
+        [
+            base_ms + i * step_ms,
+            50000.0 + i,
+            50100.0 + i,
+            49900.0 + i,
+            50050.0 + i,
+            100.0 + i,
+        ]
+        for i in range(total_closed + 1)
+    ]
+    # Received 1 minute into the 1501st (index 1500) candle -> index 0..1499 are closed.
+    received_time = datetime.fromtimestamp((base_ms + total_closed * step_ms + 60_000) / 1000, UTC)
+
+    # Page 1 returns 1000 rows (0..999), Page 2 returns rows with an overlap (999..1500)
+    page1 = all_rows[:1000]
+    page2 = all_rows[999:]
+    fake_client = FakeCcxtClient([page1, page2])
+
+    provider = CcxtMarketDataProvider(
+        client=fake_client,
+        retry_initial_seconds=0.0,
+        retry_max_seconds=0.0,
+        clock=lambda: received_time,
+    )
+
+    batch = await provider.get_closed_ohlcv_history("BTC", Timeframe.H4, limit=1500)
+
+    assert not batch.has_provider_error, batch.error_message
+    assert len(fake_client.calls) == 2
+    assert fake_client.calls[0][2] is not None
+    assert fake_client.calls[1][2] == page1[-1][0] + step_ms
+    assert len(batch.candles) == 1500
+    assert batch.excluded_open_count == 1
+    assert batch.duplicate_count == 0
+    assert QualityFlag.GAP not in batch.quality_flags
+    assert all(c.is_closed for c in batch.candles)
+
+    with pytest.raises(ValueError, match="between 1 and"):
+        await provider.get_closed_ohlcv_history(
+            "BTC",
+            Timeframe.H4,
+            limit=MAX_HISTORY_CANDLE_LIMIT + 1,
+        )
 
 
 @pytest.mark.live

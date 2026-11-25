@@ -184,8 +184,8 @@ def test_build_trade_setup_long_short_and_wait_guards() -> None:
     bull_structure = StructureAnalysis(
         pivots=(),
         market_structure=MarketStructure.BULLISH,
-        last_swing_highs=(_pivot(StructureEventType.SWING_HIGH, 66_500.0),),
-        last_swing_lows=(_pivot(StructureEventType.SWING_LOW, 64_100.0),),
+        last_swing_highs=(_pivot(StructureEventType.SWING_HIGH, 69_500.0),),
+        last_swing_lows=(_pivot(StructureEventType.SWING_LOW, 62_800.0),),
     )
 
     # 1. Clean bullish setup (LONG) -> strict price hierarchy & R:R >= 1.5
@@ -193,11 +193,11 @@ def test_build_trade_setup_long_short_and_wait_guards() -> None:
         last_close=65_000.0,
         ema_20=64_600.0,
         ema_50=63_800.0,
-        atr_14=500.0,
+        atr_14=800.0,
         adx_14=32.0,
     )
     bull_smc = SmcSummary(
-        dealing_range_high=67_000.0,
+        dealing_range_high=70_000.0,
         dealing_range_low=62_000.0,
         equilibrium=64_500.0,
         dealing_zone=DealingZone.PREMIUM,
@@ -232,20 +232,20 @@ def test_build_trade_setup_long_short_and_wait_guards() -> None:
         last_close=60_000.0,
         ema_20=60_500.0,
         ema_50=61_500.0,
-        atr_14=500.0,
+        atr_14=800.0,
         adx_14=30.0,
     )
     bear_smc = SmcSummary(
         dealing_range_high=63_000.0,
-        dealing_range_low=57_000.0,
-        equilibrium=60_000.0,
-        dealing_zone=DealingZone.EQUILIBRIUM,
+        dealing_range_low=54_000.0,
+        equilibrium=58_500.0,
+        dealing_zone=DealingZone.PREMIUM,
     )
     bear_structure = StructureAnalysis(
         pivots=(),
         market_structure=MarketStructure.BEARISH,
-        last_swing_highs=(_pivot(StructureEventType.SWING_HIGH, 61_000.0),),
-        last_swing_lows=(_pivot(StructureEventType.SWING_LOW, 58_500.0),),
+        last_swing_highs=(_pivot(StructureEventType.SWING_HIGH, 62_200.0),),
+        last_swing_lows=(_pivot(StructureEventType.SWING_LOW, 55_000.0),),
     )
     short_setup = build_trade_setup(
         metrics=bear_metrics,
@@ -885,3 +885,143 @@ def test_setup_short_extreme_vol_no_crash_net_rr_wait_and_leverage_cap() -> None
     if low_cost_ready.status is SetupStatus.READY:
         assert low_cost_ready.max_theoretical_leverage is not None
         assert low_cost_ready.max_theoretical_leverage <= 20
+
+
+def test_ema200_trend_filter_and_exec_cost_r_gate() -> None:
+    t_piv = ANCHOR - timedelta(hours=8)
+
+    def _ev(event_type: StructureEventType, level: float) -> StructureEvent:
+        return StructureEvent(
+            event_type=event_type,
+            event_time=t_piv,
+            confirmation_time=t_piv,
+            level=level,
+        )
+
+    bull_structure = StructureAnalysis(
+        pivots=(),
+        market_structure=MarketStructure.BULLISH,
+        last_swing_highs=(_ev(StructureEventType.SWING_HIGH, 70_000.0),),
+        last_swing_lows=(_ev(StructureEventType.SWING_LOW, 62_000.0),),
+    )
+    bull_smc = SmcSummary(
+        dealing_range_high=72_000.0,
+        dealing_range_low=61_000.0,
+        equilibrium=66_500.0,
+        dealing_zone=DealingZone.DISCOUNT,
+    )
+
+    # 1. Counter-EMA200 LONG without Liquidity Sweep + CHoCH -> WAIT
+    counter_long_metrics = TechnicalMetrics(
+        last_close=64_000.0,
+        ema_20=63_500.0,
+        ema_50=63_000.0,
+        ema_200=68_000.0,
+        atr_14=800.0,
+        adx_14=30.0,
+    )
+    wait_long = build_trade_setup(
+        metrics=counter_long_metrics,
+        regime=Regime.TRENDING_UP,
+        structure=bull_structure,
+        smc=bull_smc,
+    )
+    assert wait_long.status is SetupStatus.WAIT
+    assert wait_long.wait_reason is not None
+    assert "EMA 200" in wait_long.wait_reason
+
+    # 2. Counter-EMA200 SHORT without Liquidity Sweep + CHoCH -> WAIT
+    bear_structure = StructureAnalysis(
+        pivots=(),
+        market_structure=MarketStructure.BEARISH,
+        last_swing_highs=(_ev(StructureEventType.SWING_HIGH, 61_000.0),),
+        last_swing_lows=(_ev(StructureEventType.SWING_LOW, 58_500.0),),
+    )
+    bear_smc = SmcSummary(
+        dealing_range_high=63_000.0,
+        dealing_range_low=57_000.0,
+        equilibrium=60_000.0,
+        dealing_zone=DealingZone.EQUILIBRIUM,
+    )
+    counter_short_metrics = TechnicalMetrics(
+        last_close=60_000.0,
+        ema_20=60_500.0,
+        ema_50=61_500.0,
+        ema_200=55_000.0,
+        atr_14=500.0,
+        adx_14=30.0,
+    )
+    wait_short = build_trade_setup(
+        metrics=counter_short_metrics,
+        regime=Regime.TRENDING_DOWN,
+        structure=bear_structure,
+        smc=bear_smc,
+    )
+    assert wait_short.status is SetupStatus.WAIT
+    assert wait_short.wait_reason is not None
+    assert "EMA 200" in wait_short.wait_reason
+
+    # 3. Counter-EMA200 LONG WITH aligned Liquidity Sweep + CHoCH -> allowed (READY)
+    bull_reversal_smc = SmcSummary(
+        dealing_range_high=72_000.0,
+        dealing_range_low=61_000.0,
+        equilibrium=66_500.0,
+        dealing_zone=DealingZone.DISCOUNT,
+        latest_sweep=_ev(StructureEventType.LIQUIDITY_SWEEP_BULLISH, 62_100.0),
+        latest_structure_break=_ev(StructureEventType.CHOCH_BULLISH, 63_800.0),
+    )
+    ready_reversal = build_trade_setup(
+        metrics=counter_long_metrics,
+        regime=Regime.TRENDING_UP,
+        structure=bull_structure,
+        smc=bull_reversal_smc,
+    )
+    assert ready_reversal.status is SetupStatus.READY
+    assert ready_reversal.bias is SetupBias.LONG
+
+    # 4. Narrow SL where round-trip execution cost > 15.0% of 1R -> WAIT
+    tight_sl_struct = StructureAnalysis(
+        pivots=(),
+        market_structure=MarketStructure.BULLISH,
+        last_swing_highs=(
+            StructureEvent(
+                event_type=StructureEventType.SWING_HIGH,
+                event_time=t_piv,
+                confirmation_time=t_piv,
+                level=112.0,
+            ),
+        ),
+        last_swing_lows=(
+            StructureEvent(
+                event_type=StructureEventType.SWING_LOW,
+                event_time=t_piv,
+                confirmation_time=t_piv,
+                level=99.6,
+            ),
+        ),
+    )
+    tight_metrics = TechnicalMetrics(
+        last_close=100.0,
+        ema_20=99.8,
+        ema_50=98.0,
+        ema_200=95.0,
+        atr_14=0.4,
+        adx_14=28.0,
+        rsi_14=56.0,
+    )
+    tight_smc = SmcSummary(
+        dealing_range_high=112.0,
+        dealing_range_low=96.0,
+        equilibrium=104.0,
+        dealing_zone=DealingZone.DISCOUNT,
+    )
+    cost_wait = build_trade_setup(
+        metrics=tight_metrics,
+        regime=Regime.TRENDING_UP,
+        structure=tight_sl_struct,
+        smc=tight_smc,
+        cost_assumptions=CostAssumptions(),
+    )
+    assert cost_wait.status is SetupStatus.WAIT
+    assert cost_wait.wait_reason is not None
+    assert "15,0%" in cost_wait.wait_reason

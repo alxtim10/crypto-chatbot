@@ -48,7 +48,7 @@ from crypto_chatbot.analysis.whale_tracker import (
 from crypto_chatbot.app import run_bot
 from crypto_chatbot.bot.templates import render_compact_snapshot, render_deterministic_snapshot
 from crypto_chatbot.config import ConfigError, load_settings
-from crypto_chatbot.market_data.base import OhlcvBatch
+from crypto_chatbot.market_data.base import HistoryMarketDataProvider, OhlcvBatch
 from crypto_chatbot.market_data.bybit_derivatives import BybitDerivativesProvider
 from crypto_chatbot.market_data.derivatives_quality import (
     normalize_funding_rate_payload,
@@ -991,6 +991,8 @@ async def _fetch_live_ohlcv_for_backtest(
     chain = _resolve_exchange_chain_from_env()
     provider, deriv_provider = build_futures_providers(chain)
     try:
+        if isinstance(provider, HistoryMarketDataProvider):
+            return await provider.get_closed_ohlcv_history(symbol, timeframe, limit=limit)
         return await provider.get_closed_ohlcv(symbol, timeframe, limit=limit)
     finally:
         await provider.close()

@@ -22,6 +22,7 @@ from crypto_chatbot.market_data.base import (
     DEFAULT_CANDLE_LIMIT,
     DEFAULT_FRESHNESS_GRACE,
     MAX_CANDLE_LIMIT,
+    MAX_HISTORY_CANDLE_LIMIT,
     FuturesTickerBatch,
     FuturesTickerSnapshot,
     OhlcvBatch,
@@ -196,13 +197,17 @@ class CcxtMarketDataProvider:
         ccxt_symbol: str,
         timeframe: Timeframe,
         fetch_limit: int,
+        *,
+        since: int | None = None,
     ) -> Sequence[Sequence[Any]]:
+        kwargs: dict[str, Any] = {
+            "timeframe": timeframe.value,
+            "limit": fetch_limit,
+        }
+        if since is not None:
+            kwargs["since"] = since
         return await asyncio.wait_for(
-            self._client.fetch_ohlcv(
-                ccxt_symbol,
-                timeframe=timeframe.value,
-                limit=fetch_limit,
-            ),
+            self._client.fetch_ohlcv(ccxt_symbol, **kwargs),
             timeout=self._timeout_seconds,
         )
 
@@ -211,6 +216,8 @@ class CcxtMarketDataProvider:
         ccxt_symbol: str,
         timeframe: Timeframe,
         fetch_limit: int,
+        *,
+        since: int | None = None,
     ) -> Sequence[Sequence[Any]]:
         retrying = AsyncRetrying(
             retry=retry_if_exception_type(_TRANSIENT_EXCEPTIONS),
@@ -224,8 +231,148 @@ class CcxtMarketDataProvider:
         )
         async for attempt in retrying:
             with attempt:
-                return await self._fetch_once(ccxt_symbol, timeframe, fetch_limit)
+                return await self._fetch_once(
+                    ccxt_symbol,
+                    timeframe,
+                    fetch_limit,
+                    since=since,
+                )
         raise RuntimeError("unreachable")  # pragma: no cover
+
+    def _resolve_venue_mapping(
+        self,
+        symbol: str,
+    ) -> tuple[SymbolMapping, list[QualityFlag]]:
+        mapping = resolve_symbol(symbol, market_type=self._market_type)
+        if self._market_type is MarketType.PERPETUAL and self._exchange_id != "binance":
+            provider_sym = f"{self._exchange_id.upper()}:{mapping.base}{mapping.quote}.P"
+            mapping = mapping.model_copy(
+                update={
+                    "venue": self._exchange_id,
+                    "provider_symbol": provider_sym,
+                }
+            )
+        extra_flags: list[QualityFlag] = []
+        client_id = getattr(self._client, "id", "").lower()
+        if client_id and not (
+            client_id.startswith(mapping.venue) or mapping.venue.startswith(client_id)
+        ):
+            extra_flags.append(QualityFlag.SYMBOL_MISMATCH)
+        return mapping, extra_flags
+
+    def _resolve_1000_perp_fallback(self, base: str) -> SymbolMapping | None:
+        if self._market_type is not MarketType.PERPETUAL or base not in _BINANCE_1000_PERP_BASES:
+            return None
+        fallback_mapping = resolve_symbol(
+            f"1000{base}",
+            market_type=MarketType.PERPETUAL,
+        )
+        if self._exchange_id != "binance":
+            fallback_mapping = fallback_mapping.model_copy(
+                update={
+                    "venue": self._exchange_id,
+                    "provider_symbol": (
+                        f"{self._exchange_id.upper()}:"
+                        f"{fallback_mapping.base}{fallback_mapping.quote}.P"
+                    ),
+                }
+            )
+        return fallback_mapping
+
+    async def _fetch_chunk_with_fallback(
+        self,
+        *,
+        mapping: SymbolMapping,
+        timeframe: Timeframe,
+        fetch_limit: int,
+        since: int | None = None,
+        allow_1000_fallback: bool = True,
+    ) -> tuple[Sequence[Sequence[Any]] | None, SymbolMapping, OhlcvBatch | None]:
+        try:
+            rows = await self._fetch_with_retries(
+                mapping.ccxt_symbol,
+                timeframe,
+                fetch_limit,
+                since=since,
+            )
+            return rows, mapping, None
+        except ccxt.BadSymbol as exc:
+            fallback_mapping = (
+                self._resolve_1000_perp_fallback(mapping.base) if allow_1000_fallback else None
+            )
+            if fallback_mapping is None:
+                return (
+                    None,
+                    mapping,
+                    self._provider_error_batch(
+                        mapping=mapping,
+                        timeframe=timeframe,
+                        message=(
+                            f"Provider error ({type(exc).__name__}) fetching "
+                            f"{mapping.canonical_symbol} {timeframe.value}"
+                        ),
+                    ),
+                )
+            try:
+                rows = await self._fetch_with_retries(
+                    fallback_mapping.ccxt_symbol,
+                    timeframe,
+                    fetch_limit,
+                    since=since,
+                )
+                return rows, fallback_mapping, None
+            except TimeoutError:
+                return (
+                    None,
+                    fallback_mapping,
+                    self._provider_error_batch(
+                        mapping=fallback_mapping,
+                        timeframe=timeframe,
+                        message=(
+                            f"Provider timeout fetching {fallback_mapping.canonical_symbol} "
+                            f"{timeframe.value} after {self._max_attempts} attempt(s)"
+                        ),
+                    ),
+                )
+            except ccxt.BaseError as fallback_exc:
+                return (
+                    None,
+                    fallback_mapping,
+                    self._provider_error_batch(
+                        mapping=fallback_mapping,
+                        timeframe=timeframe,
+                        message=(
+                            f"Provider error ({type(fallback_exc).__name__}) fetching "
+                            f"{fallback_mapping.canonical_symbol} {timeframe.value}"
+                        ),
+                    ),
+                )
+        except TimeoutError:
+            return (
+                None,
+                mapping,
+                self._provider_error_batch(
+                    mapping=mapping,
+                    timeframe=timeframe,
+                    message=(
+                        f"Provider timeout fetching {mapping.canonical_symbol} {timeframe.value} "
+                        f"after {self._max_attempts} attempt(s)"
+                    ),
+                ),
+            )
+        except ccxt.BaseError as exc:
+            return (
+                None,
+                mapping,
+                self._provider_error_batch(
+                    mapping=mapping,
+                    timeframe=timeframe,
+                    message=(
+                        f"Provider error ({type(exc).__name__}) fetching "
+                        f"{mapping.canonical_symbol} {timeframe.value}"
+                    ),
+                ),
+            )
 
     async def get_closed_ohlcv(
         self,
@@ -237,106 +384,100 @@ class CcxtMarketDataProvider:
         if limit < 1 or limit > MAX_CANDLE_LIMIT:
             raise ValueError(f"limit must be between 1 and {MAX_CANDLE_LIMIT}")
 
-        mapping = resolve_symbol(symbol, market_type=self._market_type)
-        if self._market_type is MarketType.PERPETUAL and self._exchange_id != "binance":
-            provider_sym = f"{self._exchange_id.upper()}:{mapping.base}{mapping.quote}.P"
-            mapping = mapping.model_copy(
-                update={
-                    "venue": self._exchange_id,
-                    "provider_symbol": provider_sym,
-                }
-            )
+        mapping, extra_flags = self._resolve_venue_mapping(symbol)
         # Request one extra row when below venue cap so dropping the open candle preserves `limit`.
         fetch_limit = min(limit + 1, MAX_CANDLE_LIMIT)
-
-        extra_flags: list[QualityFlag] = []
-        client_id = getattr(self._client, "id", "").lower()
-        if client_id and not (
-            client_id.startswith(mapping.venue) or mapping.venue.startswith(client_id)
-        ):
-            extra_flags.append(QualityFlag.SYMBOL_MISMATCH)
-
-        try:
-            raw_rows = await self._fetch_with_retries(
-                mapping.ccxt_symbol,
-                timeframe,
-                fetch_limit,
-            )
-        except ccxt.BadSymbol as exc:
-            if (
-                self._market_type is MarketType.PERPETUAL
-                and mapping.base in _BINANCE_1000_PERP_BASES
-            ):
-                fallback_mapping = resolve_symbol(
-                    f"1000{mapping.base}",
-                    market_type=MarketType.PERPETUAL,
-                )
-                if self._exchange_id != "binance":
-                    fallback_mapping = fallback_mapping.model_copy(
-                        update={
-                            "venue": self._exchange_id,
-                            "provider_symbol": (
-                                f"{self._exchange_id.upper()}:"
-                                f"{fallback_mapping.base}{fallback_mapping.quote}.P"
-                            ),
-                        }
-                    )
-                try:
-                    raw_rows = await self._fetch_with_retries(
-                        fallback_mapping.ccxt_symbol,
-                        timeframe,
-                        fetch_limit,
-                    )
-                    mapping = fallback_mapping
-                except TimeoutError:
-                    return self._provider_error_batch(
-                        mapping=fallback_mapping,
-                        timeframe=timeframe,
-                        message=(
-                            f"Provider timeout fetching {fallback_mapping.canonical_symbol} "
-                            f"{timeframe.value} after {self._max_attempts} attempt(s)"
-                        ),
-                    )
-                except ccxt.BaseError as fallback_exc:
-                    return self._provider_error_batch(
-                        mapping=fallback_mapping,
-                        timeframe=timeframe,
-                        message=(
-                            f"Provider error ({type(fallback_exc).__name__}) fetching "
-                            f"{fallback_mapping.canonical_symbol} {timeframe.value}"
-                        ),
-                    )
-            else:
-                return self._provider_error_batch(
-                    mapping=mapping,
-                    timeframe=timeframe,
-                    message=(
-                        f"Provider error ({type(exc).__name__}) fetching "
-                        f"{mapping.canonical_symbol} {timeframe.value}"
-                    ),
-                )
-        except TimeoutError:
-            return self._provider_error_batch(
+        raw_rows, mapping, error_batch = await self._fetch_chunk_with_fallback(
+            mapping=mapping,
+            timeframe=timeframe,
+            fetch_limit=fetch_limit,
+        )
+        if error_batch is not None or raw_rows is None:
+            return error_batch or self._provider_error_batch(
                 mapping=mapping,
                 timeframe=timeframe,
-                message=(
-                    f"Provider timeout fetching {mapping.canonical_symbol} {timeframe.value} "
-                    f"after {self._max_attempts} attempt(s)"
-                ),
-            )
-        except ccxt.BaseError as exc:
-            return self._provider_error_batch(
-                mapping=mapping,
-                timeframe=timeframe,
-                message=(
-                    f"Provider error ({type(exc).__name__}) fetching "
-                    f"{mapping.canonical_symbol} {timeframe.value}"
-                ),
+                message=f"Provider error fetching {mapping.canonical_symbol} {timeframe.value}",
             )
 
         received_time = self._clock()
         return normalize_ohlcv_rows(
             raw_rows,
+            symbol=mapping,
+            timeframe=timeframe,
+            received_time=received_time,
+            provider="ccxt",
+            limit=limit,
+            now=received_time,
+            freshness_grace=self._freshness_grace,
+            extra_flags=extra_flags,
+        )
+
+    async def get_closed_ohlcv_history(
+        self,
+        symbol: str,
+        timeframe: Timeframe,
+        limit: int = DEFAULT_CANDLE_LIMIT,
+    ) -> OhlcvBatch:
+        """Fetch paginated closed OHLCV history up to `MAX_HISTORY_CANDLE_LIMIT` candles."""
+        if limit < 1 or limit > MAX_HISTORY_CANDLE_LIMIT:
+            raise ValueError(f"limit must be between 1 and {MAX_HISTORY_CANDLE_LIMIT}")
+        if limit <= MAX_CANDLE_LIMIT:
+            return await self.get_closed_ohlcv(symbol, timeframe, limit=limit)
+
+        mapping, extra_flags = self._resolve_venue_mapping(symbol)
+        step_ms = int(timeframe.duration.total_seconds() * 1000)
+        now = self._clock()
+        now_ms = int(now.timestamp() * 1000)
+        cursor_ms = now_ms - (limit + 2) * step_ms
+        rows_by_ts: dict[int, Sequence[Any]] = {}
+
+        max_pages = 60
+        for page_idx in range(max_pages):
+            remaining = (limit + 2) - len(rows_by_ts) + 1
+            chunk_limit = max(2, min(MAX_CANDLE_LIMIT, remaining))
+            chunk, mapping, error_batch = await self._fetch_chunk_with_fallback(
+                mapping=mapping,
+                timeframe=timeframe,
+                fetch_limit=chunk_limit,
+                since=cursor_ms,
+                allow_1000_fallback=(page_idx == 0),
+            )
+            if error_batch is not None or chunk is None:
+                return error_batch or self._provider_error_batch(
+                    mapping=mapping,
+                    timeframe=timeframe,
+                    message=f"Provider error fetching {mapping.canonical_symbol} {timeframe.value}",
+                )
+            if not chunk:
+                break
+
+            page_max_ts: int | None = None
+            for row in chunk:
+                if not row:
+                    continue
+                try:
+                    ts = int(row[0])
+                except (TypeError, ValueError):
+                    continue
+                rows_by_ts[ts] = row
+                if page_max_ts is None or ts > page_max_ts:
+                    page_max_ts = ts
+
+            if page_max_ts is None:
+                break
+            next_cursor = page_max_ts + step_ms
+            if next_cursor <= cursor_ms or page_max_ts >= now_ms - step_ms:
+                break
+            if len(rows_by_ts) >= limit + 2:
+                break
+            cursor_ms = next_cursor
+            if self._retry_initial_seconds > 0:
+                await asyncio.sleep(0.1)
+
+        sorted_rows = [rows_by_ts[ts] for ts in sorted(rows_by_ts)]
+        received_time = self._clock()
+        return normalize_ohlcv_rows(
+            sorted_rows,
             symbol=mapping,
             timeframe=timeframe,
             received_time=received_time,
