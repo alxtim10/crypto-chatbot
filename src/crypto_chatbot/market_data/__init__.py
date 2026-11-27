@@ -111,6 +111,13 @@ from crypto_chatbot.market_data.gate_taker_flow import (
     enrich_candles_with_taker_flow,
     parse_rest_trades_payload,
 )
+from crypto_chatbot.market_data.gate_ws_candles import (
+    DEFAULT_GATE_WS_URL,
+    GateClosedCandleStreamAssembler,
+    GateWsCandlesRunner,
+    build_gate_ws_subscribe_message,
+    parse_gate_ws_candlestick_entry,
+)
 from crypto_chatbot.market_data.macro_provider import (
     DxyMarketDataProvider,
     is_dxy_market_closed,
@@ -176,6 +183,7 @@ __all__ = [
     "DEFAULT_GATEDATA_BASE_URL",
     "DEFAULT_GATE_API_URL",
     "DEFAULT_GATE_RAW_DIR",
+    "DEFAULT_GATE_WS_URL",
     "DEFAULT_MAX_WEBHOOK_BODY_BYTES",
     "DEFAULT_OI_UNIT_TOLERANCE",
     "DEFAULT_PRIMARY_VENUE",
@@ -216,6 +224,7 @@ __all__ = [
     "FuturesTickerProvider",
     "FuturesTickerSnapshot",
     "GateArchiveTrade",
+    "GateClosedCandleStreamAssembler",
     "GateContractStatsClient",
     "GateFundingHistoryClient",
     "GateFuturesMarketDataProvider",
@@ -224,6 +233,7 @@ __all__ = [
     "GateRiskLimitTier",
     "GateRiskTiersClient",
     "GateTradesClient",
+    "GateWsCandlesRunner",
     "MarketDataProvider",
     "OhlcvBatch",
     "OrderBookSynchronizer",
@@ -245,6 +255,7 @@ __all__ = [
     "aggregate_gatedata_trades_archives",
     "aggregate_trades_to_bars",
     "build_futures_providers",
+    "build_gate_ws_subscribe_message",
     "build_webhook_ssl_context",
     "check_cross_source_price",
     "compare_funding_rates",
@@ -276,6 +287,7 @@ __all__ = [
     "parse_ai_agent_lens_packet",
     "parse_contract_multipliers",
     "parse_gate_risk_limit_tiers",
+    "parse_gate_ws_candlestick_entry",
     "parse_gatedata_candlesticks_csv",
     "parse_gatedata_funding_applies_csv",
     "parse_rest_trades_payload",

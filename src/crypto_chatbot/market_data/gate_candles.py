@@ -45,6 +45,7 @@ DEFAULT_CONTRACTS_CACHE_TTL_SECONDS = 3600.0
 _GATE_1000_PREFIX_BASES: frozenset[str] = frozenset({"PEPE", "SHIB", "FLOKI", "BONK", "LUNC"})
 
 _GATE_TIMEFRAMES: dict[Timeframe, str] = {
+    Timeframe.M1: "1m",
     Timeframe.M5: "5m",
     Timeframe.M15: "15m",
     Timeframe.H1: "1h",

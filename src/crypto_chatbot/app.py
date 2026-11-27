@@ -36,6 +36,7 @@ from crypto_chatbot.market_data.gate_contract_stats import (
     GateContractStatsClient,
 )
 from crypto_chatbot.market_data.gate_risk_tiers import GateRiskTiersClient
+from crypto_chatbot.market_data.gate_ws_candles import GateWsCandlesRunner
 from crypto_chatbot.market_data.macro_provider import DxyMarketDataProvider
 from crypto_chatbot.memory.service import MemoryService
 from crypto_chatbot.schemas.market import Timeframe
@@ -165,13 +166,25 @@ def build_telegram_application(
             backfill_days=settings.gate_contract_stats_backfill_days,
         )
 
+    ws_candles_runner: GateWsCandlesRunner | None = None
+    if settings.gate_ws_enabled and "gate" in settings.futures_exchange_chain:
+        ws_candles_runner = GateWsCandlesRunner(
+            symbols=settings.gate_ws_symbols,
+            timeframes=settings.gate_ws_timeframes,
+            repository=market_repo,
+        )
+
     async def on_startup(app: Application[Any, Any, Any, Any, Any, Any]) -> None:
         del app
         if contract_stats_scheduler is not None:
             contract_stats_scheduler.start()
+        if ws_candles_runner is not None:
+            ws_candles_runner.start()
 
     async def on_shutdown(app: Application[Any, Any, Any, Any, Any, Any]) -> None:
         del app
+        if ws_candles_runner is not None:
+            await ws_candles_runner.stop()
         if contract_stats_scheduler is not None:
             await contract_stats_scheduler.stop()
         if contract_stats_client is not None:

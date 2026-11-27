@@ -70,6 +70,15 @@ class Settings(BaseSettings):
     gate_contract_stats_enabled: bool = Field(default=False)
     gate_contract_stats_interval_seconds: int = Field(default=300, ge=10, le=3600)
     gate_contract_stats_backfill_days: int = Field(default=179, ge=1, le=180)
+    gate_ws_enabled: bool = Field(default=False)
+    gate_ws_symbols: Annotated[tuple[str, ...], NoDecode] = Field(
+        default=("BTC", "ETH", "SOL"),
+        validate_default=True,
+    )
+    gate_ws_timeframes: Annotated[tuple[str, ...], NoDecode] = Field(
+        default=("1m", "5m", "15m", "1h"),
+        validate_default=True,
+    )
 
     @field_validator("futures_exchange", mode="before")
     @classmethod
@@ -149,6 +158,36 @@ class Settings(BaseSettings):
         if cleaned not in {"1m", "5m", "15m", "1h"}:
             raise ValueError("resample_from must be one of: 1m, 5m, 15m, 1h")
         return cleaned
+
+    @field_validator("gate_ws_symbols", mode="before")
+    @classmethod
+    def _validate_gate_ws_symbols(cls, value: object) -> tuple[str, ...]:
+        if value is None:
+            return ("BTC", "ETH", "SOL")
+        if isinstance(value, str):
+            items = tuple(p.strip().upper() for p in value.split(",") if p.strip())
+            return items or ("BTC", "ETH", "SOL")
+        if isinstance(value, (tuple, list)):
+            items = tuple(str(p).strip().upper() for p in value if str(p).strip())
+            return items or ("BTC", "ETH", "SOL")
+        raise ValueError("must be comma-separated symbol strings")
+
+    @field_validator("gate_ws_timeframes", mode="before")
+    @classmethod
+    def _validate_gate_ws_timeframes(cls, value: object) -> tuple[str, ...]:
+        allowed = {"1m", "5m", "15m", "1h", "4h", "1d"}
+        if value is None:
+            return ("1m", "5m", "15m", "1h")
+        if isinstance(value, str):
+            raw = [p.strip().lower() for p in value.split(",") if p.strip()]
+        elif isinstance(value, (tuple, list)):
+            raw = [str(p).strip().lower() for p in value if str(p).strip()]
+        else:
+            raise ValueError("must be comma-separated timeframe strings")
+        for tf in raw:
+            if tf not in allowed:
+                raise ValueError(f"unsupported WS timeframe '{tf}'")
+        return tuple(dict.fromkeys(raw)) or ("1m", "5m", "15m", "1h")
 
     @field_validator("tradingview_webhook_secret", mode="before")
     @classmethod
