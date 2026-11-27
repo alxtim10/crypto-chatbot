@@ -488,6 +488,60 @@ class CcxtMarketDataProvider:
             extra_flags=extra_flags,
         )
 
+    async def get_funding_history(
+        self,
+        symbol: str,
+        start: datetime,
+        end: datetime,
+    ) -> tuple[tuple[datetime, float], ...]:
+        """Fetch point-in-time historical funding settlements `(timestamp_utc, rate)`."""
+        fetch_fn = getattr(self._client, "fetch_funding_rate_history", None)
+        if not callable(fetch_fn):
+            return ()
+        mapping, _ = self._resolve_venue_mapping(symbol)
+        start_ms = int(start.astimezone(UTC).timestamp() * 1000)
+        end_ms = int(end.astimezone(UTC).timestamp() * 1000)
+        if end_ms <= start_ms:
+            return ()
+
+        by_ts: dict[int, float] = {}
+        cursor_ms = start_ms
+        for _ in range(30):
+            try:
+                rows = await asyncio.wait_for(
+                    fetch_fn(mapping.ccxt_symbol, since=cursor_ms, limit=500),
+                    timeout=self._timeout_seconds,
+                )
+            except (TimeoutError, ccxt.BaseError, TypeError, ValueError):
+                break
+            if not rows:
+                break
+            page_max_ts: int | None = None
+            for item in rows:
+                if not isinstance(item, Mapping):
+                    continue
+                ts_raw = item.get("timestamp")
+                rate_raw = item.get("fundingRate")
+                if not isinstance(ts_raw, (int, float)) or rate_raw is None:
+                    continue
+                ts_int = int(ts_raw)
+                rate_f = self._to_finite_float(rate_raw)
+                if rate_f is None:
+                    continue
+                if start_ms <= ts_int <= end_ms:
+                    by_ts[ts_int] = rate_f
+                if page_max_ts is None or ts_int > page_max_ts:
+                    page_max_ts = ts_int
+            if page_max_ts is None or page_max_ts >= end_ms or page_max_ts + 1 <= cursor_ms:
+                break
+            cursor_ms = page_max_ts + 1
+            if self._retry_initial_seconds > 0:
+                await asyncio.sleep(0.1)
+
+        return tuple(
+            (datetime.fromtimestamp(ts / 1000.0, tz=UTC), by_ts[ts]) for ts in sorted(by_ts)
+        )
+
     def _provider_error_batch(
         self,
         *,

@@ -10,7 +10,10 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from crypto_chatbot.schemas.market import FiniteFloat, UtcDatetime
 
 SENTIMENT_MODEL_VERSION = "crypto-lexicon-v1.0.0"
+SENTIMENT_SCORER_ID = "crypto-lexicon"
 MIN_ENTITY_MATCH_CONFIDENCE = 0.65
+
+ScorerClass = Literal["lexicon_deterministic", "llm"]
 
 
 class SentimentLabel(StrEnum):
@@ -94,6 +97,11 @@ class SentimentObservation(BaseModel):
     is_probabilistic: Literal[False] = False
     published_time: UtcDatetime
     available_time: UtcDatetime
+    scored_at: UtcDatetime | None = None
+    scorer_id: str = Field(default=SENTIMENT_SCORER_ID, min_length=1)
+    scorer_version: str = Field(default=SENTIMENT_MODEL_VERSION, min_length=1)
+    scorer_class: ScorerClass = "lexicon_deterministic"
+    is_backfilled: bool = False
 
     @model_validator(mode="after")
     def _validate_observation(self) -> SentimentObservation:
@@ -101,6 +109,8 @@ class SentimentObservation(BaseModel):
             raise ValueError("canonical_url must start with http:// or https://")
         if self.available_time < self.published_time:
             raise ValueError("available_time cannot be earlier than published_time")
+        if self.is_backfilled and self.scorer_class == "llm":
+            raise ValueError("LLM-based sentiment scores cannot be backfilled (PRD v1.7 §6.2)")
         return self
 
 
@@ -160,5 +170,6 @@ class SentimentMetrics(BaseModel):
     mean_confidence: FiniteFloat = Field(ge=0.0, le=1.0)
     dominant_label: SentimentLabel
     latest_available_time: UtcDatetime | None = None
+    sentiment_backfilled: bool = False
     buckets: tuple[SentimentBucket, ...] = ()
     sources: tuple[NewsSourceLink, ...] = ()

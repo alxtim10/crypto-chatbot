@@ -6,6 +6,9 @@ import itertools
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+import numpy as np
+from numpy.typing import NDArray
+
 from crypto_chatbot.schemas.ml import FeatureRow
 
 
@@ -104,11 +107,68 @@ def generate_purged_walk_forward_splits(
     return tuple(splits)
 
 
+def compute_uniqueness_weights(
+    rows: Sequence[FeatureRow],
+    *,
+    normalize: bool = True,
+) -> NDArray[np.float64]:
+    """Compute Lopez de Prado sample uniqueness weights across overlapping label windows (§6.3).
+
+    For each elementary time span `(t_k, t_{k+1}]` between distinct event endpoints, `c_k` is the
+    number of events whose `(prediction_time, label_end_time]` contains that span. Event `i` gets
+    average inverse concurrency `u_i = mean_{k in T_i}(1 / c_k)` (duration-weighted). When
+    `normalize=True`, returns `w_i = u_i / mean(u)`.
+    """
+    n = len(rows)
+    if n == 0:
+        return np.zeros(0, dtype=np.float64)
+
+    endpoints = sorted({pt for r in rows for pt in (r.prediction_time, r.label_end_time)})
+    if len(endpoints) < 2:
+        return np.ones(n, dtype=np.float64)
+
+    n_spans = len(endpoints) - 1
+    durations = np.array(
+        [(endpoints[k + 1] - endpoints[k]).total_seconds() for k in range(n_spans)],
+        dtype=np.float64,
+    )
+    ts_to_idx = {ts: i for i, ts in enumerate(endpoints)}
+    concurrency = np.zeros(n_spans, dtype=np.float64)
+    row_ranges: list[tuple[int, int]] = []
+    for r in rows:
+        lo = ts_to_idx[r.prediction_time]
+        hi = ts_to_idx[r.label_end_time]
+        row_ranges.append((lo, hi))
+        if hi > lo:
+            concurrency[lo:hi] += 1.0
+
+    inv_c = np.divide(
+        1.0,
+        concurrency,
+        out=np.zeros_like(concurrency),
+        where=concurrency > 0.0,
+    )
+    raw_u = np.ones(n, dtype=np.float64)
+    for i, (lo, hi) in enumerate(row_ranges):
+        if hi > lo:
+            span_durs = durations[lo:hi]
+            total_dur = float(np.sum(span_durs))
+            if total_dur > 0.0:
+                raw_u[i] = float(np.sum(span_durs * inv_c[lo:hi]) / total_dur)
+
+    if not normalize:
+        return raw_u
+    mean_u = float(np.mean(raw_u))
+    return raw_u / mean_u if mean_u > 0.0 else np.ones(n, dtype=np.float64)
+
+
 def assert_no_fold_leakage(
     rows: Sequence[FeatureRow],
     splits: Sequence[PurgedSplit],
+    *,
+    min_embargo_bars: int | None = None,
 ) -> None:
-    """Assert strict temporal ordering, purge, and zero overlap across every fold."""
+    """Assert strict temporal ordering, purge, embargo, and zero overlap across every fold."""
     for row in rows:
         if row.available_time > row.prediction_time:
             raise ValueError("row available_time exceeds prediction_time (causal violation)")
@@ -127,6 +187,11 @@ def assert_no_fold_leakage(
         max_train_idx = max(split.train_indices)
         if max_train_idx >= min_val_idx:
             raise ValueError(f"fold {split.fold_index} breaks chronological train < val order")
+        if min_embargo_bars is not None and (min_val_idx - max_train_idx - 1) < min_embargo_bars:
+            raise ValueError(
+                f"fold {split.fold_index} violates embargo requirement "
+                f"(gap {min_val_idx - max_train_idx - 1} < {min_embargo_bars})"
+            )
 
         val_start_time = rows[min_val_idx].prediction_time
         for tr_idx in split.train_indices:

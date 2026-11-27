@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 
 from pydantic import BaseModel, ConfigDict
 
-from crypto_chatbot.schemas.analysis import AnalysisSnapshot
+from crypto_chatbot.schemas.analysis import AnalysisSnapshot, FactStatus
 from crypto_chatbot.schemas.llm import LlmAnalysisNarration
+
+logger = logging.getLogger(__name__)
 
 _BRACED_TOKEN_RE = re.compile(r"\{([^}]*)\}")
 _VALID_FACT_BODY_RE = re.compile(r"^F[1-9][0-9]*$")
@@ -145,9 +148,15 @@ def _build_allowlist_patterns(
     return tuple(patterns)
 
 
-def _strip_valid_placeholders(text: str, known_fact_ids: set[str]) -> tuple[str, bool]:
-    """Validate brace syntax and replace known `{F<n>}` placeholders with spaces."""
+def _strip_valid_placeholders(
+    text: str,
+    known_fact_ids: set[str],
+    none_fact_ids: set[str] | None = None,
+) -> tuple[str, bool, list[str]]:
+    """Validate brace syntax and replace known non-NONE `{F<n>}` placeholders with spaces."""
     bad = False
+    none_refs: list[str] = []
+    blocked = none_fact_ids or set()
 
     def _replace(match: re.Match[str]) -> str:
         nonlocal bad
@@ -155,12 +164,31 @@ def _strip_valid_placeholders(text: str, known_fact_ids: set[str]) -> tuple[str,
         if not _VALID_FACT_BODY_RE.match(token) or token not in known_fact_ids:
             bad = True
             return match.group(0)
+        if token in blocked:
+            none_refs.append(token)
+            return match.group(0)
         return " "
 
     stripped = _BRACED_TOKEN_RE.sub(_replace, text)
     if "{" in stripped or "}" in stripped:
         bad = True
-    return stripped, bad
+    return stripped, bad, none_refs
+
+
+def log_guard_violations(
+    reasons: Sequence[str],
+    *,
+    model_version: str,
+    attempt: int = 1,
+) -> None:
+    """Log every guard violation with `violation_type` and `model_version` (PRD v1.7 §2.3)."""
+    for reason in reasons:
+        logger.warning(
+            "llm_guard_violation violation_type=%s model_version=%s attempt=%d",
+            reason,
+            model_version,
+            attempt,
+        )
 
 
 def validate_narration(
@@ -170,10 +198,13 @@ def validate_narration(
     """Validate structured LLM narration strictly against backend `AnalysisSnapshot` facts."""
     reasons: list[str] = []
     known_fact_ids = {fact.fact_id for fact in snapshot.facts}
+    none_fact_ids = {fact.fact_id for fact in snapshot.facts if fact.status is FactStatus.NONE}
 
     for fid in narration.fact_ids:
         if fid not in known_fact_ids:
             reasons.append(f"unknown_fact_id:{fid}")
+        elif fid in none_fact_ids:
+            reasons.append(f"fact_status_none:{fid}")
 
     base_ticker = snapshot.canonical_symbol.split("/")[0]
     allowed_symbols: list[str] = [snapshot.canonical_symbol, snapshot.provider_symbol, base_ticker]
@@ -204,7 +235,11 @@ def validate_narration(
     ]
 
     for text in text_fields:
-        scrubbed, bad_braces = _strip_valid_placeholders(text, known_fact_ids)
+        scrubbed, bad_braces, none_refs = _strip_valid_placeholders(
+            text, known_fact_ids, none_fact_ids
+        )
+        for fid in none_refs:
+            reasons.append(f"fact_status_none:{fid}")
         if bad_braces:
             reasons.append("malformed_or_unknown_placeholder")
 

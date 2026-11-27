@@ -195,10 +195,10 @@ def test_cli_shadow_report_json_output() -> None:
             confidence_label="HIGH",
             abstained=False,
             latency_ms=12,
-            realized_label=1 if i < 7 else 0,
+            realized_label=1 if i < 21 else 0,
             settled_at=ref_time,
         )
-        for i in range(10)
+        for i in range(30)
     )
 
     mock_repo = MagicMock()
@@ -214,7 +214,7 @@ def test_cli_shadow_report_json_output() -> None:
         code = main(["shadow-report", "--symbol", "BTC", "--json"])
         assert code == 0
         parsed = json.loads(fake_out.getvalue())
-        assert parsed["total_predictions"] == 10
-        assert parsed["settled_predictions"] == 10
+        assert parsed["total_predictions"] == 30
+        assert parsed["settled_predictions"] == 30
         assert parsed["is_healthy"] is True
         assert len(parsed["calibration_bins"]) == 5

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import datetime
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
+from crypto_chatbot.analysis.bootstrap import stationary_block_bootstrap_ci
 from crypto_chatbot.schemas.ml import (
     CalibrationBinMetrics,
     CostAssumptions,
@@ -88,11 +90,22 @@ def compute_ece(
     p_pred: NDArray[np.float64],
     *,
     n_bins: int = 5,
+    sample_weight: NDArray[np.float64] | None = None,
 ) -> float:
-    """Expected Calibration Error (ECE) over equal-width probability bins."""
+    """Expected Calibration Error (ECE) over equal-width probability bins (optionally weighted)."""
     n = len(y_true)
     if n == 0:
         return 0.0
+    if sample_weight is not None:
+        weights = np.asarray(sample_weight, dtype=np.float64)
+        total_w = float(np.sum(weights))
+        if total_w <= 0.0:
+            weights = np.ones(n, dtype=np.float64)
+            total_w = float(n)
+    else:
+        weights = np.ones(n, dtype=np.float64)
+        total_w = float(n)
+
     ece = 0.0
     edges = np.linspace(0.0, 1.0, n_bins + 1)
     for b_idx in range(n_bins):
@@ -101,12 +114,15 @@ def compute_ece(
             mask = (p_pred >= lo) & (p_pred <= hi)
         else:
             mask = (p_pred >= lo) & (p_pred < hi)
-        count = int(np.sum(mask))
-        if count == 0:
+        if not np.any(mask):
             continue
-        acc = float(np.mean(y_true[mask]))
-        conf = float(np.mean(p_pred[mask]))
-        ece += (count / n) * abs(acc - conf)
+        bin_w = weights[mask]
+        bin_w_sum = float(np.sum(bin_w))
+        if bin_w_sum <= 0.0:
+            continue
+        acc = float(np.sum(bin_w * y_true[mask]) / bin_w_sum)
+        conf = float(np.sum(bin_w * p_pred[mask]) / bin_w_sum)
+        ece += (bin_w_sum / total_w) * abs(acc - conf)
     return float(min(1.0, max(0.0, ece)))
 
 
@@ -120,6 +136,9 @@ def compute_evaluation_summary(
     prob_threshold: float,
     prediction_times: Sequence[datetime] | None = None,
     label_end_times: Sequence[datetime] | None = None,
+    sample_weight: ArrayLike | None = None,
+    base_rate: float | None = None,
+    base_rate_delta: float | None = None,
 ) -> EvaluationSummary:
     """Compute Brier score, ECE, balanced accuracy, precision/recall, and post-cost returns."""
     y_true = np.asarray(y_true_in, dtype=np.float64)
@@ -130,17 +149,31 @@ def compute_evaluation_summary(
     if not (n > 0 and len(p_model) == n and len(p_naive) == n and len(fwd_ret) == n):
         raise ValueError("evaluation arrays must be non-empty and share identical lengths")
 
+    if sample_weight is not None:
+        sw = np.asarray(sample_weight, dtype=np.float64)
+        if len(sw) != n or float(np.sum(sw)) <= 0.0 or np.any(sw < 0.0):
+            raise ValueError("sample_weight must match length and have positive sum")
+        norm_w = sw / float(np.sum(sw))
+    else:
+        sw = None
+        norm_w = np.full(n, 1.0 / float(n), dtype=np.float64)
+
     round_trip_cost = cost_assumptions.round_trip_cost_rate
-    naive_brier = float(np.mean((p_naive - y_true) ** 2))
-    model_brier = float(np.mean((p_model - y_true) ** 2))
+    naive_brier = float(np.sum(norm_w * (p_naive - y_true) ** 2))
+    model_brier = float(np.sum(norm_w * (p_model - y_true) ** 2))
     skill = 1.0 - (model_brier / naive_brier) if naive_brier > 0.0 else 0.0
     bss = compute_brier_skill_score(model_brier, naive_brier)
-    ece = compute_ece(y_true, p_model, n_bins=5)
+    ece = compute_ece(y_true, p_model, n_bins=5, sample_weight=sw)
     cal_bins = compute_calibration_bins(
         y_true, p_model, net_returns=fwd_ret - round_trip_cost, n_bins=5
     )
 
-    y_pred = p_model >= prob_threshold
+    effective_threshold = (
+        base_rate + base_rate_delta
+        if base_rate is not None and base_rate_delta is not None
+        else prob_threshold
+    )
+    y_pred = p_model >= effective_threshold
     y_pos = y_true >= 0.5
 
     tp = int(np.sum(y_pred & y_pos))
@@ -311,3 +344,210 @@ def decide_promotion(
         )
 
     return (not reasons), tuple(reasons)
+
+
+@dataclass(frozen=True)
+class PromotionGateResult:
+    """Single promotion gate evaluation outcome (PRD v1.7 §6.6)."""
+
+    gate_id: str
+    passed: bool
+    value: float | None
+    threshold: str
+    detail: str
+
+
+@dataclass(frozen=True)
+class PromotionV2Config:
+    """Configurable thresholds for Promotion Gates v2 (G1-G8)."""
+
+    min_oos_bss: float = 0.02
+    min_fold_win_count: int = 3
+    min_oos_selected_trades: int = 50
+    min_holdout_selected_trades: int = 30
+    min_dsr: float = 0.95
+    min_cpcv_profitable_fraction: float = 0.60
+    max_holdout_ece: float = 0.10
+    bootstrap_resamples: int = 2000
+    bootstrap_mean_block_length: float = 5.0
+    bootstrap_seed: int = 42
+
+
+@dataclass(frozen=True)
+class PromotionV2Decision:
+    """Full Promotion Gates v2 decision with per-gate diagnostics."""
+
+    promoted: bool
+    gates: tuple[PromotionGateResult, ...]
+    rejection_reasons: tuple[str, ...]
+
+
+def decide_promotion_v2(
+    *,
+    oof_y_true: ArrayLike,
+    oof_p_model: ArrayLike,
+    oof_p_naive: ArrayLike,
+    oof_selected_r_1x: Sequence[float],
+    oof_selected_r_15x: Sequence[float],
+    oof_all_setup_expectancy: float,
+    fold_bss_and_expectancy: Sequence[tuple[float, float]],
+    holdout_selected_trades: int,
+    holdout_bss: float,
+    holdout_selected_expectancy: float,
+    holdout_weighted_ece: float,
+    dsr: float | None,
+    cpcv_profitable_fraction: float | None,
+    oof_sample_weight: ArrayLike | None = None,
+    config: PromotionV2Config | None = None,
+) -> PromotionV2Decision:
+    """Evaluate Promotion Gates v2 (G1-G8); reject if any single gate fails."""
+    cfg = config or PromotionV2Config()
+    y = np.asarray(oof_y_true, dtype=np.float64)
+    pm = np.asarray(oof_p_model, dtype=np.float64)
+    pn = np.asarray(oof_p_naive, dtype=np.float64)
+    n = len(y)
+    if n == 0 or len(pm) != n or len(pn) != n:
+        raise ValueError("OOS arrays must be non-empty and share identical lengths")
+
+    if oof_sample_weight is not None:
+        sw = np.asarray(oof_sample_weight, dtype=np.float64)
+        if len(sw) != n or float(np.sum(sw)) <= 0.0 or np.any(sw < 0.0):
+            raise ValueError("oof_sample_weight must match length and have positive sum")
+        norm_w = sw / float(np.sum(sw))
+    else:
+        norm_w = np.full(n, 1.0 / float(n), dtype=np.float64)
+
+    naive_bs_vec = (pn - y) ** 2
+    model_bs_vec = (pm - y) ** 2
+    naive_bs = float(np.sum(norm_w * naive_bs_vec))
+    model_bs = float(np.sum(norm_w * model_bs_vec))
+    oos_bss = compute_brier_skill_score(model_bs, naive_bs)
+
+    # Elementwise scaled Brier improvement so the mean equals weighted (BS_naive - BS_model)
+    brier_diff_series = (norm_w * float(n)) * (naive_bs_vec - model_bs_vec)
+    ci_low, _ci_high, _pos_rate = stationary_block_bootstrap_ci(
+        brier_diff_series,
+        resamples=cfg.bootstrap_resamples,
+        mean_block_length=cfg.bootstrap_mean_block_length,
+        seed=cfg.bootstrap_seed,
+    )
+    g1_pass = ci_low > 0.0 and oos_bss >= cfg.min_oos_bss
+    g1 = PromotionGateResult(
+        gate_id="G1",
+        passed=g1_pass,
+        value=oos_bss,
+        threshold=f"CI_low > 0 and BSS >= {cfg.min_oos_bss:.2f}",
+        detail=(
+            f"G1: OOS block-CI lower bound={ci_low:.5f}, OOS BSS={oos_bss:.4f} "
+            f"(need CI_low > 0 and BSS >= {cfg.min_oos_bss:.2f})"
+        ),
+    )
+
+    winning_folds = sum(
+        1 for bss_f, exp_f in fold_bss_and_expectancy if bss_f > 0.0 and exp_f > 0.0
+    )
+    total_folds = len(fold_bss_and_expectancy)
+    g2_pass = winning_folds >= cfg.min_fold_win_count
+    g2 = PromotionGateResult(
+        gate_id="G2",
+        passed=g2_pass,
+        value=float(winning_folds),
+        threshold=f">= {cfg.min_fold_win_count} folds",
+        detail=(
+            f"G2: {winning_folds}/{total_folds} folds had BSS > 0 and selected expectancy > 0 "
+            f"(need >= {cfg.min_fold_win_count})"
+        ),
+    )
+
+    oos_sel_count = len(oof_selected_r_1x)
+    g3_pass = oos_sel_count >= cfg.min_oos_selected_trades
+    g3 = PromotionGateResult(
+        gate_id="G3",
+        passed=g3_pass,
+        value=float(oos_sel_count),
+        threshold=f">= {cfg.min_oos_selected_trades} trades",
+        detail=f"G3: OOS selected trades={oos_sel_count} (need >= {cfg.min_oos_selected_trades})",
+    )
+
+    sel_exp_1x = float(np.mean(oof_selected_r_1x)) if oof_selected_r_1x else float("-inf")
+    sel_exp_15x = float(np.mean(oof_selected_r_15x)) if oof_selected_r_15x else float("-inf")
+    lift = sel_exp_1x - oof_all_setup_expectancy
+    g4_pass = (
+        bool(oof_selected_r_1x)
+        and bool(oof_selected_r_15x)
+        and lift > 0.0
+        and sel_exp_1x > 0.0
+        and sel_exp_15x >= 0.0
+    )
+    g4 = PromotionGateResult(
+        gate_id="G4",
+        passed=g4_pass,
+        value=sel_exp_1x if np.isfinite(sel_exp_1x) else None,
+        threshold="lift > 0, E[R]@1.0x > 0, E[R]@1.5x >= 0",
+        detail=(
+            f"G4: selected E[R]@1.0x={sel_exp_1x:.4f} (all={oof_all_setup_expectancy:.4f}, "
+            f"lift={lift:.4f}), E[R]@1.5x={sel_exp_15x:.4f}"
+        ),
+    )
+
+    g5_pass = (
+        holdout_selected_trades >= cfg.min_holdout_selected_trades
+        and holdout_bss > 0.0
+        and holdout_selected_expectancy > 0.0
+    )
+    g5 = PromotionGateResult(
+        gate_id="G5",
+        passed=g5_pass,
+        value=holdout_selected_expectancy,
+        threshold=f"trades >= {cfg.min_holdout_selected_trades}, BSS > 0, E[R] > 0",
+        detail=(
+            f"G5: holdout trades={holdout_selected_trades} "
+            f"(need >= {cfg.min_holdout_selected_trades}), "
+            f"BSS={holdout_bss:.4f}, E[R]={holdout_selected_expectancy:.4f}"
+        ),
+    )
+
+    g6_pass = dsr is not None and dsr >= cfg.min_dsr
+    g6 = PromotionGateResult(
+        gate_id="G6",
+        passed=g6_pass,
+        value=dsr,
+        threshold=f">= {cfg.min_dsr:.2f}",
+        detail=f"G6: DSR={dsr if dsr is not None else 'N/A'} (need >= {cfg.min_dsr:.2f})",
+    )
+
+    g7_pass = (
+        cpcv_profitable_fraction is not None
+        and cpcv_profitable_fraction >= cfg.min_cpcv_profitable_fraction
+    )
+    g7 = PromotionGateResult(
+        gate_id="G7",
+        passed=g7_pass,
+        value=cpcv_profitable_fraction,
+        threshold=f">= {cfg.min_cpcv_profitable_fraction:.2f}",
+        detail=(
+            f"G7: CPCV profitable path fraction="
+            f"{cpcv_profitable_fraction if cpcv_profitable_fraction is not None else 'N/A'} "
+            f"(need >= {cfg.min_cpcv_profitable_fraction:.2f})"
+        ),
+    )
+
+    g8_pass = holdout_weighted_ece <= cfg.max_holdout_ece
+    g8 = PromotionGateResult(
+        gate_id="G8",
+        passed=g8_pass,
+        value=holdout_weighted_ece,
+        threshold=f"<= {cfg.max_holdout_ece:.2f}",
+        detail=(
+            f"G8: holdout weighted 5-bin ECE={holdout_weighted_ece:.4f} "
+            f"(need <= {cfg.max_holdout_ece:.2f})"
+        ),
+    )
+
+    gates = (g1, g2, g3, g4, g5, g6, g7, g8)
+    reasons = tuple(g.detail for g in gates if not g.passed)
+    return PromotionV2Decision(
+        promoted=not reasons,
+        gates=gates,
+        rejection_reasons=reasons,
+    )

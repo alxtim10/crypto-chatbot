@@ -111,7 +111,7 @@ def test_smc_causal_bos_choch_fvg_ob_sweep_and_prefix_no_lookahead() -> None:
     assert smc_13.dealing_range_high == pytest.approx(112.0)
     assert smc_13.dealing_range_low == pytest.approx(100.0)
     assert smc_13.equilibrium == pytest.approx(106.0)
-    assert smc_13.dealing_zone is DealingZone.PREMIUM
+    assert smc_13.dealing_zone is DealingZone.ABOVE_RANGE
 
     # Truncation invariance: before bar 10, neither BOS nor bar-7 SL is confirmed yet;
     # at bar 10 (len=11), BOS up is already confirmed without future bars 11..13!
@@ -1025,3 +1025,127 @@ def test_ema200_trend_filter_and_exec_cost_r_gate() -> None:
     assert cost_wait.status is SetupStatus.WAIT
     assert cost_wait.wait_reason is not None
     assert "15,0%" in cost_wait.wait_reason
+
+
+def test_prd_v17_p0b_t08_t09_t10_t11_invariants() -> None:
+    from crypto_chatbot.analysis.indicators import adx_dmi_series
+    from crypto_chatbot.analysis.setup import MAX_EXEC_COST_R, ema200_available
+
+    # T-09 (F-30): +DI = -DI = 0 -> DX = 0 without NaN or warning
+    flat = [100.0] * 80
+    adx, pdi, mdi = adx_dmi_series(flat, flat, flat, period=14)
+    assert adx[-1] == pytest.approx(0.0)
+    assert pdi[-1] == pytest.approx(0.0)
+    assert mdi[-1] == pytest.approx(0.0)
+
+    # T-09 (F-07): dealing range invalid when D <= 0.1 * ATR, and ABOVE_RANGE/BELOW_RANGE zones
+    candles = [_candle(i, open_p=100.0, high_p=101.0, low_p=99.0, close_p=100.0) for i in range(15)]
+    t_piv = candles[5].close_time
+    tiny_range_struct = StructureAnalysis(
+        pivots=(),
+        market_structure=MarketStructure.MIXED,
+        last_swing_highs=(
+            StructureEvent(
+                event_type=StructureEventType.SWING_HIGH,
+                event_time=t_piv,
+                confirmation_time=t_piv,
+                level=100.05,
+            ),
+        ),
+        last_swing_lows=(
+            StructureEvent(
+                event_type=StructureEventType.SWING_LOW,
+                event_time=t_piv,
+                confirmation_time=t_piv,
+                level=100.00,
+            ),
+        ),
+    )
+    smc_invalid = analyze_smc(candles, structure=tiny_range_struct, atr_14=1.0)
+    assert smc_invalid.range_invalid is True
+    assert smc_invalid.dealing_zone is None
+
+    candles_above = [
+        _candle(i, open_p=115.0, high_p=116.0, low_p=114.0, close_p=115.0) for i in range(15)
+    ]
+    normal_struct = StructureAnalysis(
+        pivots=(),
+        market_structure=MarketStructure.BULLISH,
+        last_swing_highs=(
+            StructureEvent(
+                event_type=StructureEventType.SWING_HIGH,
+                event_time=t_piv,
+                confirmation_time=t_piv,
+                level=110.0,
+            ),
+        ),
+        last_swing_lows=(
+            StructureEvent(
+                event_type=StructureEventType.SWING_LOW,
+                event_time=t_piv,
+                confirmation_time=t_piv,
+                level=100.0,
+            ),
+        ),
+    )
+    smc_above = analyze_smc(candles_above, structure=normal_struct, atr_14=2.0)
+    assert smc_above.dealing_zone is DealingZone.ABOVE_RANGE
+
+    # T-10 (F-08): ema200_available predicate & WAIT_EMA200_UNAVAILABLE
+    assert ema200_available(300) is False
+    assert ema200_available(600) is True
+    no_ema200_metrics = TechnicalMetrics(
+        last_close=65_000.0,
+        ema_20=64_600.0,
+        ema_50=63_800.0,
+        ema_200=None,
+        atr_14=800.0,
+        adx_14=32.0,
+    )
+    bull_struct = StructureAnalysis(
+        pivots=(),
+        market_structure=MarketStructure.BULLISH,
+        last_swing_highs=(
+            StructureEvent(
+                event_type=StructureEventType.SWING_HIGH,
+                event_time=t_piv,
+                confirmation_time=t_piv,
+                level=69_500.0,
+            ),
+        ),
+        last_swing_lows=(
+            StructureEvent(
+                event_type=StructureEventType.SWING_LOW,
+                event_time=t_piv,
+                confirmation_time=t_piv,
+                level=62_800.0,
+            ),
+        ),
+    )
+    wait_ema = build_trade_setup(
+        metrics=no_ema200_metrics,
+        regime=Regime.TRENDING_UP,
+        structure=bull_struct,
+        smc=SmcSummary(),
+        require_ema200=True,
+    )
+    assert wait_ema.status is SetupStatus.WAIT
+    assert wait_ema.wait_reason is not None
+    assert "WAIT_EMA200_UNAVAILABLE" in wait_ema.wait_reason
+
+    # T-08 (F-06) + T-11 (F-10): strict monotonic TP1 < TP2 < TP3 and min_sl_pct_implied == 2.0%
+    ready_metrics = no_ema200_metrics.model_copy(update={"ema_200": 60_000.0})
+    ready = build_trade_setup(
+        metrics=ready_metrics,
+        regime=Regime.TRENDING_UP,
+        structure=bull_struct,
+        smc=SmcSummary(),
+        require_ema200=True,
+    )
+    assert ready.status is SetupStatus.READY
+    assert ready.entry_mid is not None
+    assert ready.tp1 is not None
+    assert ready.tp2 is not None
+    assert ready.tp3 is not None
+    assert ready.entry_mid < ready.tp1 < ready.tp2 < ready.tp3
+    assert ready.min_sl_pct_implied == pytest.approx((0.0030 / MAX_EXEC_COST_R) * 100.0)

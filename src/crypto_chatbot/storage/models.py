@@ -426,6 +426,10 @@ class TradeSetupRow(Base):
     outcome_status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
     settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     realized_r: Mapped[float | None] = mapped_column(Double, nullable=True)
+    params_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    forward_only_guards_fired: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list
+    )
 
 
 class TradingViewPacketRow(Base):
@@ -534,6 +538,15 @@ class SentimentObservationRow(Base):
     is_probabilistic: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     published_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     available_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    scored_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    scorer_id: Mapped[str] = mapped_column(String(64), nullable=False, default="crypto-lexicon")
+    scorer_version: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="crypto-lexicon-v1.0.0"
+    )
+    scorer_class: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="lexicon_deterministic"
+    )
+    is_backfilled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
 
 class MlExperimentRow(Base):
@@ -628,3 +641,24 @@ class WhaleWatchlistRow(Base):
     label: Mapped[str] = mapped_column(String(128), nullable=False)
     added_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+
+class TrialRow(Base):
+    """Registered historical backtest / ML experiment trial (`trials`, PRD v1.7 §8.2)."""
+
+    __tablename__ = "trials"
+    __table_args__ = (Index("ix_trials_family_freq", "family", "obs_frequency"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trial_id: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    family: Mapped[str] = mapped_column(String(64), nullable=False)
+    variant_params_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    params_sha256: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    data_window: Mapped[str] = mapped_column(String(128), nullable=False)
+    symbols: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
+    timeframe: Mapped[str] = mapped_column(String(16), nullable=False)
+    obs_frequency: Mapped[str] = mapped_column(String(32), nullable=False)
+    sr_per_obs: Mapped[float | None] = mapped_column(Double, nullable=True)
+    n_obs: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    git_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)

@@ -16,6 +16,10 @@ from typing import Literal
 import numpy as np
 from pydantic import BaseModel, ConfigDict, Field
 
+from crypto_chatbot.analysis.bootstrap import (
+    PortfolioSummary,
+    compute_portfolio_and_block_bootstrap,
+)
 from crypto_chatbot.analysis.indicators import compute_technical_metrics
 from crypto_chatbot.analysis.regimes import classify_regime
 from crypto_chatbot.analysis.setup import build_trade_setup
@@ -34,6 +38,32 @@ from crypto_chatbot.schemas.analysis import (
 )
 from crypto_chatbot.schemas.market import MarketCandle, Timeframe, UtcDatetime
 from crypto_chatbot.schemas.ml import CostAssumptions
+
+
+class ParityTag(StrEnum):
+    """Live/backtest parity classification (PRD v1.7 §1.2, §7.6)."""
+
+    BACKTESTED = "BACKTESTED"
+    FORWARD_ONLY = "FORWARD_ONLY"
+    CONTEXT_ONLY = "CONTEXT_ONLY"
+
+
+BACKTEST_PROFILE: dict[str, ParityTag] = {
+    "indicators": ParityTag.BACKTESTED,
+    "regimes": ParityTag.BACKTESTED,
+    "structure": ParityTag.BACKTESTED,
+    "smc": ParityTag.BACKTESTED,
+    "failed_breakout": ParityTag.BACKTESTED,
+    "ema200_gate": ParityTag.BACKTESTED,
+    "cost_gate": ParityTag.BACKTESTED,
+    "net_rr_gate": ParityTag.BACKTESTED,
+    "historical_funding": ParityTag.BACKTESTED,
+    "l2_orderbook_imbalance_guard": ParityTag.FORWARD_ONLY,
+    "whale_positioning": ParityTag.FORWARD_ONLY,
+    "live_trade_cvd": ParityTag.FORWARD_ONLY,
+    "llm_sentiment": ParityTag.FORWARD_ONLY,
+    "dxy_macro_context": ParityTag.CONTEXT_ONLY,
+}
 
 
 class RoundBoundaryMode(StrEnum):
@@ -67,9 +97,10 @@ class BacktestConfig(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    warmup_bars: int = Field(default=200, ge=50)
+    warmup_bars: int = Field(default=600, ge=50)
     max_lookback_bars: int = Field(default=1000, ge=200)
     step_bars: int = Field(default=1, ge=1)
+    entry_expiry_bars: int | None = Field(default=None, ge=1)
     max_hold_bars: int = Field(default=24, ge=1)
     cooldown_bars: int = Field(default=1, ge=0)
     cost_assumptions: CostAssumptions = CostAssumptions()
@@ -77,6 +108,7 @@ class BacktestConfig(BaseModel):
     bootstrap_seed: int = 42
     include_long: bool = True
     include_short: bool = True
+    require_ema200: bool = False
     book_name: str = "always_on"
     flat_boundary: RoundBoundaryMode = RoundBoundaryMode.NONE
     record_decision_log: bool = True
@@ -101,8 +133,24 @@ class BacktestTrade(BaseModel):
     outcome: str
     gross_r: float
     net_r: float
+    exec_cost_r: float = 0.0
+    funding_r: float = 0.0
+    funding_assumed: bool = True
+    be_exit: bool = False
     bars_held: int
     entry_source: str | None = None
+
+
+class CostSensitivityPoint(BaseModel):
+    """Backtest performance under a scaled execution-cost multiplier (PRD v1.7 §7.4)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    multiplier: float = Field(gt=0.0)
+    net_expectancy_r: float
+    total_net_r: float
+    profit_factor: float | None = None
+    max_drawdown_r: float = Field(ge=0.0)
 
 
 class BootstrapSummary(BaseModel):
@@ -145,15 +193,21 @@ class BacktestReport(BaseModel):
     boundary_flats: int = 0
     start_time: UtcDatetime
     end_time: UtcDatetime
+    eval_start: UtcDatetime | None = None
+    eval_end: UtcDatetime | None = None
     total_bars: int
     evaluated_bars: int
+    eval_bars: int | None = None
     wait_signals: int
     ready_signals: int
     untriggered_signals: int
+    no_fill_tp1_first: int = 0
+    no_fill_expired: int = 0
     executed_trades: int
     wins: int
     losses: int
     breakeven: int
+    be_exits: int = 0
     win_rate: float
     gross_expectancy_r: float
     net_expectancy_r: float
@@ -161,9 +215,13 @@ class BacktestReport(BaseModel):
     total_net_r: float
     max_drawdown_r: float
     max_consecutive_losses: int
+    assumed_funding_fraction: float = Field(default=1.0, ge=0.0, le=1.0)
+    cost_sensitivity: tuple[CostSensitivityPoint, ...] = ()
+    breakeven_cost_multiplier: float | None = None
     sharpe_per_trade: float | None = None
     sharpe_adjustment: SharpeAdjustment | None = None
     bootstrap: BootstrapSummary | None = None
+    portfolio: PortfolioSummary | None = None
     regime_breakdown: tuple[RegimeBreakdown, ...]
     trades: tuple[BacktestTrade, ...]
     decision_log: tuple[RoundDecisionEvent, ...] = ()
@@ -215,23 +273,123 @@ def _is_round_boundary(candle: MarketCandle, boundary: RoundBoundaryMode) -> boo
     return False
 
 
-def _simulate_setup_forward(
+class _SimulationOutcome:
+    """Internal result of causal forward simulation for one READY setup."""
+
+    __slots__ = (
+        "bars_held",
+        "be_exit",
+        "cancel_reason",
+        "exit_bar_idx",
+        "exit_price",
+        "exit_time",
+        "fill_price",
+        "fill_time",
+        "gross_r",
+        "outcome",
+        "remaining_history",
+    )
+
+    def __init__(
+        self,
+        *,
+        outcome: str,
+        fill_time: datetime | None = None,
+        exit_time: datetime | None = None,
+        gross_r: float = 0.0,
+        exit_bar_idx: int = 0,
+        bars_held: int = 0,
+        exit_price: float = 0.0,
+        fill_price: float = 0.0,
+        be_exit: bool = False,
+        cancel_reason: str | None = None,
+        remaining_history: tuple[tuple[datetime, float], ...] = (),
+    ) -> None:
+        self.outcome = outcome
+        self.fill_time = fill_time
+        self.exit_time = exit_time
+        self.gross_r = gross_r
+        self.exit_bar_idx = exit_bar_idx
+        self.bars_held = bars_held
+        self.exit_price = exit_price
+        self.fill_price = fill_price
+        self.be_exit = be_exit
+        self.cancel_reason = cancel_reason
+        self.remaining_history = remaining_history
+
+
+def _compute_signed_funding_r(
+    *,
+    is_long: bool,
+    fill_time: datetime,
+    exit_time: datetime,
+    fill_price: float,
+    risk: float,
+    remaining_history: Sequence[tuple[datetime, float]],
+    funding_history: Sequence[tuple[datetime, float]] | None,
+) -> tuple[float, bool]:
+    """Compute signed historical funding in R-multiples (`None`/empty -> assumed fallback)."""
+    if not funding_history or risk <= 0.0:
+        return 0.0, True
+    relevant = [(ts, rate) for ts, rate in funding_history if fill_time <= ts < exit_time]
+    if not relevant:
+        return 0.0, True
+    direction = 1.0 if is_long else -1.0
+    total_funding_r = 0.0
+    for ts, rate in relevant:
+        q_s = 1.0
+        for bar_ts, rem in remaining_history:
+            if bar_ts <= ts:
+                q_s = rem
+            else:
+                break
+        total_funding_r += (-direction * rate * q_s * fill_price) / risk
+    return total_funding_r, False
+
+
+def _compute_cost_sensitivity(
+    trades: Sequence[BacktestTrade],
+    *,
+    multipliers: Sequence[float] = (1.0, 1.25, 1.5, 2.0),
+) -> tuple[tuple[CostSensitivityPoint, ...], float | None]:
+    """Evaluate strategy R-multiples across execution-cost multipliers (PRD v1.7 §7.4)."""
+    if not trades:
+        return (), None
+    points: list[CostSensitivityPoint] = []
+    for mult in multipliers:
+        adj_rs = [t.gross_r + t.funding_r - (mult * t.exec_cost_r) for t in trades]
+        total_r = float(sum(adj_rs))
+        exp_r = total_r / len(adj_rs)
+        pos = sum(x for x in adj_rs if x > 0.0)
+        neg = sum(abs(x) for x in adj_rs if x < 0.0)
+        pf = round(pos / neg, 4) if neg > 0.0 else None
+        dd = _max_drawdown_r(adj_rs)
+        points.append(
+            CostSensitivityPoint(
+                multiplier=float(mult),
+                net_expectancy_r=round(exp_r, 4),
+                total_net_r=round(total_r, 4),
+                profit_factor=pf,
+                max_drawdown_r=round(dd, 4),
+            )
+        )
+
+    mean_pre_exec = float(np.mean([t.gross_r + t.funding_r for t in trades]))
+    mean_exec = float(np.mean([t.exec_cost_r for t in trades]))
+    be_mult = round(mean_pre_exec / mean_exec, 4) if mean_exec > 1e-12 else None
+    return tuple(points), be_mult
+
+
+def _simulate_setup_v17(
     setup: TradeSetup,
     future_candles: Sequence[MarketCandle],
     *,
     start_bar_index: int,
+    max_hold_bars: int,
+    entry_expiry_bars: int | None = None,
     flat_boundary: RoundBoundaryMode = RoundBoundaryMode.NONE,
-) -> tuple[str, datetime, datetime, float, int, int, float, float] | None:
-    """Simulate a READY setup forward causally with scaled partial exits (40/40/20).
-
-    Returns `(outcome, fill_time, exit_time, gross_r, exit_bar_idx, bars_held,
-    exit_price, fill_price)` if triggered, or `None` if price never touched the entry zone
-    within `future_candles`.
-    - Entry fill uses the conservative side reached inside `[entry_low, entry_high]`.
-    - Gap-through-SL at `candle.open` fills at actual `candle.open` rather than flat `-1.0R`.
-    - Partial exits: 40% at TP1 (then trail SL to breakeven `fill_price`), 40% at TP2,
-      and 20% at TP3. Never rewinds exit time/bar backward to a past TP bar.
-    """
+) -> _SimulationOutcome | None:
+    """Causal forward simulation with optional v1.7 pending lifecycle & intrabar event order."""
     if (
         setup.entry_low is None
         or setup.entry_high is None
@@ -260,16 +418,33 @@ def _simulate_setup_forward(
     realized_r = 0.0
     hit_tp1 = False
     hit_tp2 = False
+    remaining_history: list[tuple[datetime, float]] = []
 
     for offset, candle in enumerate(future_candles):
         bar_idx = start_bar_index + offset
         just_triggered = False
+        tp1_blocked_this_bar = False
         if not triggered:
-            if candle.low <= setup.entry_high and candle.high >= setup.entry_low:
+            if entry_expiry_bars is not None and offset >= entry_expiry_bars:
+                return _SimulationOutcome(
+                    outcome="no_fill_expired",
+                    cancel_reason="NO_FILL_EXPIRED",
+                )
+            fill_touched = candle.low <= setup.entry_high and candle.high >= setup.entry_low
+            tp1_touched = (candle.high >= setup.tp1) if is_long else (candle.low <= setup.tp1)
+            if entry_expiry_bars is not None and tp1_touched and not fill_touched:
+                return _SimulationOutcome(
+                    outcome="no_fill_tp1_first",
+                    cancel_reason="NO_FILL_TP1_FIRST",
+                )
+            if fill_touched:
                 triggered = True
                 just_triggered = True
                 fill_time = candle.close_time
                 trigger_offset = offset
+                if entry_expiry_bars is not None and tp1_touched:
+                    # Conservative rule (§7.2): fill first, TP1 not credited on same bar.
+                    tp1_blocked_this_bar = True
                 if is_long:
                     if candle.open >= setup.entry_high:
                         fill_price = setup.entry_high
@@ -279,6 +454,7 @@ def _simulate_setup_forward(
                     fill_price = setup.entry_low
                 else:
                     fill_price = candle.open
+                remaining_history.append((candle.close_time, remaining))
             else:
                 continue
 
@@ -298,49 +474,66 @@ def _simulate_setup_forward(
             realized_r += remaining * leg_r
             bars_held = max(1, offset - trigger_offset + 1)
             sl_outcome = "hit_tp2" if hit_tp2 else ("hit_tp1" if hit_tp1 else "hit_sl")
-            return (
-                sl_outcome,
-                fill_time,
-                candle.close_time,
-                realized_r,
-                bar_idx,
-                bars_held,
-                exit_px,
-                fill_price,
+            was_be_exit = hit_tp1 and (current_sl == fill_price)
+            return _SimulationOutcome(
+                outcome=sl_outcome,
+                fill_time=fill_time,
+                exit_time=candle.close_time,
+                gross_r=realized_r,
+                exit_bar_idx=bar_idx,
+                bars_held=bars_held,
+                exit_price=exit_px,
+                fill_price=fill_price,
+                be_exit=was_be_exit,
+                remaining_history=tuple(remaining_history),
             )
 
-        if not hit_tp1 and ((candle.high >= setup.tp1) if is_long else (candle.low <= setup.tp1)):
+        if (
+            not tp1_blocked_this_bar
+            and not hit_tp1
+            and ((candle.high >= setup.tp1) if is_long else (candle.low <= setup.tp1))
+        ):
             hit_tp1 = True
             leg_tp1 = (
                 (setup.tp1 - fill_price) / risk if is_long else (fill_price - setup.tp1) / risk
             )
             realized_r += 0.40 * leg_tp1
             remaining -= 0.40
+            # Takes effect on the NEXT bar because SL was already evaluated above.
             current_sl = fill_price
+            remaining_history.append((candle.close_time, remaining))
 
-        if not hit_tp2 and ((candle.high >= setup.tp2) if is_long else (candle.low <= setup.tp2)):
+        if (
+            not tp1_blocked_this_bar
+            and not hit_tp2
+            and ((candle.high >= setup.tp2) if is_long else (candle.low <= setup.tp2))
+        ):
             hit_tp2 = True
             leg_tp2 = (
                 (setup.tp2 - fill_price) / risk if is_long else (fill_price - setup.tp2) / risk
             )
             realized_r += 0.40 * leg_tp2
             remaining -= 0.40
+            remaining_history.append((candle.close_time, remaining))
 
-        if (candle.high >= setup.tp3) if is_long else (candle.low <= setup.tp3):
+        if not tp1_blocked_this_bar and (
+            (candle.high >= setup.tp3) if is_long else (candle.low <= setup.tp3)
+        ):
             leg_tp3 = (
                 (setup.tp3 - fill_price) / risk if is_long else (fill_price - setup.tp3) / risk
             )
             realized_r += remaining * leg_tp3
             bars_held = max(1, offset - trigger_offset + 1)
-            return (
-                "hit_tp3",
-                fill_time,
-                candle.close_time,
-                realized_r,
-                bar_idx,
-                bars_held,
-                setup.tp3,
-                fill_price,
+            return _SimulationOutcome(
+                outcome="hit_tp3",
+                fill_time=fill_time,
+                exit_time=candle.close_time,
+                gross_r=realized_r,
+                exit_bar_idx=bar_idx,
+                bars_held=bars_held,
+                exit_price=setup.tp3,
+                fill_price=fill_price,
+                remaining_history=tuple(remaining_history),
             )
 
         if flat_boundary is not RoundBoundaryMode.NONE and _is_round_boundary(
@@ -353,18 +546,42 @@ def _simulate_setup_forward(
                 else (fill_price - candle.close) / risk
             )
             realized_r += remaining * leg_flat
-            return (
-                "flat_boundary",
-                fill_time,
-                candle.close_time,
-                realized_r,
-                bar_idx,
-                bars_held,
-                candle.close,
-                fill_price,
+            return _SimulationOutcome(
+                outcome="flat_boundary",
+                fill_time=fill_time,
+                exit_time=candle.close_time,
+                gross_r=realized_r,
+                exit_bar_idx=bar_idx,
+                bars_held=bars_held,
+                exit_price=candle.close,
+                fill_price=fill_price,
+                remaining_history=tuple(remaining_history),
+            )
+
+        bars_held_now = offset - trigger_offset + 1
+        if entry_expiry_bars is not None and bars_held_now >= max_hold_bars:
+            leg_end = (
+                (candle.close - fill_price) / risk
+                if is_long
+                else (fill_price - candle.close) / risk
+            )
+            realized_r += remaining * leg_end
+            final_outcome = "hit_tp2" if hit_tp2 else ("hit_tp1" if hit_tp1 else "expired")
+            return _SimulationOutcome(
+                outcome=final_outcome,
+                fill_time=fill_time,
+                exit_time=candle.close_time,
+                gross_r=realized_r,
+                exit_bar_idx=bar_idx,
+                bars_held=bars_held_now,
+                exit_price=candle.close,
+                fill_price=fill_price,
+                remaining_history=tuple(remaining_history),
             )
 
     if not triggered or fill_time is None:
+        if entry_expiry_bars is not None:
+            return _SimulationOutcome(outcome="no_fill_expired", cancel_reason="NO_FILL_EXPIRED")
         return None
 
     last_candle = future_candles[-1]
@@ -377,15 +594,51 @@ def _simulate_setup_forward(
     )
     realized_r += remaining * leg_end
     final_outcome = "hit_tp2" if hit_tp2 else ("hit_tp1" if hit_tp1 else "expired")
+    return _SimulationOutcome(
+        outcome=final_outcome,
+        fill_time=fill_time,
+        exit_time=last_candle.close_time,
+        gross_r=realized_r,
+        exit_bar_idx=last_bar_idx,
+        bars_held=bars_held,
+        exit_price=last_candle.close,
+        fill_price=fill_price,
+        remaining_history=tuple(remaining_history),
+    )
+
+
+def _simulate_setup_forward(
+    setup: TradeSetup,
+    future_candles: Sequence[MarketCandle],
+    *,
+    start_bar_index: int,
+    flat_boundary: RoundBoundaryMode = RoundBoundaryMode.NONE,
+) -> tuple[str, datetime, datetime, float, int, int, float, float] | None:
+    """Backwards-compatible legacy v1.6 tuple wrapper around `_simulate_setup_v17`."""
+    res = _simulate_setup_v17(
+        setup,
+        future_candles,
+        start_bar_index=start_bar_index,
+        max_hold_bars=len(future_candles),
+        entry_expiry_bars=None,
+        flat_boundary=flat_boundary,
+    )
+    if (
+        res is None
+        or res.cancel_reason is not None
+        or res.fill_time is None
+        or res.exit_time is None
+    ):
+        return None
     return (
-        final_outcome,
-        fill_time,
-        last_candle.close_time,
-        realized_r,
-        last_bar_idx,
-        bars_held,
-        last_candle.close,
-        fill_price,
+        res.outcome,
+        res.fill_time,
+        res.exit_time,
+        res.gross_r,
+        res.exit_bar_idx,
+        res.bars_held,
+        res.exit_price,
+        res.fill_price,
     )
 
 
@@ -394,6 +647,7 @@ def run_setup_backtest(
     *,
     config: BacktestConfig | None = None,
     ltf_candles: Sequence[MarketCandle] | None = None,
+    funding_history: Sequence[tuple[datetime, float]] | None = None,
     use_available_time: bool = False,
 ) -> BacktestReport:
     """Replay `build_trade_setup` bar-by-bar with strict causal slicing and no overlap."""
@@ -416,6 +670,8 @@ def run_setup_backtest(
     wait_signals = 0
     ready_signals = 0
     untriggered_signals = 0
+    no_fill_tp1_first = 0
+    no_fill_expired = 0
     boundary_flats = 0
     trades: list[BacktestTrade] = []
     decision_events: list[RoundDecisionEvent] = []
@@ -475,7 +731,7 @@ def run_setup_backtest(
             idx += cfg.step_bars
             continue
         struct = analyze_market_structure(history)
-        smc = analyze_smc(history, structure=struct)
+        smc = analyze_smc(history, structure=struct, atr_14=ind.metrics.atr_14)
 
         setup = build_trade_setup(
             metrics=ind.metrics,
@@ -487,6 +743,7 @@ def run_setup_backtest(
             as_of=as_of,
             use_available_time=use_available_time,
             cost_assumptions=cfg.cost_assumptions,
+            require_ema200=cfg.require_ema200,
         )
 
         bias_disabled = (setup.bias is SetupBias.LONG and not cfg.include_long) or (
@@ -510,31 +767,59 @@ def run_setup_backtest(
             continue
 
         ready_signals += 1
-        future = closed[idx + 1 : idx + 1 + cfg.max_hold_bars]
-        sim = _simulate_setup_forward(
+        horizon_len = (
+            cfg.entry_expiry_bars + cfg.max_hold_bars
+            if cfg.entry_expiry_bars is not None
+            else cfg.max_hold_bars
+        )
+        future = closed[idx + 1 : idx + 1 + horizon_len]
+        sim_obj = _simulate_setup_v17(
             setup,
             future,
             start_bar_index=idx + 1,
+            max_hold_bars=cfg.max_hold_bars,
+            entry_expiry_bars=cfg.entry_expiry_bars,
             flat_boundary=cfg.flat_boundary,
         )
-        if sim is None:
+        if (
+            sim_obj is None
+            or sim_obj.cancel_reason is not None
+            or sim_obj.fill_time is None
+            or sim_obj.exit_time is None
+        ):
             untriggered_signals += 1
+            if sim_obj is not None and sim_obj.cancel_reason == "NO_FILL_TP1_FIRST":
+                no_fill_tp1_first += 1
+                cancel_txt = "HOLD: READY setup cancelled (NO_FILL_TP1_FIRST)."
+            elif sim_obj is not None and sim_obj.cancel_reason == "NO_FILL_EXPIRED":
+                no_fill_expired += 1
+                cancel_txt = (
+                    f"HOLD: READY setup expired untriggered within {cfg.entry_expiry_bars} bars "
+                    "(NO_FILL_EXPIRED)."
+                )
+            else:
+                cancel_txt = (
+                    f"HOLD: READY {setup.bias.value.upper()} setup expired untriggered "
+                    f"within {cfg.max_hold_bars} bars."
+                )
             _append_event(
                 "HOLD",
                 ts=as_of,
                 bias=setup.bias,
                 price=bar_candle.close,
-                reason=(
-                    f"HOLD: READY {setup.bias.value.upper()} setup expired untriggered "
-                    f"within {cfg.max_hold_bars} bars."
-                ),
+                reason=cancel_txt,
             )
             idx += cfg.step_bars
             continue
 
-        outcome, fill_time, exit_time, gross_r, exit_bar_idx, bars_held, exit_price, fill_price = (
-            sim
-        )
+        outcome = sim_obj.outcome
+        fill_time = sim_obj.fill_time
+        exit_time = sim_obj.exit_time
+        gross_r = sim_obj.gross_r
+        exit_bar_idx = sim_obj.exit_bar_idx
+        bars_held = sim_obj.bars_held
+        exit_price = sim_obj.exit_price
+        fill_price = sim_obj.fill_price
         if (
             setup.entry_low is None
             or setup.entry_high is None
@@ -551,10 +836,24 @@ def run_setup_backtest(
         exec_costs = cfg.cost_assumptions.model_copy(update={"funding_bps_per_24h": 0.0})
         exec_cost_r = (exec_costs.round_trip_cost_rate * fill_price) / risk
         held_hours = bars_held * (tf.duration.total_seconds() / 3600.0)
-        funding_rate = (held_hours / 24.0) * (cfg.cost_assumptions.funding_bps_per_24h / 10_000.0)
-        funding_r = (funding_rate * fill_price) / risk
-        cost_r = exec_cost_r + funding_r
-        net_r = gross_r - cost_r
+        signed_fund_r, funding_assumed = _compute_signed_funding_r(
+            is_long=(setup.bias is SetupBias.LONG),
+            fill_time=fill_time,
+            exit_time=exit_time,
+            fill_price=fill_price,
+            risk=risk,
+            remaining_history=sim_obj.remaining_history,
+            funding_history=funding_history,
+        )
+        if funding_assumed:
+            funding_rate = (held_hours / 24.0) * (
+                cfg.cost_assumptions.funding_bps_per_24h / 10_000.0
+            )
+            funding_r_signed = -((funding_rate * fill_price) / risk)
+        else:
+            funding_r_signed = signed_fund_r
+        cost_r = exec_cost_r - funding_r_signed
+        net_r = gross_r - exec_cost_r + funding_r_signed
 
         _append_event(
             "FILL",
@@ -621,6 +920,10 @@ def run_setup_backtest(
                 outcome=outcome,
                 gross_r=round(gross_r, 4),
                 net_r=round(net_r, 4),
+                exec_cost_r=round(exec_cost_r, 6),
+                funding_r=round(funding_r_signed, 6),
+                funding_assumed=funding_assumed,
+                be_exit=sim_obj.be_exit,
                 bars_held=bars_held,
                 entry_source=setup.entry_source,
             )
@@ -630,6 +933,19 @@ def run_setup_backtest(
     executed_trades = len(trades)
     net_rs = [t.net_r for t in trades]
     gross_rs = [t.gross_r for t in trades]
+    be_exits_count = sum(1 for t in trades if t.be_exit)
+    assumed_funding_frac = (
+        sum(1 for t in trades if t.funding_assumed) / executed_trades
+        if executed_trades > 0
+        else 0.0
+    )
+    cost_sens, be_cost_mult = _compute_cost_sensitivity(trades)
+    portfolio_summary = compute_portfolio_and_block_bootstrap(
+        trades,
+        resamples=max(200, cfg.bootstrap_resamples),
+        mean_block_length=5.0,
+        seed=cfg.bootstrap_seed,
+    )
 
     wins = sum(1 for val in net_rs if val > 0.0)
     losses = sum(1 for val in net_rs if val < 0.0)
@@ -715,15 +1031,21 @@ def run_setup_backtest(
         boundary_flats=boundary_flats,
         start_time=closed[cfg.warmup_bars - 1].close_time,
         end_time=last.close_time,
+        eval_start=closed[cfg.warmup_bars - 1].close_time,
+        eval_end=last.close_time,
         total_bars=len(closed),
         evaluated_bars=evaluated_bars,
+        eval_bars=evaluated_bars,
         wait_signals=wait_signals,
         ready_signals=ready_signals,
         untriggered_signals=untriggered_signals,
+        no_fill_tp1_first=no_fill_tp1_first,
+        no_fill_expired=no_fill_expired,
         executed_trades=executed_trades,
         wins=wins,
         losses=losses,
         breakeven=breakeven,
+        be_exits=be_exits_count,
         win_rate=win_rate,
         gross_expectancy_r=round(gross_exp, 4),
         net_expectancy_r=round(net_exp, 4),
@@ -731,9 +1053,13 @@ def run_setup_backtest(
         total_net_r=round(total_net_r, 4),
         max_drawdown_r=round(max_dd_r, 4),
         max_consecutive_losses=max_consec_losses,
+        assumed_funding_fraction=round(assumed_funding_frac, 4),
+        cost_sensitivity=cost_sens,
+        breakeven_cost_multiplier=be_cost_mult,
         sharpe_per_trade=round(sharpe_trade, 4) if sharpe_trade is not None else None,
         sharpe_adjustment=sharpe_adj,
         bootstrap=bootstrap,
+        portfolio=portfolio_summary,
         regime_breakdown=tuple(regime_breakdown),
         trades=tuple(trades),
         decision_log=tuple(decision_events),
@@ -989,10 +1315,15 @@ def render_backtest_report(report: BacktestReport) -> str:
     ]
 
     if report.sharpe_per_trade is not None and report.sharpe_adjustment is not None:
+        ac_txt = (
+            f"{report.sharpe_adjustment.autocorr_adjusted_sharpe:.3f}"
+            if report.sharpe_adjustment.autocorr_adjusted_sharpe is not None
+            else "AC_UNDEFINED"
+        )
         lines.append(
             f"Sharpe / Trade    : {report.sharpe_per_trade:.3f} "
-            f"(Autocorr-Adj: {report.sharpe_adjustment.autocorr_adjusted_sharpe:.3f}, "
-            f"Non-Normal-Adj: {report.sharpe_adjustment.non_normal_adjusted_sharpe:.3f})"
+            f"(Autocorr-Adj: {ac_txt}, "
+            f"SE: {report.sharpe_adjustment.sr_std_error:.4f})"
         )
 
     if report.bootstrap is not None:
@@ -1012,6 +1343,24 @@ def render_backtest_report(report: BacktestReport) -> str:
                 f"- Max Drawdown P95             : {bs.max_drawdown_r_p95:.2f} R",
             ]
         )
+
+    if report.cost_sensitivity:
+        lines.append("---------------------------------------------------------------------")
+        be_txt = (
+            f"{report.breakeven_cost_multiplier:.2f}x"
+            if report.breakeven_cost_multiplier is not None
+            else "N/A"
+        )
+        lines.append(
+            f"Sensitivitas Biaya (Break-Even: {be_txt} | Funding Assumed: "
+            f"{report.assumed_funding_fraction * 100.0:.1f}% | BE Exits: {report.be_exits}):"
+        )
+        for pt in report.cost_sensitivity:
+            pf_txt = f"{pt.profit_factor:.2f}" if pt.profit_factor is not None else "N/A"
+            lines.append(
+                f"- {pt.multiplier:4.2f}x | Exp: {pt.net_expectancy_r:+.4f} R | "
+                f"Net: {pt.total_net_r:+6.2f} R | PF: {pf_txt} | MaxDD: {pt.max_drawdown_r:.2f} R"
+            )
 
     if report.regime_breakdown:
         lines.append("---------------------------------------------------------------------")

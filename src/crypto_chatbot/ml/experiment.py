@@ -46,7 +46,13 @@ def _extract_matrix(
     feature_names: Sequence[str],
 ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
     x = np.array(
-        [[row.features[name] for name in feature_names] for row in rows],
+        [
+            [
+                np.nan if row.features.get(name) is None else float(row.features[name] or 0.0)
+                for name in feature_names
+            ]
+            for row in rows
+        ],
         dtype=np.float64,
     )
     y = np.array([row.label for row in rows], dtype=np.float64)
@@ -316,9 +322,7 @@ def run_offline_experiment(
         use_available_time=use_available_time,
     )
     has_sentiment = bool(sentiment_observations) and any(
-        abs(r.features["sentiment_net_score"]) > 0.0
-        or r.features["sentiment_article_count_log"] > 0.0
-        for r in rows
+        r.features.get("sentiment_missing") == 0.0 for r in rows
     )
     return evaluate_feature_rows_experiment(
         rows,
@@ -345,9 +349,7 @@ def build_model_artifact(
         use_available_time=use_available_time,
     )
     has_sentiment = bool(sentiment_observations) and any(
-        abs(r.features["sentiment_net_score"]) > 0.0
-        or r.features["sentiment_article_count_log"] > 0.0
-        for r in rows
+        r.features.get("sentiment_missing") == 0.0 for r in rows
     )
     report = evaluate_feature_rows_experiment(
         rows,
@@ -410,6 +412,7 @@ def build_model_artifact(
         bias=float(final_pipeline.model.bias_),
         platt_a=float(final_pipeline.calibrator.a),
         platt_b=float(final_pipeline.calibrator.b),
+        base_rate=float(final_pipeline.base_rate_),
         seen_regimes=seen_regimes,
         accepted=report.accepted,
         created_at=report.created_at,

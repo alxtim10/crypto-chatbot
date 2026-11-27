@@ -301,7 +301,10 @@ async def test_old_numbers_from_memory_cannot_pass_output_guard() -> None:
             "fact_ids": ["F1", "F6"],
         }
     )
-    bot, repo, _ = _build_bot_stack(allowed_ids=(111,), gemini_texts=[poisoned_reply])
+    bot, repo, _ = _build_bot_stack(
+        allowed_ids=(111,),
+        gemini_texts=[poisoned_reply, poisoned_reply],
+    )
 
     chunks = await bot.handle_analyze(111, ["BTC", "4h"])
     full = "\n".join(chunks)

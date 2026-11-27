@@ -14,7 +14,11 @@ from google import genai
 from google.genai import types
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 
-from crypto_chatbot.llm.guard import validate_conversational_answer, validate_narration
+from crypto_chatbot.llm.guard import (
+    log_guard_violations,
+    validate_conversational_answer,
+    validate_narration,
+)
 from crypto_chatbot.llm.prompts import (
     ANALYSIS_SYSTEM_PROMPT,
     CONVERSATIONAL_QA_SYSTEM_PROMPT,
@@ -218,6 +222,7 @@ class GeminiNarrator:
         max_output_tokens: int = 1024,
         temperature: float = 0.2,
         quota_tracker: DailyQuotaTracker | None = None,
+        max_guard_retries: int = 1,
     ) -> None:
         if not model.strip():
             raise ValueError("model must not be blank")
@@ -225,12 +230,15 @@ class GeminiNarrator:
             raise ValueError("timeout_seconds must be positive")
         if max_output_tokens < 64:
             raise ValueError("max_output_tokens must be >= 64")
+        if max_guard_retries < 0:
+            raise ValueError("max_guard_retries must be >= 0")
         self._model = model.strip()
         self._transport = transport
         self._timeout_seconds = timeout_seconds
         self._max_output_tokens = max_output_tokens
         self._temperature = temperature
         self._quota_tracker = quota_tracker
+        self._max_guard_retries = max_guard_retries
         self._response_schema = LlmAnalysisNarration.model_json_schema()
 
     def _fallback(
@@ -295,84 +303,91 @@ class GeminiNarrator:
             external_data=external_data,
         )
 
-        try:
-            raw = await asyncio.wait_for(
-                self._transport.generate_json(
-                    model=self._model,
-                    system_instruction=ANALYSIS_SYSTEM_PROMPT,
-                    contents=payload,
-                    response_json_schema=self._response_schema,
-                    max_output_tokens=self._max_output_tokens,
-                    temperature=self._temperature,
-                ),
-                timeout=self._timeout_seconds,
-            )
-        except TimeoutError:
-            return self._fallback(
-                snapshot,
-                status=NarrationStatus.FALLBACK_DETERMINISTIC,
-                reasons=("gemini_timeout",),
-                start_monotonic=started,
-            )
-        except Exception as exc:
-            return self._fallback(
-                snapshot,
-                status=NarrationStatus.FALLBACK_DETERMINISTIC,
-                reasons=(f"gemini_error:{type(exc).__name__}",),
-                start_monotonic=started,
-            )
+        current_payload = payload
+        last_reasons: tuple[str, ...] = ()
+        resolved_model = self._model
+        prompt_tokens: int | None = None
+        output_tokens: int | None = None
 
-        resolved_model = raw.model_version or self._model
-        if not raw.text or not raw.text.strip():
-            return self._fallback(
-                snapshot,
-                status=NarrationStatus.FALLBACK_DETERMINISTIC,
-                reasons=("malformed_or_invalid_schema",),
-                start_monotonic=started,
-                model_id=resolved_model,
-                prompt_tokens=raw.prompt_tokens,
-                output_tokens=raw.output_tokens,
-            )
+        for attempt in range(1, self._max_guard_retries + 2):
+            try:
+                raw = await asyncio.wait_for(
+                    self._transport.generate_json(
+                        model=self._model,
+                        system_instruction=ANALYSIS_SYSTEM_PROMPT,
+                        contents=current_payload,
+                        response_json_schema=self._response_schema,
+                        max_output_tokens=self._max_output_tokens,
+                        temperature=self._temperature,
+                    ),
+                    timeout=self._timeout_seconds,
+                )
+            except TimeoutError:
+                return self._fallback(
+                    snapshot,
+                    status=NarrationStatus.FALLBACK_DETERMINISTIC,
+                    reasons=("gemini_timeout",),
+                    start_monotonic=started,
+                )
+            except Exception as exc:
+                return self._fallback(
+                    snapshot,
+                    status=NarrationStatus.FALLBACK_DETERMINISTIC,
+                    reasons=(f"gemini_error:{type(exc).__name__}",),
+                    start_monotonic=started,
+                )
 
-        try:
-            narration = LlmAnalysisNarration.model_validate_json(raw.text)
-        except (ValidationError, ValueError):
-            return self._fallback(
-                snapshot,
-                status=NarrationStatus.FALLBACK_DETERMINISTIC,
-                reasons=("malformed_or_invalid_schema",),
-                start_monotonic=started,
-                model_id=resolved_model,
-                prompt_tokens=raw.prompt_tokens,
-                output_tokens=raw.output_tokens,
-            )
+            resolved_model = raw.model_version or self._model
+            prompt_tokens = raw.prompt_tokens
+            output_tokens = raw.output_tokens
+            if not raw.text or not raw.text.strip():
+                last_reasons = ("malformed_or_invalid_schema",)
+                log_guard_violations(last_reasons, model_version=resolved_model, attempt=attempt)
+                break
 
-        guard_result = validate_narration(narration, snapshot)
-        if not guard_result.is_valid:
-            return self._fallback(
-                snapshot,
-                status=NarrationStatus.FALLBACK_DETERMINISTIC,
-                reasons=guard_result.reasons,
-                start_monotonic=started,
-                model_id=resolved_model,
-                prompt_tokens=raw.prompt_tokens,
-                output_tokens=raw.output_tokens,
-            )
+            try:
+                narration = LlmAnalysisNarration.model_validate_json(raw.text)
+            except (ValidationError, ValueError):
+                last_reasons = ("malformed_or_invalid_schema",)
+                log_guard_violations(last_reasons, model_version=resolved_model, attempt=attempt)
+                break
 
-        elapsed_ms = max(0, int((time.monotonic() - started) * 1000))
-        return NarrationOutcome(
-            response=AnalysisResponse(
-                snapshot=snapshot,
-                narration_status=NarrationStatus.GENERATED,
-                narration=narration,
-            ),
+            guard_result = validate_narration(narration, snapshot)
+            if guard_result.is_valid:
+                elapsed_ms = max(0, int((time.monotonic() - started) * 1000))
+                return NarrationOutcome(
+                    response=AnalysisResponse(
+                        snapshot=snapshot,
+                        narration_status=NarrationStatus.GENERATED,
+                        narration=narration,
+                    ),
+                    model_id=resolved_model,
+                    prompt_version=PROMPT_VERSION,
+                    validation_passed=True,
+                    rejection_reasons=(),
+                    latency_ms=elapsed_ms,
+                    prompt_tokens=prompt_tokens,
+                    output_tokens=output_tokens,
+                )
+
+            last_reasons = guard_result.reasons
+            log_guard_violations(last_reasons, model_version=resolved_model, attempt=attempt)
+            if attempt <= self._max_guard_retries:
+                feedback = ", ".join(last_reasons)
+                current_payload = (
+                    f"{payload}\n\n[GUARD_RETRY_FEEDBACK] Previous output failed validation "
+                    f"with violations: {feedback}. Regenerate using ONLY valid non-NONE "
+                    "{F<n>} placeholders and zero raw digits."
+                )
+
+        return self._fallback(
+            snapshot,
+            status=NarrationStatus.FALLBACK_DETERMINISTIC,
+            reasons=last_reasons or ("guard_rejected",),
+            start_monotonic=started,
             model_id=resolved_model,
-            prompt_version=PROMPT_VERSION,
-            validation_passed=True,
-            rejection_reasons=(),
-            latency_ms=elapsed_ms,
-            prompt_tokens=raw.prompt_tokens,
-            output_tokens=raw.output_tokens,
+            prompt_tokens=prompt_tokens,
+            output_tokens=output_tokens,
         )
 
     async def classify_intent(

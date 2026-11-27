@@ -263,6 +263,7 @@ def analyze_smc(
     structure: StructureAnalysis | None = None,
     pivot_k: int = DEFAULT_PIVOT_K,
     lookback_bars: int = SMC_LOOKBACK_BARS,
+    atr_14: float | None = None,
 ) -> SmcSummary:
     """Detect causal BOS/CHoCH, liquidity sweeps, active FVG/OB zones, and dealing range."""
     validate_closed_candles(candles)
@@ -299,16 +300,25 @@ def analyze_smc(
     eq: float | None = None
     pos_in_range: float | None = None
     dealing_zone: DealingZone | None = None
+    range_invalid = False
 
     if struct.last_swing_highs and struct.last_swing_lows:
         sh_level = struct.last_swing_highs[-1].level
         sl_level = struct.last_swing_lows[-1].level
-        if sh_level > sl_level:
+        range_width = sh_level - sl_level
+        min_valid_width = (0.1 * atr_14) if (atr_14 is not None and atr_14 > 0.0) else 0.0
+        if range_width <= min_valid_width:
+            range_invalid = True
+        else:
             dr_high = sh_level
             dr_low = sl_level
             eq = (dr_high + dr_low) / 2.0
-            pos_in_range = (last_close - dr_low) / (dr_high - dr_low)
-            if pos_in_range < 0.45:
+            pos_in_range = (last_close - dr_low) / range_width
+            if pos_in_range > 1.0:
+                dealing_zone = DealingZone.ABOVE_RANGE
+            elif pos_in_range < 0.0:
+                dealing_zone = DealingZone.BELOW_RANGE
+            elif pos_in_range < 0.45:
                 dealing_zone = DealingZone.DISCOUNT
             elif pos_in_range > 0.55:
                 dealing_zone = DealingZone.PREMIUM
@@ -327,4 +337,5 @@ def analyze_smc(
         equilibrium=eq,
         position_in_range=pos_in_range,
         dealing_zone=dealing_zone,
+        range_invalid=range_invalid,
     )

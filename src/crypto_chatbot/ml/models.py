@@ -117,12 +117,29 @@ class L2LogisticRegression:
         self.bias_: float = 0.0
         self.is_fitted: bool = False
 
-    def fit(self, features_x: NDArray[np.float64], y: NDArray[np.float64]) -> L2LogisticRegression:
+    def fit(
+        self,
+        features_x: NDArray[np.float64],
+        y: NDArray[np.float64],
+        *,
+        sample_weight: NDArray[np.float64] | None = None,
+    ) -> L2LogisticRegression:
         if features_x.ndim != 2 or features_x.shape[0] != len(y) or features_x.shape[0] < 1:
             raise ValueError("invalid X/y dimensions for L2LogisticRegression")
 
         n_samples, n_features = features_x.shape
-        pos_rate = float(np.mean(y))
+        if sample_weight is not None:
+            if len(sample_weight) != n_samples:
+                raise ValueError("sample_weight length must match y")
+            sw = np.asarray(sample_weight, dtype=np.float64)
+            sw_sum = float(np.sum(sw))
+            if sw_sum <= 0.0 or np.any(sw < 0.0):
+                raise ValueError("sample_weight must be non-negative with positive sum")
+            norm_w = sw / sw_sum
+        else:
+            norm_w = np.full(n_samples, 1.0 / float(n_samples), dtype=np.float64)
+
+        pos_rate = float(np.sum(norm_w * y))
         if pos_rate <= 0.0 or pos_rate >= 1.0:
             p_clamped = float(np.clip(pos_rate, 1e-4, 1.0 - 1e-4))
             self.bias_ = float(np.log(p_clamped / (1.0 - p_clamped)))
@@ -140,9 +157,9 @@ class L2LogisticRegression:
         for _ in range(self.max_iter):
             logits = np.clip(x_aug @ theta, -30.0, 30.0)
             probs = _sigmoid_array(logits)
-            w_diag = np.clip(probs * (1.0 - probs), 1e-6, 0.25)
+            w_diag = norm_w * np.clip(probs * (1.0 - probs), 1e-6, 0.25)
 
-            grad = x_aug.T @ (probs - y) + reg_vec * theta
+            grad = x_aug.T @ (norm_w * (probs - y)) + reg_vec * theta
             hess = (x_aug.T * w_diag) @ x_aug + np.diag(reg_vec + 1e-6)
             try:
                 step = np.linalg.solve(hess, grad)
@@ -206,6 +223,8 @@ class CalibratedLogisticPipeline:
         self.model = L2LogisticRegression(l2_reg=l2_reg)
         self.calibrator = PlattCalibrator()
         self.l2_reg = l2_reg
+        self.base_rate_: float = 0.5
+        self.calibration_logits_: NDArray[np.float64] = np.zeros(0, dtype=np.float64)
 
     def fit(
         self,
@@ -214,32 +233,113 @@ class CalibratedLogisticPipeline:
         *,
         pred_times_train: Sequence[datetime],
         label_end_times_train: Sequence[datetime],
+        sample_weight: NDArray[np.float64] | None = None,
     ) -> CalibratedLogisticPipeline:
         max_time = max(pred_times_train)
         x_scaled = self.preprocessor.fit(raw_x_train, fit_max_time=max_time).transform(raw_x_train)
+        if sample_weight is not None and float(np.sum(sample_weight)) > 0.0:
+            self.base_rate_ = float(
+                np.clip(np.average(y_train, weights=sample_weight), 1e-6, 1.0 - 1e-6)
+            )
+        else:
+            self.base_rate_ = float(np.clip(np.mean(y_train), 1e-6, 1.0 - 1e-6))
 
         n = len(y_train)
         cal_count = max(8, n // 5)
         split_idx = n - cal_count
+        calibrated_inner = False
         if split_idx >= 12:
             cal_start_time = pred_times_train[split_idx]
             inner_idx = [i for i in range(split_idx) if label_end_times_train[i] <= cal_start_time]
             if len(inner_idx) >= 10:
                 y_inner = y_train[inner_idx]
                 y_cal = y_train[split_idx:]
+                w_inner = sample_weight[inner_idx] if sample_weight is not None else None
                 inner_rate = float(np.mean(y_inner))
                 cal_rate = float(np.mean(y_cal))
                 if 0.0 < inner_rate < 1.0 and 0.0 < cal_rate < 1.0:
-                    inner_model = L2LogisticRegression(l2_reg=self.l2_reg)
-                    inner_model.fit(x_scaled[inner_idx], y_inner)
-                    cal_logits = inner_model.predict_logits(x_scaled[split_idx:])
+                    # Final predictor is the inner model composed with Platt calibrator (no refit).
+                    self.model.fit(x_scaled[inner_idx], y_inner, sample_weight=w_inner)
+                    cal_logits = self.model.predict_logits(x_scaled[split_idx:])
+                    self.calibration_logits_ = cal_logits
                     self.calibrator.fit(cal_logits, y_cal)
+                    calibrated_inner = True
 
-        # Fit weights deterministically across full purged training fold after calibration fit.
-        self.model.fit(x_scaled, y_train)
+        if not calibrated_inner:
+            self.model.fit(x_scaled, y_train, sample_weight=sample_weight)
+            self.calibrator = PlattCalibrator(a=1.0, b=0.0)
+            self.calibration_logits_ = np.zeros(0, dtype=np.float64)
         return self
 
     def predict_proba(self, raw_x_eval: NDArray[np.float64]) -> NDArray[np.float64]:
         x_scaled = self.preprocessor.transform(raw_x_eval)
         logits = self.model.predict_logits(x_scaled)
         return self.calibrator.transform(logits)
+
+
+L2_REG_GRID: tuple[float, ...] = (0.001, 0.01, 0.1, 1.0)
+
+
+def select_l2_reg_grid(
+    raw_x_train: NDArray[np.float64],
+    y_train: NDArray[np.float64],
+    *,
+    feature_names: Sequence[str],
+    pred_times_train: Sequence[datetime],
+    label_end_times_train: Sequence[datetime],
+    sample_weight: NDArray[np.float64] | None = None,
+    grid: Sequence[float] = L2_REG_GRID,
+    n_splits: int = 3,
+) -> tuple[float, dict[float, float]]:
+    """Select L2 regularization lambda via purged inner walk-forward weighted Brier score."""
+    if not grid:
+        raise ValueError("grid must be non-empty")
+    n = len(y_train)
+    if n < 30 or n_splits < 1:
+        default_lam = float(grid[-1])
+        return default_lam, {float(lam): float("nan") for lam in grid}
+
+    val_size = max(8, n // (n_splits + 2))
+    split_scores: dict[float, list[float]] = {float(lam): [] for lam in grid}
+
+    for k in range(n_splits):
+        val_start = n - (n_splits - k) * val_size
+        val_end = val_start + val_size
+        if val_start < 12 or val_end > n:
+            continue
+        val_start_time = pred_times_train[val_start]
+        train_idx = [i for i in range(val_start) if label_end_times_train[i] <= val_start_time]
+        if len(train_idx) < 10:
+            continue
+
+        y_tr = y_train[train_idx]
+        if float(np.mean(y_tr)) <= 0.0 or float(np.mean(y_tr)) >= 1.0:
+            continue
+        y_va = y_train[val_start:val_end]
+        w_tr = sample_weight[train_idx] if sample_weight is not None else None
+        w_va = sample_weight[val_start:val_end] if sample_weight is not None else None
+        norm_w_va = (
+            w_va / float(np.sum(w_va))
+            if w_va is not None and float(np.sum(w_va)) > 0.0
+            else np.full(len(y_va), 1.0 / float(len(y_va)), dtype=np.float64)
+        )
+
+        prep = FeaturePreprocessor(feature_names)
+        x_tr = prep.fit(raw_x_train[train_idx]).transform(raw_x_train[train_idx])
+        x_va = prep.transform(raw_x_train[val_start:val_end])
+
+        for lam in grid:
+            model = L2LogisticRegression(l2_reg=float(lam))
+            model.fit(x_tr, y_tr, sample_weight=w_tr)
+            p_va = model.predict_proba(x_va)
+            brier = float(np.sum(norm_w_va * (p_va - y_va) ** 2))
+            split_scores[float(lam)].append(brier)
+
+    mean_scores: dict[float, float] = {}
+    for lam, scores in split_scores.items():
+        mean_scores[lam] = float(np.mean(scores)) if scores else float("inf")
+
+    best_lam = min(mean_scores, key=lambda lam: (mean_scores[lam], lam))
+    if not np.isfinite(mean_scores[best_lam]):
+        best_lam = float(grid[-1])
+    return best_lam, mean_scores

@@ -35,13 +35,18 @@ _NON_GUARANTEE_NOTICE = (
 )
 
 
-def _confidence_label(prob: float | None, *, abstained: bool) -> str:
+def _confidence_label(
+    prob: float | None,
+    *,
+    abstained: bool,
+    base_rate: float = 0.5,
+) -> str:
     if abstained or prob is None:
         return "abstained"
-    margin = abs(prob - 0.5)
-    if margin >= 0.15:
+    edge = abs(prob - base_rate)
+    if edge >= 0.15:
         return "high"
-    if margin >= 0.08:
+    if edge >= 0.08:
         return "moderate"
     return "low"
 
@@ -74,7 +79,9 @@ class ShadowInferenceEngine:
     def artifact(self) -> MlModelArtifact:
         return self._artifact
 
-    def _predict_from_features(self, feature_map: Mapping[str, float]) -> tuple[float, float]:
+    def _predict_from_features(
+        self, feature_map: Mapping[str, float | None]
+    ) -> tuple[float, float]:
         n = len(self._artifact.feature_names)
         x = np.empty(n, dtype=np.float64)
         for j, name in enumerate(self._artifact.feature_names):
@@ -155,17 +162,22 @@ class ShadowInferenceEngine:
             else:
                 prob, raw_max_z = self._predict_from_features(latest_row.features)
                 max_z = raw_max_z
+                edge = abs(prob - self._artifact.base_rate)
                 if raw_max_z > self._max_feature_zscore:
                     abstained = True
                     abstention_reason = "feature_drift_high"
-                elif abs(prob - 0.5) < self._min_prob_margin:
+                elif edge < self._min_prob_margin:
                     cal_prob = prob
                     abstained = True
                     abstention_reason = "low_confidence"
                 else:
                     cal_prob = prob
 
-        conf_lbl = _confidence_label(cal_prob, abstained=abstained)
+        conf_lbl = _confidence_label(
+            cal_prob,
+            abstained=abstained,
+            base_rate=self._artifact.base_rate,
+        )
         latency_ms = max(0, int((time.monotonic() - t0) * 1000))
         pred_raw = (
             f"{snapshot.snapshot_id}|{self._artifact.artifact_id}|{snapshot.as_of.isoformat()}"
@@ -266,11 +278,13 @@ def settle_shadow_prediction(
 def compute_shadow_monitoring_report(
     records: Sequence[ShadowPredictionRecord],
     *,
-    max_brier: float = 0.25,
+    max_brier: float | None = None,
     max_ece: float = 0.12,
     drift_zscore_threshold: float = 4.0,
     max_drift_rate: float = 0.20,
-    min_settled: int = 5,
+    min_settled: int = 30,
+    min_settled_ece: int = 50,
+    reference_base_rate: float | None = None,
 ) -> ShadowMonitoringReport:
     """Audit feature drift, abstention rates, and live calibration across shadow logs."""
     total = len(records)
@@ -309,7 +323,7 @@ def compute_shadow_monitoring_report(
         y = np.array([pair[0] for pair in settled_pairs], dtype=np.float64)
         p = np.array([pair[1] for pair in settled_pairs], dtype=np.float64)
         realized_brier = float(np.mean((p - y) ** 2))
-        naive_p = float(np.mean(y))
+        naive_p = reference_base_rate if reference_base_rate is not None else float(np.mean(y))
         naive_brier = float(np.mean((naive_p - y) ** 2))
         realized_bss = compute_brier_skill_score(realized_brier, naive_brier)
         realized_ece = compute_ece(y, p, n_bins=5)
@@ -318,9 +332,17 @@ def compute_shadow_monitoring_report(
     alerts: list[str] = []
     if len(settled_pairs) < min_settled:
         alerts.append("insufficient_settled_samples")
-    if realized_brier is not None and realized_brier > max_brier:
+    else:
+        if realized_bss is not None and realized_bss < 0.0:
+            alerts.append("bss_below_zero")
+    if max_brier is not None and realized_brier is not None and realized_brier > max_brier:
         alerts.append("brier_above_threshold")
-    if realized_ece is not None and realized_ece > max_ece:
+    effective_ece_min = min(min_settled, min_settled_ece) if min_settled < 30 else min_settled_ece
+    if (
+        len(settled_pairs) >= effective_ece_min
+        and realized_ece is not None
+        and realized_ece > max_ece
+    ):
         alerts.append("calibration_ece_above_threshold")
     if drift_rate > max_drift_rate:
         alerts.append("feature_drift_rate_high")

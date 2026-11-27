@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import os
 import sys
 from collections.abc import Sequence
@@ -13,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from sqlalchemy import Engine
 
 from crypto_chatbot.analysis.backtest import (
     BacktestConfig,
@@ -24,6 +26,7 @@ from crypto_chatbot.analysis.backtest import (
     send_round_events_webhook,
     write_decision_log_jsonl,
 )
+from crypto_chatbot.analysis.forward_proof import freeze_variant_params
 from crypto_chatbot.analysis.momentum_screener import (
     DEFAULT_MIN_VOLUME_24H_USD,
     DEFAULT_TOP_PER_SIDE,
@@ -75,6 +78,12 @@ from crypto_chatbot.market_data.whale_provider import (
 )
 from crypto_chatbot.ml.experiment import run_offline_experiment
 from crypto_chatbot.ml.shadow import compute_shadow_monitoring_report
+from crypto_chatbot.ml.trials import (
+    JsonlTrialRegistry,
+    PostgresTrialRegistry,
+    TrialRecord,
+    TrialRegistry,
+)
 from crypto_chatbot.news.pipeline import build_sentiment_observations, deduplicate_articles
 from crypto_chatbot.ops import (
     BackupError,
@@ -685,6 +694,29 @@ def _load_news_observations_from_fixture(
     return build_sentiment_observations(articles)
 
 
+logger = logging.getLogger(__name__)
+
+
+def _record_cli_trial(
+    trial: TrialRecord,
+    *,
+    engine: Engine | None = None,
+) -> None:
+    """Best-effort Trial Registry recording (PostgreSQL when configured, else local JSONL)."""
+    registry: TrialRegistry
+    if engine is not None:
+        registry = PostgresTrialRegistry(engine)
+    else:
+        trials_path_raw = os.environ.get("TRIALS_JSONL_PATH", "").strip()
+        registry = (
+            JsonlTrialRegistry(Path(trials_path_raw)) if trials_path_raw else JsonlTrialRegistry()
+        )
+    try:
+        registry.record_trial(trial)
+    except Exception:
+        logger.debug("Trial registry recording skipped due to storage error", exc_info=True)
+
+
 def _run_ml_experiment(
     *,
     symbol_raw: str,
@@ -754,6 +786,23 @@ def _run_ml_experiment(
             engine = create_db_engine(database_url)
             init_db(engine)
             PostgresMlExperimentRepository(engine).save_experiment(report)
+
+        _record_cli_trial(
+            TrialRecord.create(
+                family=f"ml:{config.target_name}",
+                variant_params=config.model_dump(mode="json"),
+                data_window=(
+                    f"{batch.candles[0].open_time.strftime('%Y-%m-%d')}.."
+                    f"{batch.candles[-1].close_time.strftime('%Y-%m-%d')}"
+                ),
+                symbols=(config.canonical_symbol,),
+                timeframe=config.timeframe.value,
+                obs_frequency=config.timeframe.value,
+                sr_per_obs=None,
+                n_obs=report.oof_summary.sample_count,
+            ),
+            engine=engine,
+        )
     except (SymbolError, ValueError, json.JSONDecodeError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
@@ -1084,6 +1133,29 @@ def _run_backtest(
             return 0
 
         report = run_setup_backtest(batch.candles, config=config)
+        _record_cli_trial(
+            TrialRecord.create(
+                family="setup_backtest",
+                variant_params={
+                    "symbol": report.symbol,
+                    "timeframe": report.timeframe.value,
+                    "warmup_bars": config.warmup_bars,
+                    "max_hold_bars": config.max_hold_bars,
+                    "step_bars": config.step_bars,
+                    "require_ema200": config.require_ema200,
+                    "cost_bps": config.cost_assumptions.round_trip_cost_bps,
+                },
+                data_window=(
+                    f"{report.start_time.strftime('%Y-%m-%d')}.."
+                    f"{report.end_time.strftime('%Y-%m-%d')}"
+                ),
+                symbols=(report.symbol,),
+                timeframe=report.timeframe.value,
+                obs_frequency="per_trade",
+                sr_per_obs=report.sharpe_per_trade,
+                n_obs=report.executed_trades,
+            ),
+        )
         if log_jsonl is not None:
             write_decision_log_jsonl(report.decision_log, log_jsonl)
         if webhook_url:
@@ -1561,8 +1633,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     backtest_parser.add_argument(
         "--warmup",
         type=int,
-        default=200,
-        help="Minimum warmup bars before first signal evaluation (default: 200).",
+        default=600,
+        help="Minimum warmup bars before first signal evaluation (default: 600).",
     )
     backtest_parser.add_argument(
         "--max-hold",
@@ -1709,6 +1781,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Output raw JSON instead of formatted text report.",
     )
 
+    freeze_parser = subcommands.add_parser(
+        "freeze-params",
+        help="Freeze strategy variant parameters to frozen_params.json with params_sha256.",
+    )
+    freeze_parser.add_argument(
+        "variant",
+        type=str,
+        help="Strategy variant name to freeze (e.g. v3, v0).",
+    )
+    freeze_parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("frozen_params.json"),
+        help="Output JSON path (default: frozen_params.json).",
+    )
+    freeze_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print frozen artifact JSON to stdout.",
+    )
+
     args = parser.parse_args(argv)
     if args.command == "check-config":
         return _check_config()
@@ -1809,6 +1902,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     if args.command == "health-check":
         return _run_health_check(database_url=args.database_url)
+    if args.command == "freeze-params":
+        try:
+            artifact = freeze_variant_params(args.variant, output_path=args.output)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        if args.json:
+            print(artifact.model_dump_json(indent=2))
+        else:
+            print(
+                f"Frozen variant={artifact.variant} params_sha256={artifact.params_sha256} "
+                f"frozen_at={artifact.frozen_at.isoformat()} -> {args.output}"
+            )
+        return 0
     parser.error(f"unknown command: {args.command}")  # pragma: no cover
 
 

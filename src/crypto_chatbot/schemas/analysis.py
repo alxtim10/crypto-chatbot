@@ -74,9 +74,11 @@ class StructureEventType(StrEnum):
 
 
 class DealingZone(StrEnum):
+    BELOW_RANGE = "below_range"
     DISCOUNT = "discount"
     EQUILIBRIUM = "equilibrium"
     PREMIUM = "premium"
+    ABOVE_RANGE = "above_range"
 
 
 class PriceZone(BaseModel):
@@ -116,6 +118,7 @@ class SmcSummary(BaseModel):
     equilibrium: FiniteFloat | None = Field(default=None, gt=0)
     position_in_range: FiniteFloat | None = None
     dealing_zone: DealingZone | None = None
+    range_invalid: bool = False
 
 
 class TimeframeOverview(BaseModel):
@@ -180,6 +183,7 @@ class TradeSetup(BaseModel):
     net_rr_tp2: FiniteFloat | None = None
     net_rr_tp3: FiniteFloat | None = None
     cost_rate_round_trip: FiniteFloat | None = Field(default=None, ge=0)
+    min_sl_pct_implied: FiniteFloat | None = Field(default=None, ge=0)
     stop_loss_distance_pct: FiniteFloat | None = Field(default=None, ge=0)
     max_theoretical_leverage: int | None = Field(default=None, ge=1)
     wait_reason: str | None = None
@@ -225,6 +229,14 @@ class TradeSetup(BaseModel):
         return self
 
 
+class FactStatus(StrEnum):
+    """Availability status of a fact in the AnalysisSnapshot ledger (PRD v1.7 §2.3)."""
+
+    OK = "OK"
+    DEGRADED = "DEGRADED"
+    NONE = "NONE"
+
+
 class Fact(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -235,6 +247,7 @@ class Fact(BaseModel):
     display_format: str = Field(min_length=1)
     source: str = Field(min_length=1)
     as_of: UtcDatetime
+    status: FactStatus = FactStatus.OK
 
 
 class InputRange(BaseModel):

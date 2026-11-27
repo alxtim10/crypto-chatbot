@@ -6,7 +6,11 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime
 from typing import NamedTuple
 
-from crypto_chatbot.analysis.indicators import MIN_HISTORY_EMA_20, compute_technical_metrics
+from crypto_chatbot.analysis.indicators import (
+    MIN_HISTORY_EMA_20,
+    MIN_HISTORY_EMA_200,
+    compute_technical_metrics,
+)
 from crypto_chatbot.analysis.regimes import classify_regime
 from crypto_chatbot.analysis.smc import analyze_smc
 from crypto_chatbot.analysis.structure import StructureAnalysis, analyze_market_structure
@@ -46,6 +50,11 @@ SETUP_PARAMETERS: dict[str, int | float | str] = {
     "trade_setup_sl_atr_buffer": SL_ATR_BUFFER,
     "trade_setup_tp_levels": 3,
 }
+
+
+def ema200_available(closed_count: int) -> bool:
+    """Single canonical predicate for EMA200 availability across live and backtest (§3.2)."""
+    return closed_count >= MIN_HISTORY_EMA_200
 
 
 def _net_reward_risk(
@@ -474,6 +483,7 @@ def _resolve_bias(
     regime: Regime,
     structure: StructureAnalysis,
     smc: SmcSummary,
+    require_ema200: bool = False,
 ) -> tuple[SetupBias, str | None]:
     brk = smc.latest_structure_break.event_type if smc.latest_structure_break else None
     swp = smc.latest_sweep.event_type if smc.latest_sweep else None
@@ -550,6 +560,12 @@ def _resolve_bias(
         )
 
     if score >= 2:
+        if require_ema200 and metrics.ema_200 is None:
+            return (
+                SetupBias.NEUTRAL,
+                "WAIT_EMA200_UNAVAILABLE: EMA 200 belum tersedia (butuh minimal 600 candle "
+                "tertutup).",
+            )
         if metrics.ema_200 is not None and metrics.last_close < metrics.ema_200:
             return (
                 SetupBias.NEUTRAL,
@@ -558,6 +574,12 @@ def _resolve_bias(
             )
         return SetupBias.LONG, None
     if score <= -2:
+        if require_ema200 and metrics.ema_200 is None:
+            return (
+                SetupBias.NEUTRAL,
+                "WAIT_EMA200_UNAVAILABLE: EMA 200 belum tersedia (butuh minimal 600 candle "
+                "tertutup).",
+            )
         if metrics.ema_200 is not None and metrics.last_close > metrics.ema_200:
             return (
                 SetupBias.NEUTRAL,
@@ -688,6 +710,7 @@ def build_trade_setup(
     use_available_time: bool = False,
     cost_assumptions: CostAssumptions | None = None,
     macro_context: MacroBenchmarkContext | None = None,
+    require_ema200: bool = False,
 ) -> TradeSetup:
     """Compute 1 deterministic conditional trade setup (Entry, SL, TP1-3) or honest WAIT."""
     htf_sup, htf_res = _extract_sr_levels(structure, smc)
@@ -721,6 +744,7 @@ def build_trade_setup(
         regime=regime,
         structure=structure,
         smc=smc,
+        require_ema200=require_ema200,
     )
     if bias is SetupBias.NEUTRAL or wait_reason is not None:
         return _wait_setup(
@@ -971,6 +995,17 @@ def build_trade_setup(
             smc=smc,
             ltf_resistance=ltf_res,
         )
+        if not (entry_mid < tp1 < tp2 < tp3):
+            return _wait_setup(
+                "WAIT_TARGET_INVALID: target TP1/TP2/TP3 LONG tidak monoton secara ketat (WAIT).",
+                risk_notes,
+                entry_timeframe=entry_tf,
+                ltf_confirmation=ltf_confirmation,
+                htf_support=htf_sup,
+                htf_resistance=htf_res,
+                ltf_support=ltf_sup,
+                ltf_resistance=ltf_res,
+            )
         rr_tp1 = (tp1 - entry_mid) / risk
         rr_tp2 = (tp2 - entry_mid) / risk
         rr_tp3 = (tp3 - entry_mid) / risk
@@ -1016,8 +1051,8 @@ def build_trade_setup(
         )
         if tp3 <= 0.0 or not (entry_mid > tp1 > tp2 > tp3):
             return _wait_setup(
-                "Target take profit SHORT melampaui batas harga positif "
-                "(volatilitas/SL terlalu lebar).",
+                "WAIT_TARGET_INVALID: target take profit SHORT tidak monoton atau melampaui "
+                "batas harga positif (WAIT).",
                 risk_notes,
                 entry_timeframe=entry_tf,
                 ltf_confirmation=ltf_confirmation,
@@ -1101,6 +1136,7 @@ def build_trade_setup(
 
     sl_dist_ratio = abs(entry_mid - stop_loss) / entry_mid
     sl_dist_pct = round(sl_dist_ratio * 100.0, 4)
+    min_sl_pct_implied = round((exec_costs.round_trip_cost_rate / MAX_EXEC_COST_R) * 100.0, 4)
     max_theor_lev = (
         min(20, max(1, int(0.75 / (sl_dist_ratio + cost_rate)))) if sl_dist_ratio > 0 else 1
     )
@@ -1121,6 +1157,7 @@ def build_trade_setup(
         stop_loss=stop_loss,
         invalidation_reason=invalidation_reason,
         stop_loss_distance_pct=sl_dist_pct,
+        min_sl_pct_implied=min_sl_pct_implied,
         max_theoretical_leverage=max_theor_lev,
         tp1=tp1,
         tp1_label=tp1_label,
@@ -1241,7 +1278,7 @@ def _select_long_targets(
     if tp2_match is not None:
         tp2, tp2_label = tp2_match
     else:
-        tp2 = max(tp1 + 0.8 * risk, entry_mid + DEFAULT_TP2_R * risk)
+        tp2 = max(tp1 + 0.3 * risk, entry_mid + DEFAULT_TP2_R * risk)
         tp2_label = "Ekspansi 2,0R"
 
     tp3_match = next(
@@ -1255,7 +1292,7 @@ def _select_long_targets(
     if tp3_match is not None:
         tp3, tp3_label = tp3_match
     else:
-        tp3 = max(tp2 + risk, entry_mid + DEFAULT_TP3_R * risk)
+        tp3 = min(entry_mid + 5.0 * risk, max(tp2 + 0.5 * risk, entry_mid + DEFAULT_TP3_R * risk))
         tp3_label = "Ekspansi 3,0R"
 
     return tp1, tp1_label, tp2, tp2_label, tp3, tp3_label
@@ -1310,7 +1347,7 @@ def _select_short_targets(
     if tp2_match is not None:
         tp2, tp2_label = tp2_match
     else:
-        tp2 = min(tp1 - 0.8 * risk, entry_mid - DEFAULT_TP2_R * risk)
+        tp2 = min(tp1 - 0.3 * risk, entry_mid - DEFAULT_TP2_R * risk)
         tp2_label = "Ekspansi 2,0R"
 
     tp3_match = next(
@@ -1324,7 +1361,7 @@ def _select_short_targets(
     if tp3_match is not None:
         tp3, tp3_label = tp3_match
     else:
-        tp3 = min(tp2 - risk, entry_mid - DEFAULT_TP3_R * risk)
+        tp3 = max(entry_mid - 5.0 * risk, min(tp2 - 0.5 * risk, entry_mid - DEFAULT_TP3_R * risk))
         tp3_label = "Ekspansi 3,0R"
 
     return tp1, tp1_label, tp2, tp2_label, tp3, tp3_label
