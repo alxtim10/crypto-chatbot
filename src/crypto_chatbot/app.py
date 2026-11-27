@@ -27,10 +27,16 @@ from crypto_chatbot.llm.gemini import (
 )
 from crypto_chatbot.market_data.bybit_derivatives import BybitDerivativesProvider
 from crypto_chatbot.market_data.fallback_provider import build_futures_providers
+from crypto_chatbot.market_data.gate_contract_stats import (
+    ContractStatsRecorder,
+    ContractStatsScheduler,
+    GateContractStatsClient,
+)
 from crypto_chatbot.market_data.macro_provider import DxyMarketDataProvider
 from crypto_chatbot.memory.service import MemoryService
 from crypto_chatbot.storage.database import create_db_engine, init_db
 from crypto_chatbot.storage.repositories import (
+    PostgresContractStatsRepository,
     PostgresDerivativesRepository,
     PostgresMarketRepository,
     PostgresNewsRepository,
@@ -123,8 +129,31 @@ def build_telegram_application(
         whale_watchlist=whale_watchlist,
     )
 
+    contract_stats_scheduler: ContractStatsScheduler | None = None
+    contract_stats_client: GateContractStatsClient | None = None
+    if settings.gate_contract_stats_enabled:
+        contract_stats_client = GateContractStatsClient()
+        contract_stats_recorder = ContractStatsRecorder(
+            client=contract_stats_client,
+            repository=PostgresContractStatsRepository(engine),
+        )
+        contract_stats_scheduler = ContractStatsScheduler(
+            contract_stats_recorder,
+            interval_seconds=settings.gate_contract_stats_interval_seconds,
+            backfill_days=settings.gate_contract_stats_backfill_days,
+        )
+
+    async def on_startup(app: Application[Any, Any, Any, Any, Any, Any]) -> None:
+        del app
+        if contract_stats_scheduler is not None:
+            contract_stats_scheduler.start()
+
     async def on_shutdown(app: Application[Any, Any, Any, Any, Any, Any]) -> None:
         del app
+        if contract_stats_scheduler is not None:
+            await contract_stats_scheduler.stop()
+        if contract_stats_client is not None:
+            await contract_stats_client.close()
         await provider.close()
         await derivatives_provider.close()
         await dxy_provider.close()
@@ -135,6 +164,7 @@ def build_telegram_application(
     application = (
         ApplicationBuilder()
         .token(settings.telegram_bot_token.get_secret_value())
+        .post_init(on_startup)
         .post_shutdown(on_shutdown)
         .build()
     )

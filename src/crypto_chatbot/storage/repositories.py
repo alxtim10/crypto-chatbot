@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from crypto_chatbot.schemas.analysis import AnalysisSnapshot, TradeSetup
 from crypto_chatbot.schemas.derivatives import (
+    ContractStatsObservation,
     FundingRateObservation,
     LiquidationEvent,
     LiquidationSide,
@@ -44,6 +45,7 @@ from crypto_chatbot.schemas.tradingview import (
 from crypto_chatbot.schemas.whale import NetworkType, WhaleWatchlistEntry
 from crypto_chatbot.storage.models import (
     AnalysisSnapshotRow,
+    ContractStatsRow,
     ConversationRow,
     FundingRateRow,
     LiquidationEventRow,
@@ -247,6 +249,33 @@ class DerivativesRepository(Protocol):
         end_available_time: datetime | None = None,
         limit: int | None = None,
     ) -> tuple[LiquidationEvent, ...]: ...
+
+
+class ContractStatsRepository(Protocol):
+    """Repository interface for Gate.io perpetual contract_stats observations."""
+
+    def save_contract_stats(self, observations: Sequence[ContractStatsObservation]) -> int: ...
+
+    def load_contract_stats(
+        self,
+        *,
+        venue: str,
+        canonical_symbol: str,
+        interval: str = "5m",
+        start_time: datetime | None = None,
+        end_available_time: datetime | None = None,
+        limit: int | None = None,
+    ) -> tuple[ContractStatsObservation, ...]: ...
+
+    def list_contract_stats_times(
+        self,
+        *,
+        venue: str,
+        canonical_symbol: str,
+        interval: str = "5m",
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+    ) -> tuple[datetime, ...]: ...
 
 
 class SetupLogRepository(Protocol):
@@ -1958,3 +1987,135 @@ class PostgresWhaleWatchlistRepository:
                     )
                 )
                 session.execute(stmt)
+
+
+class PostgresContractStatsRepository:
+    """Synchronous PostgreSQL append-only repository for Gate contract_stats snapshots."""
+
+    _INSERT_BATCH_SIZE = 500
+
+    def __init__(self, engine: Engine) -> None:
+        self._engine = engine
+
+    def save_contract_stats(self, observations: Sequence[ContractStatsObservation]) -> int:
+        if not observations:
+            return 0
+        rows = [
+            {
+                "venue": obs.venue,
+                "canonical_symbol": obs.canonical_symbol,
+                "provider_symbol": obs.provider_symbol,
+                "interval": obs.interval,
+                "observed_time": _to_utc(obs.observed_time),
+                "received_time": _to_utc(obs.received_time),
+                "available_time": _to_utc(obs.available_time),
+                "lsr_taker": obs.lsr_taker,
+                "lsr_account": obs.lsr_account,
+                "top_lsr_account": obs.top_lsr_account,
+                "top_lsr_size": obs.top_lsr_size,
+                "long_liq_usd": obs.long_liq_usd,
+                "short_liq_usd": obs.short_liq_usd,
+                "open_interest": obs.open_interest,
+                "open_interest_usd": obs.open_interest_usd,
+                "mark_price": obs.mark_price,
+                "last_funding_rate": obs.last_funding_rate,
+                "long_users": obs.long_users,
+                "short_users": obs.short_users,
+                "quality_flags": [flag.value for flag in obs.quality_flags],
+                "raw_payload": obs.raw_payload,
+            }
+            for obs in observations
+        ]
+        inserted_total = 0
+        with Session(self._engine) as session, session.begin():
+            for idx in range(0, len(rows), self._INSERT_BATCH_SIZE):
+                chunk = rows[idx : idx + self._INSERT_BATCH_SIZE]
+                stmt = (
+                    insert(ContractStatsRow)
+                    .values(chunk)
+                    .on_conflict_do_nothing(constraint="uq_contract_stats_identity")
+                    .returning(ContractStatsRow.id)
+                )
+                inserted_total += len(session.scalars(stmt).all())
+        return inserted_total
+
+    def load_contract_stats(
+        self,
+        *,
+        venue: str,
+        canonical_symbol: str,
+        interval: str = "5m",
+        start_time: datetime | None = None,
+        end_available_time: datetime | None = None,
+        limit: int | None = None,
+    ) -> tuple[ContractStatsObservation, ...]:
+        stmt = select(ContractStatsRow).where(
+            ContractStatsRow.venue == venue,
+            ContractStatsRow.canonical_symbol == canonical_symbol,
+            ContractStatsRow.interval == interval,
+        )
+        if start_time is not None:
+            stmt = stmt.where(ContractStatsRow.observed_time >= _to_utc(start_time))
+        if end_available_time is not None:
+            stmt = stmt.where(ContractStatsRow.available_time <= _to_utc(end_available_time))
+        if limit is not None:
+            if limit < 1:
+                raise ValueError("limit must be >= 1")
+            stmt = stmt.order_by(ContractStatsRow.observed_time.desc()).limit(limit)
+        else:
+            stmt = stmt.order_by(ContractStatsRow.observed_time.asc())
+        with Session(self._engine) as session:
+            db_rows = list(session.scalars(stmt))
+        if limit is not None:
+            db_rows.reverse()
+        return tuple(
+            ContractStatsObservation(
+                venue=row.venue,
+                canonical_symbol=row.canonical_symbol,
+                provider_symbol=row.provider_symbol,
+                interval=row.interval,  # type: ignore[arg-type]
+                observed_time=_to_utc(row.observed_time),
+                received_time=_to_utc(row.received_time),
+                available_time=_to_utc(row.available_time),
+                lsr_taker=row.lsr_taker,
+                lsr_account=row.lsr_account,
+                top_lsr_account=row.top_lsr_account,
+                top_lsr_size=row.top_lsr_size,
+                long_liq_usd=row.long_liq_usd,
+                short_liq_usd=row.short_liq_usd,
+                open_interest=row.open_interest,
+                open_interest_usd=row.open_interest_usd,
+                mark_price=row.mark_price,
+                last_funding_rate=row.last_funding_rate,
+                long_users=row.long_users,
+                short_users=row.short_users,
+                quality_flags=tuple(QualityFlag(flag) for flag in row.quality_flags),
+                raw_payload=dict(row.raw_payload),
+            )
+            for row in db_rows
+        )
+
+    def list_contract_stats_times(
+        self,
+        *,
+        venue: str,
+        canonical_symbol: str,
+        interval: str = "5m",
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+    ) -> tuple[datetime, ...]:
+        stmt = (
+            select(ContractStatsRow.observed_time)
+            .where(
+                ContractStatsRow.venue == venue,
+                ContractStatsRow.canonical_symbol == canonical_symbol,
+                ContractStatsRow.interval == interval,
+            )
+            .order_by(ContractStatsRow.observed_time.asc())
+        )
+        if start_time is not None:
+            stmt = stmt.where(ContractStatsRow.observed_time >= _to_utc(start_time))
+        if end_time is not None:
+            stmt = stmt.where(ContractStatsRow.observed_time <= _to_utc(end_time))
+        with Session(self._engine) as session:
+            return tuple(_to_utc(ts) for ts in session.scalars(stmt).all())

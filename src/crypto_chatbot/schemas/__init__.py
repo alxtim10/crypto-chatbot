@@ -31,6 +31,7 @@ from crypto_chatbot.schemas.commands import (
     WhaleCommandArgs,
 )
 from crypto_chatbot.schemas.derivatives import (
+    ContractStatsObservation,
     CrossSourcePriceCheck,
     DerivativesContext,
     FundingRateBatch,
@@ -128,6 +129,7 @@ __all__ = [
     "AnalysisSnapshot",
     "AnalyzeCommandArgs",
     "CompareCommandArgs",
+    "ContractStatsObservation",
     "CostAssumptions",
     "CrossSourcePriceCheck",
     "DealingZone",

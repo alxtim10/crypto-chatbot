@@ -114,6 +114,7 @@ from crypto_chatbot.storage.repositories import (
     DerivativesRepository,
     MarketRepository,
     NewsRepository,
+    PostgresContractStatsRepository,
     PostgresDerivativesRepository,
     PostgresMarketRepository,
     PostgresMlExperimentRepository,
@@ -1444,6 +1445,119 @@ def _run_whale(
     return 0
 
 
+def _run_contract_stats(
+    *,
+    action: str,
+    symbols_raw: str | None,
+    interval: str,
+    days: int,
+    limit: int,
+    interval_seconds: int,
+    as_json: bool,
+    database_url: str | None,
+) -> int:
+    from crypto_chatbot.analysis.scanner import DEFAULT_SCAN_BASKET
+    from crypto_chatbot.market_data.gate_contract_stats import (
+        ContractStatsRecorder,
+        ContractStatsScheduler,
+        GateContractStatsClient,
+    )
+
+    resolved_url = database_url or os.environ.get("DATABASE_URL")
+    if not resolved_url:
+        try:
+            settings = load_settings()
+            resolved_url = settings.database_url.get_secret_value()
+        except Exception:
+            resolved_url = None
+    if not resolved_url:
+        print("Error: DATABASE_URL is required for contract-stats.", file=sys.stderr)
+        return 1
+
+    if interval not in {"5m", "1h"}:
+        print(f"Error: unsupported interval '{interval}' (use 5m or 1h).", file=sys.stderr)
+        return 1
+    interval_lit: Any = interval
+    symbols = (
+        tuple(item.strip() for item in symbols_raw.split(",") if item.strip())
+        if symbols_raw
+        else DEFAULT_SCAN_BASKET
+    )
+
+    engine = create_db_engine(resolved_url)
+    init_db(engine)
+    repo = PostgresContractStatsRepository(engine)
+    client = GateContractStatsClient()
+    recorder = ContractStatsRecorder(
+        client=client,
+        repository=repo,
+        symbols=symbols,
+        interval=interval_lit,
+    )
+
+    try:
+        if action == "gap-report":
+            report = recorder.generate_gap_report(lookback_days=days)
+            if as_json:
+                print(report.model_dump_json(indent=2))
+            else:
+                print(
+                    f"Gate contract_stats gap report ({report.venue}, interval={report.interval}, "
+                    f"lookback={report.lookback_days}d)"
+                )
+                for item in report.symbols:
+                    print(
+                        f"- {item.canonical_symbol}: observed={item.observed_bars}/"
+                        f"{item.expected_bars} ({item.coverage_pct:.2f}%), "
+                        f"missing={item.missing_bars}, gaps={len(item.gaps)}"
+                    )
+            return 0
+
+        async def _run_async() -> int:
+            try:
+                if action == "poll":
+                    summary = await recorder.poll_once(limit=limit)
+                elif action == "backfill":
+                    summary = await recorder.backfill_history(lookback_days=days)
+                elif action == "schedule":
+                    scheduler = ContractStatsScheduler(
+                        recorder,
+                        interval_seconds=interval_seconds,
+                        backfill_days=days,
+                        run_backfill_on_start=True,
+                    )
+                    await scheduler.run_loop()
+                    return 0
+                else:
+                    raise ValueError(f"unknown action: {action}")
+            finally:
+                await client.close()
+
+            payload = {
+                "action": action,
+                "venue": summary.venue,
+                "interval": summary.interval,
+                "symbols_processed": summary.symbols_processed,
+                "fetched_rows": summary.fetched_rows,
+                "inserted_rows": summary.inserted_rows,
+                "skipped_duplicates": summary.skipped_duplicates,
+                "errors": list(summary.errors),
+            }
+            if as_json:
+                print(json.dumps(payload, indent=2))
+            else:
+                print(
+                    f"contract-stats {action}: symbols={summary.symbols_processed}, "
+                    f"fetched={summary.fetched_rows}, inserted={summary.inserted_rows}, "
+                    f"dupes={summary.skipped_duplicates}, errors={len(summary.errors)}"
+                )
+            return 0 if not summary.errors else 1
+
+        return asyncio.run(_run_async())
+    finally:
+        engine.dispose()
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="crypto-chatbot")
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -1833,6 +1947,55 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Print frozen artifact JSON to stdout.",
     )
 
+    stats_parser = subcommands.add_parser(
+        "contract-stats",
+        help="Poll, backfill, schedule, or audit gaps for Gate.io futures contract_stats.",
+    )
+    stats_parser.add_argument(
+        "action",
+        choices=("poll", "backfill", "gap-report", "schedule"),
+        help="Action to execute: poll once, backfill history, print gap report, or run scheduler.",
+    )
+    stats_parser.add_argument(
+        "--symbols",
+        default=None,
+        help="Comma-separated symbols (default: liquid perpetual basket).",
+    )
+    stats_parser.add_argument(
+        "--interval",
+        choices=("5m", "1h"),
+        default="5m",
+        help="contract_stats bucket interval (default: 5m).",
+    )
+    stats_parser.add_argument(
+        "--days",
+        type=int,
+        default=179,
+        help="Lookback window in days for backfill or gap-report (default: 179).",
+    )
+    stats_parser.add_argument(
+        "--limit",
+        type=int,
+        default=12,
+        help="Bars per symbol to fetch on `poll` (default: 12).",
+    )
+    stats_parser.add_argument(
+        "--interval-seconds",
+        type=int,
+        default=300,
+        help="Polling cadence in seconds for `schedule` (default: 300).",
+    )
+    stats_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Optional PostgreSQL URL override.",
+    )
+    stats_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print JSON output.",
+    )
+
     args = parser.parse_args(argv)
     if args.command == "check-config":
         return _check_config()
@@ -1948,6 +2111,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"frozen_at={artifact.frozen_at.isoformat()} -> {args.output}"
             )
         return 0
+    if args.command == "contract-stats":
+        return _run_contract_stats(
+            action=args.action,
+            symbols_raw=args.symbols,
+            interval=args.interval,
+            days=args.days,
+            limit=args.limit,
+            interval_seconds=args.interval_seconds,
+            as_json=args.json,
+            database_url=args.database_url,
+        )
     parser.error(f"unknown command: {args.command}")  # pragma: no cover
 
 

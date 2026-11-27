@@ -375,3 +375,37 @@ class CrossVenueDerivativesSummary(BaseModel):
     funding_dispersion_bps: FiniteFloat | None = None
     mark_price_spread_bps: FiniteFloat | None = None
     coverage_status: Literal["full", "partial", "unavailable"] = "unavailable"
+
+
+class ContractStatsObservation(BaseModel):
+    """Normalized Gate.io contract_stats bar with strict UTC point-in-time semantics."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    venue: str = Field(default="gateio", min_length=1)
+    canonical_symbol: str = Field(min_length=1)
+    provider_symbol: str = Field(min_length=1)
+    interval: Literal["5m", "1h"] = "5m"
+    observed_time: UtcDatetime
+    received_time: UtcDatetime
+    available_time: UtcDatetime
+    lsr_taker: FiniteFloat | None = None
+    lsr_account: FiniteFloat | None = None
+    top_lsr_account: FiniteFloat | None = None
+    top_lsr_size: FiniteFloat | None = None
+    long_liq_usd: FiniteFloat | None = Field(default=None, ge=0.0)
+    short_liq_usd: FiniteFloat | None = Field(default=None, ge=0.0)
+    open_interest: FiniteFloat | None = Field(default=None, ge=0.0)
+    open_interest_usd: FiniteFloat | None = Field(default=None, ge=0.0)
+    mark_price: FiniteFloat | None = Field(default=None, gt=0.0)
+    last_funding_rate: FiniteFloat | None = None
+    long_users: int | None = Field(default=None, ge=0)
+    short_users: int | None = Field(default=None, ge=0)
+    quality_flags: tuple[QualityFlag, ...] = ()
+    raw_payload: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _validate_temporal_order(self) -> ContractStatsObservation:
+        if self.available_time < self.observed_time:
+            raise ValueError("available_time must not precede observed_time")
+        return self

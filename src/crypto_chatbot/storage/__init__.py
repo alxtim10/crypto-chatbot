@@ -4,6 +4,7 @@ from crypto_chatbot.storage.database import create_db_engine, init_db
 from crypto_chatbot.storage.models import (
     AnalysisSnapshotRow,
     Base,
+    ContractStatsRow,
     ConversationRow,
     FundingRateRow,
     LiquidationEventRow,
@@ -22,6 +23,7 @@ from crypto_chatbot.storage.models import (
     UserRow,
 )
 from crypto_chatbot.storage.repositories import (
+    ContractStatsRepository,
     DerivativesRepository,
     ForgetResult,
     LlmInteractionRecord,
@@ -29,6 +31,7 @@ from crypto_chatbot.storage.repositories import (
     MlExperimentRepository,
     ModelPredictionRepository,
     NewsRepository,
+    PostgresContractStatsRepository,
     PostgresDerivativesRepository,
     PostgresMarketRepository,
     PostgresMlExperimentRepository,
@@ -49,6 +52,8 @@ from crypto_chatbot.storage.repositories import (
 __all__ = [
     "AnalysisSnapshotRow",
     "Base",
+    "ContractStatsRepository",
+    "ContractStatsRow",
     "ConversationRow",
     "DerivativesRepository",
     "ForgetResult",
@@ -67,6 +72,7 @@ __all__ = [
     "NewsRepository",
     "OpenInterestRow",
     "OrderBookSnapshotRow",
+    "PostgresContractStatsRepository",
     "PostgresDerivativesRepository",
     "PostgresMarketRepository",
     "PostgresMlExperimentRepository",

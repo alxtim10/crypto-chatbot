@@ -692,3 +692,48 @@ class ScreenerUniverseSnapshotRow(Base):
     top_losers_json: Mapped[list[dict[str, Any]]] = mapped_column(
         JSONB, nullable=False, default=list
     )
+
+
+class ContractStatsRow(Base):
+    """Append-only Gate.io perpetual contract_stats history (`contract_stats_observations`)."""
+
+    __tablename__ = "contract_stats_observations"
+    __table_args__ = (
+        UniqueConstraint(
+            "venue",
+            "canonical_symbol",
+            "interval",
+            "observed_time",
+            name="uq_contract_stats_identity",
+        ),
+        Index(
+            "ix_contract_stats_lookup",
+            "venue",
+            "canonical_symbol",
+            "interval",
+            "available_time",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    venue: Mapped[str] = mapped_column(String(64), nullable=False)
+    canonical_symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    provider_symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    interval: Mapped[str] = mapped_column(String(16), nullable=False)
+    observed_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    received_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    available_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    lsr_taker: Mapped[float | None] = mapped_column(Double, nullable=True)
+    lsr_account: Mapped[float | None] = mapped_column(Double, nullable=True)
+    top_lsr_account: Mapped[float | None] = mapped_column(Double, nullable=True)
+    top_lsr_size: Mapped[float | None] = mapped_column(Double, nullable=True)
+    long_liq_usd: Mapped[float | None] = mapped_column(Double, nullable=True)
+    short_liq_usd: Mapped[float | None] = mapped_column(Double, nullable=True)
+    open_interest: Mapped[float | None] = mapped_column(Double, nullable=True)
+    open_interest_usd: Mapped[float | None] = mapped_column(Double, nullable=True)
+    mark_price: Mapped[float | None] = mapped_column(Double, nullable=True)
+    last_funding_rate: Mapped[float | None] = mapped_column(Double, nullable=True)
+    long_users: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    short_users: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    quality_flags: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    raw_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
