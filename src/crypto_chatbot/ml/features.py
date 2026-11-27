@@ -80,6 +80,7 @@ FEATURE_FAMILIES: dict[FeatureFamily, tuple[str, ...]] = {
 ALL_FEATURE_NAMES: tuple[str, ...] = (
     *FEATURE_FAMILIES[FeatureFamily.TECHNICAL],
     *FEATURE_FAMILIES[FeatureFamily.STRUCTURE_PIVOT],
+    *FEATURE_FAMILIES[FeatureFamily.ORDERFLOW],
     *FEATURE_FAMILIES[FeatureFamily.SENTIMENT],
 )
 

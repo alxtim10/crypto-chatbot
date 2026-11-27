@@ -430,6 +430,30 @@ class PostgresMarketRepository:
                 inserted_total += len(session.scalars(stmt).all())
         return inserted_total
 
+    def upsert_taker_buy_volumes(self, candles: Sequence[MarketCandle]) -> int:
+        """Update `taker_buy_base_volume` on existing closed candles (D-05)."""
+        eligible = [c for c in candles if c.taker_buy_base_volume is not None]
+        if not eligible:
+            return 0
+        updated = 0
+        with Session(self._engine) as session, session.begin():
+            for candle in eligible:
+                stmt = (
+                    update(MarketCandleRow)
+                    .where(
+                        MarketCandleRow.provider == candle.provider,
+                        MarketCandleRow.venue == candle.venue,
+                        MarketCandleRow.canonical_symbol == candle.canonical_symbol,
+                        MarketCandleRow.market_type == candle.market_type.value,
+                        MarketCandleRow.timeframe == candle.timeframe.value,
+                        MarketCandleRow.open_time == _to_utc(candle.open_time),
+                    )
+                    .values(taker_buy_base_volume=candle.taker_buy_base_volume)
+                )
+                result = session.execute(stmt)
+                updated += int(getattr(result, "rowcount", 0) or 0)
+        return updated
+
     def load_candles(
         self,
         *,
@@ -2071,6 +2095,30 @@ class PostgresContractStatsRepository:
                 )
                 inserted_total += len(session.scalars(stmt).all())
         return inserted_total
+
+    def upsert_taker_buy_volumes(self, candles: Sequence[MarketCandle]) -> int:
+        """Update `taker_buy_base_volume` on existing closed candles (D-05)."""
+        eligible = [c for c in candles if c.taker_buy_base_volume is not None]
+        if not eligible:
+            return 0
+        updated = 0
+        with Session(self._engine) as session, session.begin():
+            for candle in eligible:
+                stmt = (
+                    update(MarketCandleRow)
+                    .where(
+                        MarketCandleRow.provider == candle.provider,
+                        MarketCandleRow.venue == candle.venue,
+                        MarketCandleRow.canonical_symbol == candle.canonical_symbol,
+                        MarketCandleRow.market_type == candle.market_type.value,
+                        MarketCandleRow.timeframe == candle.timeframe.value,
+                        MarketCandleRow.open_time == _to_utc(candle.open_time),
+                    )
+                    .values(taker_buy_base_volume=candle.taker_buy_base_volume)
+                )
+                result = session.execute(stmt)
+                updated += int(getattr(result, "rowcount", 0) or 0)
+        return updated
 
     def load_contract_stats(
         self,
