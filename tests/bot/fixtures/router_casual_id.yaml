@@ -1,0 +1,618 @@
+version: 1
+description: "100 Indonesian casual, smalltalk, follow-up, educational, market-general, help, out-of-scope, and analysis utterances for routing diagnostics."
+utterances:
+  # --- SMALLTALK (18) ---
+  - id: "u001"
+    text: "halo"
+    expected_intent: SMALLTALK
+    has_history: false
+    expected_symbol: null
+    tags: ["greeting"]
+  - id: "u002"
+    text: "pagi min"
+    expected_intent: SMALLTALK
+    has_history: false
+    expected_symbol: null
+    tags: ["greeting"]
+  - id: "u003"
+    text: "selamat malam bro"
+    expected_intent: SMALLTALK
+    has_history: false
+    expected_symbol: null
+    tags: ["greeting"]
+  - id: "u004"
+    text: "apa kabar?"
+    expected_intent: SMALLTALK
+    has_history: false
+    expected_symbol: null
+    tags: ["greeting"]
+  - id: "u005"
+    text: "makasih"
+    expected_intent: SMALLTALK
+    has_history: false
+    expected_symbol: null
+    tags: ["thanks"]
+  - id: "u006"
+    text: "makasih banyak ya bro"
+    expected_intent: SMALLTALK
+    has_history: false
+    expected_symbol: null
+    tags: ["thanks"]
+  - id: "u007"
+    text: "siap, mantap!"
+    expected_intent: SMALLTALK
+    has_history: false
+    expected_symbol: null
+    tags: ["ack"]
+  - id: "u008"
+    text: "oke noted"
+    expected_intent: SMALLTALK
+    has_history: false
+    expected_symbol: null
+    tags: ["ack"]
+  - id: "u009"
+    text: "WKWK mantap"
+    expected_intent: SMALLTALK
+    has_history: false
+    expected_symbol: null
+    tags: ["caps_slang"]
+  - id: "u010"
+    text: "HAHA bener juga"
+    expected_intent: SMALLTALK
+    has_history: false
+    expected_symbol: null
+    tags: ["caps_slang"]
+  - id: "u011"
+    text: "OMG pusing liat chart hari ini"
+    expected_intent: SMALLTALK
+    has_history: false
+    expected_symbol: null
+    tags: ["caps_slang"]
+  - id: "u012"
+    text: "GAS tidur dulu"
+    expected_intent: SMALLTALK
+    has_history: false
+    expected_symbol: null
+    tags: ["caps_slang"]
+  - id: "u013"
+    text: "OTW makan siang"
+    expected_intent: SMALLTALK
+    has_history: false
+    expected_symbol: null
+    tags: ["caps_slang"]
+  - id: "u014"
+    text: "OKAY siap"
+    expected_intent: SMALLTALK
+    has_history: false
+    expected_symbol: null
+    tags: ["caps_slang"]
+  - id: "u015"
+    text: "lagi santai aja nih sambil ngopi"
+    expected_intent: SMALLTALK
+    has_history: false
+    expected_symbol: null
+    tags: ["banter"]
+  - id: "u016"
+    text: "capek banget hari ini"
+    expected_intent: SMALLTALK
+    has_history: false
+    expected_symbol: null
+    tags: ["mood"]
+  - id: "u017"
+    text: "lagi galau nih, istirahat dulu ah"
+    expected_intent: SMALLTALK
+    has_history: false
+    expected_symbol: null
+    tags: ["mood"]
+  - id: "u018"
+    text: "kamu lagi sibuk gak?"
+    expected_intent: SMALLTALK
+    has_history: false
+    expected_symbol: null
+    tags: ["banter"]
+
+  # --- FOLLOWUP (16, has_history: true) ---
+  - id: "u019"
+    text: "makasih"
+    expected_intent: FOLLOWUP
+    has_history: true
+    expected_symbol: null
+    tags: ["followup_thanks"]
+  - id: "u020"
+    text: "terus?"
+    expected_intent: FOLLOWUP
+    has_history: true
+    expected_symbol: null
+    tags: ["followup_short"]
+  - id: "u021"
+    text: "kalau 1h?"
+    expected_intent: FOLLOWUP
+    has_history: true
+    expected_symbol: "BTC/USDT:USDT"
+    tags: ["followup_tf"]
+  - id: "u022"
+    text: "coba 15m"
+    expected_intent: FOLLOWUP
+    has_history: true
+    expected_symbol: "BTC/USDT:USDT"
+    tags: ["followup_tf"]
+  - id: "u023"
+    text: "yang 1d gimana?"
+    expected_intent: FOLLOWUP
+    has_history: true
+    expected_symbol: "BTC/USDT:USDT"
+    tags: ["followup_tf"]
+  - id: "u024"
+    text: "detailnya dong"
+    expected_intent: FOLLOWUP
+    has_history: true
+    expected_symbol: "BTC/USDT:USDT"
+    tags: ["followup_detail"]
+  - id: "u025"
+    text: "lanjut"
+    expected_intent: FOLLOWUP
+    has_history: true
+    expected_symbol: "BTC/USDT:USDT"
+    tags: ["followup_short"]
+  - id: "u026"
+    text: "kenapa tadi WAIT?"
+    expected_intent: FOLLOWUP
+    has_history: true
+    expected_symbol: "BTC/USDT:USDT"
+    tags: ["followup_why"]
+  - id: "u027"
+    text: "bandingkan sama ETH"
+    expected_intent: FOLLOWUP
+    has_history: true
+    expected_symbol: "ETH/USDT:USDT"
+    tags: ["followup_compare"]
+  - id: "u028"
+    text: "bikinin pine scriptnya"
+    expected_intent: FOLLOWUP
+    has_history: true
+    expected_symbol: "BTC/USDT:USDT"
+    tags: ["followup_pine"]
+  - id: "u029"
+    text: "kalau buat scalp gimana?"
+    expected_intent: FOLLOWUP
+    has_history: true
+    expected_symbol: "BTC/USDT:USDT"
+    tags: ["followup_style"]
+  - id: "u030"
+    text: "SL nya di mana tadi?"
+    expected_intent: FOLLOWUP
+    has_history: true
+    expected_symbol: "BTC/USDT:USDT"
+    tags: ["followup_level"]
+  - id: "u031"
+    text: "risikonya apa aja?"
+    expected_intent: FOLLOWUP
+    has_history: true
+    expected_symbol: "BTC/USDT:USDT"
+    tags: ["followup_risk"]
+  - id: "u032"
+    text: "oke paham, makasih ya"
+    expected_intent: FOLLOWUP
+    has_history: true
+    expected_symbol: null
+    tags: ["followup_ack"]
+  - id: "u033"
+    text: "bisa dijelaskan lebih singkat?"
+    expected_intent: FOLLOWUP
+    has_history: true
+    expected_symbol: null
+    tags: ["followup_clarify"]
+  - id: "u034"
+    text: "kalau 4h gimana?"
+    expected_intent: FOLLOWUP
+    has_history: true
+    expected_symbol: "BTC/USDT:USDT"
+    tags: ["followup_tf"]
+
+  # --- EDU_QA (22) ---
+  - id: "u035"
+    text: "apa itu RSI 70?"
+    expected_intent: EDU_QA
+    has_history: false
+    expected_symbol: null
+    tags: ["edu_with_numbers"]
+  - id: "u036"
+    text: "RSI di bawah 30 artinya oversold ya?"
+    expected_intent: EDU_QA
+    has_history: false
+    expected_symbol: null
+    tags: ["edu_with_numbers"]
+  - id: "u037"
+    text: "bedanya EMA 20 dan EMA 200?"
+    expected_intent: EDU_QA
+    has_history: false
+    expected_symbol: null
+    tags: ["edu_with_numbers"]
+  - id: "u038"
+    text: "funding rate dibayar tiap 8h ya?"
+    expected_intent: EDU_QA
+    has_history: false
+    expected_symbol: null
+    tags: ["edu_with_numbers", "bad_tf_collision"]
+  - id: "u039"
+    text: "apa bedanya spot sama futures?"
+    expected_intent: EDU_QA
+    has_history: false
+    expected_symbol: null
+    tags: ["spot_collision"]
+  - id: "u040"
+    text: "apa itu BOS/CHoCH?"
+    expected_intent: EDU_QA
+    has_history: false
+    expected_symbol: null
+    tags: ["slash_collision"]
+  - id: "u041"
+    text: "bedanya long/short apa?"
+    expected_intent: EDU_QA
+    has_history: false
+    expected_symbol: null
+    tags: ["slash_collision"]
+  - id: "u042"
+    text: "cara hitung risk/reward 1:2 gimana?"
+    expected_intent: EDU_QA
+    has_history: false
+    expected_symbol: null
+    tags: ["slash_collision", "edu_with_numbers"]
+  - id: "u043"
+    text: "kenapa gak boleh all-in?"
+    expected_intent: EDU_QA
+    has_history: false
+    expected_symbol: null
+    tags: ["advice_keyword_collision"]
+  - id: "u044"
+    text: "leverage 10x aman gak buat pemula?"
+    expected_intent: EDU_QA
+    has_history: false
+    expected_symbol: null
+    tags: ["edu_with_numbers"]
+  - id: "u045"
+    text: "bedanya candle 5m dan 15m apa?"
+    expected_intent: EDU_QA
+    has_history: false
+    expected_symbol: null
+    tags: ["edu_with_numbers"]
+  - id: "u046"
+    text: "jelaskan RSI 70"
+    expected_intent: EDU_QA
+    has_history: true
+    expected_symbol: null
+    tags: ["edu_with_numbers", "context_hijack"]
+  - id: "u047"
+    text: "jelaskan apa itu FVG dan order block"
+    expected_intent: EDU_QA
+    has_history: true
+    expected_symbol: null
+    tags: ["edu_concept"]
+  - id: "u048"
+    text: "apa itu DXY dan efeknya ke kripto?"
+    expected_intent: EDU_QA
+    has_history: false
+    expected_symbol: null
+    tags: ["caps_ticker_collision"]
+  - id: "u049"
+    text: "apa itu liquidation price?"
+    expected_intent: EDU_QA
+    has_history: false
+    expected_symbol: null
+    tags: ["edu_concept"]
+  - id: "u050"
+    text: "bedanya isolated sama cross margin?"
+    expected_intent: EDU_QA
+    has_history: false
+    expected_symbol: null
+    tags: ["edu_concept"]
+  - id: "u051"
+    text: "apa itu DCA?"
+    expected_intent: EDU_QA
+    has_history: false
+    expected_symbol: null
+    tags: ["caps_ticker_collision"]
+  - id: "u052"
+    text: "apa arti FOMO dan FUD?"
+    expected_intent: EDU_QA
+    has_history: false
+    expected_symbol: null
+    tags: ["caps_ticker_collision"]
+  - id: "u053"
+    text: "gimana cara atur psikologi pas loss?"
+    expected_intent: EDU_QA
+    has_history: true
+    expected_symbol: null
+    tags: ["edu_psychology"]
+  - id: "u054"
+    text: "bedanya RSI sama MACD apa?"
+    expected_intent: EDU_QA
+    has_history: true
+    expected_symbol: null
+    tags: ["edu_concept"]
+  - id: "u055"
+    text: "apa itu ATH dan ATL?"
+    expected_intent: EDU_QA
+    has_history: false
+    expected_symbol: null
+    tags: ["caps_ticker_collision"]
+  - id: "u056"
+    text: "jelaskan konsep support/resistance"
+    expected_intent: EDU_QA
+    has_history: true
+    expected_symbol: null
+    tags: ["slash_collision", "context_hijack"]
+
+  # --- MARKET_GENERAL (14) ---
+  - id: "u057"
+    text: "ada token yang bisa disetup gak?"
+    expected_intent: MARKET_GENERAL
+    has_history: false
+    expected_symbol: null
+    tags: ["ticker_collision_ada", "scan_cue"]
+  - id: "u058"
+    text: "ada sinyal apa hari ini?"
+    expected_intent: MARKET_GENERAL
+    has_history: false
+    expected_symbol: null
+    tags: ["ticker_collision_ada", "scan_cue"]
+  - id: "u059"
+    text: "ada berita kripto terbaru gak?"
+    expected_intent: MARKET_GENERAL
+    has_history: false
+    expected_symbol: null
+    tags: ["ticker_collision_ada"]
+  - id: "u060"
+    text: "ada peluang bagus hari ini?"
+    expected_intent: MARKET_GENERAL
+    has_history: false
+    expected_symbol: null
+    tags: ["ticker_collision_ada"]
+  - id: "u061"
+    text: "kenapa market merah semua?"
+    expected_intent: MARKET_GENERAL
+    has_history: true
+    expected_symbol: null
+    tags: ["context_hijack"]
+  - id: "u062"
+    text: "lihat berita hari ini dong"
+    expected_intent: MARKET_GENERAL
+    has_history: false
+    expected_symbol: null
+    tags: ["action_cue_collision"]
+  - id: "u063"
+    text: "cek ombak market dulu"
+    expected_intent: MARKET_GENERAL
+    has_history: false
+    expected_symbol: null
+    tags: ["action_cue_collision"]
+  - id: "u064"
+    text: "koin favorit kamu apa?"
+    expected_intent: MARKET_GENERAL
+    has_history: false
+    expected_symbol: null
+    tags: ["koin_cue_collision"]
+  - id: "u065"
+    text: "koin meme lagi rame ya?"
+    expected_intent: MARKET_GENERAL
+    has_history: false
+    expected_symbol: null
+    tags: ["koin_cue_collision"]
+  - id: "u066"
+    text: "screening top gainers dong"
+    expected_intent: MARKET_GENERAL
+    has_history: false
+    expected_symbol: null
+    tags: ["screen_cue"]
+  - id: "u067"
+    text: "top losers hari ini apa?"
+    expected_intent: MARKET_GENERAL
+    has_history: false
+    expected_symbol: null
+    tags: ["screen_cue"]
+  - id: "u068"
+    text: "whale lagi akumulasi atau distribusi?"
+    expected_intent: MARKET_GENERAL
+    has_history: false
+    expected_symbol: null
+    tags: ["whale_cue"]
+  - id: "u069"
+    text: "market lagi sideways ya?"
+    expected_intent: MARKET_GENERAL
+    has_history: false
+    expected_symbol: null
+    tags: ["market_mood"]
+  - id: "u070"
+    text: "lihat grafik makro hari ini"
+    expected_intent: MARKET_GENERAL
+    has_history: false
+    expected_symbol: null
+    tags: ["action_cue_collision"]
+
+  # --- ANALYZE (14) ---
+  - id: "u071"
+    text: "analisa ADA sekarang"
+    expected_intent: ANALYZE
+    has_history: false
+    expected_symbol: "ADA/USDT:USDT"
+    tags: ["ticker_collision_ada"]
+  - id: "u072"
+    text: "cek ADA/USDT 4h"
+    expected_intent: ANALYZE
+    has_history: false
+    expected_symbol: "ADA/USDT:USDT"
+    tags: ["ticker_collision_ada"]
+  - id: "u073"
+    text: "ADAUSDT gimana?"
+    expected_intent: ANALYZE
+    has_history: false
+    expected_symbol: "ADA/USDT:USDT"
+    tags: ["ticker_collision_ada"]
+  - id: "u074"
+    text: "cek koin ADA 1h"
+    expected_intent: ANALYZE
+    has_history: false
+    expected_symbol: "ADA/USDT:USDT"
+    tags: ["ticker_collision_ada"]
+  - id: "u075"
+    text: "vvv sekarang gimana?"
+    expected_intent: ANALYZE
+    has_history: false
+    expected_symbol: "VVV/USDT:USDT"
+    tags: ["lowercase_ticker"]
+  - id: "u076"
+    text: "analisa BTC 4h"
+    expected_intent: ANALYZE
+    has_history: false
+    expected_symbol: "BTC/USDT:USDT"
+    tags: ["explicit_analyze"]
+  - id: "u077"
+    text: "cek ETH buat intraday"
+    expected_intent: ANALYZE
+    has_history: false
+    expected_symbol: "ETH/USDT:USDT"
+    tags: ["explicit_analyze"]
+  - id: "u078"
+    text: "analisa SOL buat scalp"
+    expected_intent: ANALYZE
+    has_history: false
+    expected_symbol: "SOL/USDT:USDT"
+    tags: ["explicit_analyze"]
+  - id: "u079"
+    text: "bandingkan BTC dan ETH"
+    expected_intent: ANALYZE
+    has_history: false
+    expected_symbol: "BTC/USDT:USDT"
+    tags: ["explicit_compare"]
+  - id: "u080"
+    text: "cek DOGE 15m"
+    expected_intent: ANALYZE
+    has_history: false
+    expected_symbol: "DOGE/USDT:USDT"
+    tags: ["explicit_analyze"]
+  - id: "u081"
+    text: "analisa SUI detail lengkap"
+    expected_intent: ANALYZE
+    has_history: false
+    expected_symbol: "SUI/USDT:USDT"
+    tags: ["explicit_analyze"]
+  - id: "u082"
+    text: "cek PEPE"
+    expected_intent: ANALYZE
+    has_history: false
+    expected_symbol: "PEPE/USDT:USDT"
+    tags: ["explicit_analyze"]
+  - id: "u083"
+    text: "posisi whale di BTC"
+    expected_intent: ANALYZE
+    has_history: false
+    expected_symbol: "BTC/USDT:USDT"
+    tags: ["explicit_whale"]
+  - id: "u084"
+    text: "buatkan pine script BTC"
+    expected_intent: ANALYZE
+    has_history: false
+    expected_symbol: "BTC/USDT:USDT"
+    tags: ["explicit_pine"]
+
+  # --- HELP (6) ---
+  - id: "u085"
+    text: "bisa ngapain aja bot ini?"
+    expected_intent: HELP
+    has_history: false
+    expected_symbol: null
+    tags: ["help"]
+  - id: "u086"
+    text: "cara pakai bot ini gimana?"
+    expected_intent: HELP
+    has_history: false
+    expected_symbol: null
+    tags: ["help"]
+  - id: "u087"
+    text: "daftar perintah apa aja?"
+    expected_intent: HELP
+    has_history: false
+    expected_symbol: null
+    tags: ["help"]
+  - id: "u088"
+    text: "fitur apa yang ada di sini?"
+    expected_intent: HELP
+    has_history: false
+    expected_symbol: null
+    tags: ["help"]
+  - id: "u089"
+    text: "bantu dong cara analisa koin"
+    expected_intent: HELP
+    has_history: false
+    expected_symbol: null
+    tags: ["help"]
+  - id: "u090"
+    text: "tolong jelasin cara pakai kamu"
+    expected_intent: HELP
+    has_history: false
+    expected_symbol: null
+    tags: ["help"]
+
+  # --- OUT_OF_SCOPE (6) ---
+  - id: "u091"
+    text: "belikan BTC sekarang 100 dolar"
+    expected_intent: OUT_OF_SCOPE
+    has_history: false
+    expected_symbol: null
+    tags: ["order_execution"]
+  - id: "u092"
+    text: "pasang order long ETH sekarang"
+    expected_intent: OUT_OF_SCOPE
+    has_history: false
+    expected_symbol: null
+    tags: ["order_execution"]
+  - id: "u093"
+    text: "berapa persen modal yang harus aku taruh?"
+    expected_intent: OUT_OF_SCOPE
+    has_history: false
+    expected_symbol: null
+    tags: ["personal_allocation"]
+  - id: "u094"
+    text: "kasih sinyal yang pasti profit 100%"
+    expected_intent: OUT_OF_SCOPE
+    has_history: false
+    expected_symbol: null
+    tags: ["guaranteed_profit"]
+  - id: "u095"
+    text: "resep nasi goreng dong"
+    expected_intent: OUT_OF_SCOPE
+    has_history: false
+    expected_symbol: null
+    tags: ["off_topic"]
+  - id: "u096"
+    text: "analisa saham BBCA dong"
+    expected_intent: OUT_OF_SCOPE
+    has_history: false
+    expected_symbol: null
+    tags: ["non_crypto_ticker_collision"]
+
+  # --- UNKNOWN (4) ---
+  - id: "u097"
+    text: "???"
+    expected_intent: UNKNOWN
+    has_history: false
+    expected_symbol: null
+    tags: ["noise"]
+  - id: "u098"
+    text: "hmm"
+    expected_intent: UNKNOWN
+    has_history: false
+    expected_symbol: null
+    tags: ["noise"]
+  - id: "u099"
+    text: "test 123"
+    expected_intent: UNKNOWN
+    has_history: false
+    expected_symbol: null
+    tags: ["noise"]
+  - id: "u100"
+    text: "asdfghjkl"
+    expected_intent: UNKNOWN
+    has_history: false
+    expected_symbol: null
+    tags: ["noise"]

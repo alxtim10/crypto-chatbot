@@ -18,6 +18,7 @@ from crypto_chatbot.schemas.commands import (
     WhaleAction,
     WhaleCommandArgs,
 )
+from crypto_chatbot.schemas.llm import RoutingTrace
 from crypto_chatbot.schemas.market import (
     MULTI_STYLE_SCAN_TIMEFRAMES,
     PRIMARY_TIMEFRAMES,
@@ -786,60 +787,110 @@ def _extract_recent_context(
     return recent_symbols, recent_tf
 
 
-def resolve_followup_intent(
+def resolve_followup_intent_with_trace(
     text: str,
     *,
     recent_messages: Sequence[StoredMessage],
     default_timeframe: Timeframe = Timeframe.H4,
-) -> FollowupIntent:
-    """Resolve a bounded natural-language message into an explicit backend analysis intent."""
+) -> tuple[FollowupIntent, RoutingTrace]:
+    """Resolve a bounded natural-language message and return PII-free routing telemetry."""
     cleaned = text.strip()
     if not cleaned:
-        return RefusalIntent(
-            message="Pesan kosong. Gunakan /analyze <SIMBOL> [15m|1h|4h|1d] atau /help.",
-            is_hard_refusal=True,
+        return (
+            RefusalIntent(
+                message="Pesan kosong. Gunakan /analyze <SIMBOL> [15m|1h|4h|1d] atau /help.",
+                is_hard_refusal=True,
+            ),
+            RoutingTrace(
+                layer="layer1",
+                intent="refusal_hard",
+                confidence=1.0,
+                fallback_reason="empty_message",
+            ),
         )
     if len(cleaned) > MAX_USER_MESSAGE_CHARS:
-        return RefusalIntent(
-            message=(
-                f"Pesan terlalu panjang (maksimal {MAX_USER_MESSAGE_CHARS} karakter). "
-                "Ringkas pertanyaan Anda atau gunakan /analyze /compare."
+        return (
+            RefusalIntent(
+                message=(
+                    f"Pesan terlalu panjang (maksimal {MAX_USER_MESSAGE_CHARS} karakter). "
+                    "Ringkas pertanyaan Anda atau gunakan /analyze /compare."
+                ),
+                is_hard_refusal=True,
             ),
-            is_hard_refusal=True,
+            RoutingTrace(
+                layer="layer1",
+                intent="refusal_hard",
+                confidence=1.0,
+                fallback_reason="message_too_long",
+            ),
         )
 
     if _ORDER_OR_ADVICE_RE.search(cleaned):
-        return RefusalIntent(
-            message=(
-                "Bot ini hanya asisten riset dan edukasi. Eksekusi order, instruksi beli/jual "
-                "wajib, dan alokasi portofolio pribadi berada di luar cakupan layanan."
+        return (
+            RefusalIntent(
+                message=(
+                    "Bot ini hanya asisten riset dan edukasi. Eksekusi order, instruksi beli/jual "
+                    "wajib, dan alokasi portofolio pribadi berada di luar cakupan layanan."
+                ),
+                is_hard_refusal=True,
             ),
-            is_hard_refusal=True,
+            RoutingTrace(
+                layer="layer1",
+                intent="refusal_hard",
+                confidence=1.0,
+                fallback_reason="order_or_advice_policy",
+            ),
         )
 
     if _SPOT_HINT_RE.search(cleaned):
-        return RefusalIntent(
-            message=(
-                "Analisis difokuskan pada kontrak Perpetual Futures Binance (BASE/USDT:USDT) "
-                "dan tidak melayani pasar spot atau eksekusi order langsung."
+        return (
+            RefusalIntent(
+                message=(
+                    "Analisis difokuskan pada kontrak Perpetual Futures Binance (BASE/USDT:USDT) "
+                    "dan tidak melayani pasar spot atau eksekusi order langsung."
+                ),
+                is_hard_refusal=True,
             ),
-            is_hard_refusal=True,
+            RoutingTrace(
+                layer="layer1",
+                intent="refusal_hard",
+                confidence=1.0,
+                fallback_reason="spot_market_unsupported",
+            ),
         )
 
     non_usdt = _NON_USDT_PAIR_RE.findall(cleaned)
     if non_usdt:
-        return RefusalIntent(
-            message=(
-                f"Pasangan '{non_usdt[0]}' belum didukung. Saat ini analisis difokuskan pada "
-                "kontrak perpetual Binance /USDT:USDT (contoh: BTC, DOGE, SUI)."
+        return (
+            RefusalIntent(
+                message=(
+                    f"Pasangan '{non_usdt[0]}' belum didukung. Saat ini analisis difokuskan pada "
+                    "kontrak perpetual Binance /USDT:USDT (contoh: BTC, DOGE, SUI)."
+                ),
+                is_hard_refusal=True,
             ),
-            is_hard_refusal=True,
+            RoutingTrace(
+                layer="layer1",
+                intent="refusal_hard",
+                confidence=1.0,
+                fallback_reason="non_usdt_pair_unsupported",
+            ),
         )
 
     if _BAD_TIMEFRAME_TEXT_RE.search(cleaned) and not _SUPPORTED_TIMEFRAME_TEXT_RE.search(cleaned):
-        return RefusalIntent(
-            message=("Timeframe tersebut belum didukung. Gunakan timeframe 15m, 1h, 4h, atau 1d."),
-            is_hard_refusal=True,
+        return (
+            RefusalIntent(
+                message=(
+                    "Timeframe tersebut belum didukung. Gunakan timeframe 15m, 1h, 4h, atau 1d."
+                ),
+                is_hard_refusal=True,
+            ),
+            RoutingTrace(
+                layer="layer1",
+                intent="refusal_hard",
+                confidence=1.0,
+                fallback_reason="unsupported_timeframe",
+            ),
         )
 
     recent_symbols, recent_tf = _extract_recent_context(recent_messages, default_timeframe)
@@ -860,46 +911,117 @@ def resolve_followup_intent(
             screen_side = "long"
         elif has_short and not has_long:
             screen_side = "short"
-        return ScreenIntent(side=screen_side)
+        return (
+            ScreenIntent(side=screen_side),
+            RoutingTrace(layer="layer1", intent="screen", confidence=1.0),
+        )
 
     if not mentioned and _SCAN_INTENT_RE.search(cleaned):
         if explicit_tf is not None:
-            return ScanIntent(timeframe=explicit_tf)
-        return ScanIntent(
-            timeframe=new_query_tf,
-            timeframes=MULTI_STYLE_SCAN_TIMEFRAMES,
+            return (
+                ScanIntent(timeframe=explicit_tf),
+                RoutingTrace(layer="layer1", intent="scan", confidence=1.0),
+            )
+        return (
+            ScanIntent(
+                timeframe=new_query_tf,
+                timeframes=MULTI_STYLE_SCAN_TIMEFRAMES,
+            ),
+            RoutingTrace(layer="layer1", intent="scan", confidence=1.0),
         )
 
     addr_match = _WALLET_ADDRESS_RE.search(cleaned)
     if addr_match is not None:
         extracted_addr = addr_match.group(1)
         if re.search(r"\b(?:tambah|add)\b", cleaned, re.IGNORECASE):
-            return WhaleIntent(action=WhaleAction.ADD, address=extracted_addr, label="User Tracked")
+            return (
+                WhaleIntent(action=WhaleAction.ADD, address=extracted_addr, label="User Tracked"),
+                RoutingTrace(layer="layer1", intent="whale", confidence=1.0),
+            )
         if re.search(r"\b(?:hapus|remove|delete)\b", cleaned, re.IGNORECASE):
-            return WhaleIntent(action=WhaleAction.REMOVE, address=extracted_addr)
-        return WhaleIntent(action=WhaleAction.WALLET, address=extracted_addr)
+            return (
+                WhaleIntent(action=WhaleAction.REMOVE, address=extracted_addr),
+                RoutingTrace(layer="layer1", intent="whale", confidence=1.0),
+            )
+        return (
+            WhaleIntent(action=WhaleAction.WALLET, address=extracted_addr),
+            RoutingTrace(layer="layer1", intent="whale", confidence=1.0),
+        )
 
     if _WHALE_INTENT_RE.search(cleaned):
         if re.search(r"\b(?:list|daftar|watchlist)\b", cleaned, re.IGNORECASE):
-            return WhaleIntent(action=WhaleAction.LIST)
+            return (
+                WhaleIntent(action=WhaleAction.LIST),
+                RoutingTrace(layer="layer1", intent="whale", confidence=1.0),
+            )
         target_sym = mentioned[0] if mentioned else (recent_symbols[0] if recent_symbols else "BTC")
-        return WhaleIntent(action=WhaleAction.OVERVIEW, symbol=target_sym)
+        return (
+            WhaleIntent(action=WhaleAction.OVERVIEW, symbol=target_sym),
+            RoutingTrace(
+                layer="layer1",
+                detected_symbol=target_sym,
+                intent="whale",
+                confidence=1.0,
+            ),
+        )
 
     if is_pine:
         if mentioned:
-            return PineIntent(symbol=mentioned[0], timeframe=new_query_tf)
+            return (
+                PineIntent(symbol=mentioned[0], timeframe=new_query_tf),
+                RoutingTrace(
+                    layer="layer1",
+                    detected_symbol=mentioned[0],
+                    intent="pine",
+                    confidence=1.0,
+                ),
+            )
         if recent_symbols:
-            return PineIntent(symbol=recent_symbols[0], timeframe=followup_tf)
+            return (
+                PineIntent(symbol=recent_symbols[0], timeframe=followup_tf),
+                RoutingTrace(
+                    layer="layer1",
+                    detected_symbol=recent_symbols[0],
+                    intent="pine",
+                    confidence=1.0,
+                ),
+            )
 
     if len(mentioned) >= 2:
-        return CompareIntent(symbols=tuple(mentioned[:3]), timeframe=new_query_tf)
+        syms = tuple(mentioned[:3])
+        return (
+            CompareIntent(symbols=syms, timeframe=new_query_tf),
+            RoutingTrace(
+                layer="layer1",
+                detected_symbol=",".join(syms),
+                intent="compare",
+                confidence=1.0,
+            ),
+        )
 
     if len(mentioned) == 1:
         if is_compare and recent_symbols:
             prior = next((sym for sym in recent_symbols if sym != mentioned[0]), None)
             if prior is not None:
-                return CompareIntent(symbols=(prior, mentioned[0]), timeframe=followup_tf)
-        return AnalyzeIntent(symbol=mentioned[0], timeframe=new_query_tf, detail=is_detail)
+                syms = (prior, mentioned[0])
+                return (
+                    CompareIntent(symbols=syms, timeframe=followup_tf),
+                    RoutingTrace(
+                        layer="layer1",
+                        detected_symbol=",".join(syms),
+                        intent="compare",
+                        confidence=1.0,
+                    ),
+                )
+        return (
+            AnalyzeIntent(symbol=mentioned[0], timeframe=new_query_tf, detail=is_detail),
+            RoutingTrace(
+                layer="layer1",
+                detected_symbol=mentioned[0],
+                intent="analyze_detail" if is_detail else "analyze",
+                confidence=1.0,
+            ),
+        )
 
     if (
         recent_symbols
@@ -907,14 +1029,54 @@ def resolve_followup_intent(
         and _CONCEPTUAL_QA_RE.search(cleaned) is None
     ):
         if is_compare and len(recent_symbols) >= 2:
-            return CompareIntent(symbols=tuple(recent_symbols[:2]), timeframe=followup_tf)
-        return AnalyzeIntent(symbol=recent_symbols[0], timeframe=followup_tf, detail=is_detail)
+            syms = tuple(recent_symbols[:2])
+            return (
+                CompareIntent(symbols=syms, timeframe=followup_tf),
+                RoutingTrace(
+                    layer="layer1",
+                    detected_symbol=",".join(syms),
+                    intent="compare",
+                    confidence=1.0,
+                ),
+            )
+        return (
+            AnalyzeIntent(symbol=recent_symbols[0], timeframe=followup_tf, detail=is_detail),
+            RoutingTrace(
+                layer="layer1",
+                detected_symbol=recent_symbols[0],
+                intent="analyze_detail" if is_detail else "analyze",
+                confidence=1.0,
+            ),
+        )
 
-    return RefusalIntent(
-        message=(
-            "Saya belum dapat menentukan simbol atau perintah yang dimaksud. "
-            "Cukup sebutkan koinnya (mis. 'analisa BTC sekarang'), tanya "
-            "'ada token yang bisa disetup gak?', atau ketik /help."
+    return (
+        RefusalIntent(
+            message=(
+                "Saya belum dapat menentukan simbol atau perintah yang dimaksud. "
+                "Cukup sebutkan koinnya (mis. 'analisa BTC sekarang'), tanya "
+                "'ada token yang bisa disetup gak?', atau ketik /help."
+            ),
+            is_hard_refusal=False,
         ),
-        is_hard_refusal=False,
+        RoutingTrace(
+            layer="layer1",
+            intent="refusal_soft",
+            confidence=0.0,
+            fallback_reason="layer1_unmatched",
+        ),
     )
+
+
+def resolve_followup_intent(
+    text: str,
+    *,
+    recent_messages: Sequence[StoredMessage],
+    default_timeframe: Timeframe = Timeframe.H4,
+) -> FollowupIntent:
+    """Resolve a bounded natural-language message into an explicit backend analysis intent."""
+    intent, _ = resolve_followup_intent_with_trace(
+        text,
+        recent_messages=recent_messages,
+        default_timeframe=default_timeframe,
+    )
+    return intent

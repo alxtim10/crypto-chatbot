@@ -19,6 +19,19 @@ class NarrationStatus(StrEnum):
     SKIPPED = "skipped"
 
 
+class RoutingTrace(BaseModel):
+    """PII-free routing and fallback telemetry attached to `llm_interactions`."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    layer: str | None = None
+    detected_symbol: str | None = None
+    intent: str | None = None
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    fallback_reason: str | None = None
+    guard_violations: tuple[str, ...] = ()
+
+
 class LlmAnalysisNarration(BaseModel):
     """Structured Gemini output. Regime/prices come only from backend; numbers via `{F<n>}`."""
 

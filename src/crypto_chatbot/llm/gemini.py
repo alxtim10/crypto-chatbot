@@ -195,6 +195,33 @@ class ConversationalAnswer(BaseModel):
     answer: str = Field(min_length=1, max_length=2500)
 
 
+class IntentClassificationOutcome(BaseModel):
+    """Diagnostic wrapper around `NlpIntentClassification` for routing trace logging."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    classification: NlpIntentClassification | None = None
+    failure_reason: str | None = None
+    model_id: str
+    latency_ms: int = Field(ge=0)
+    prompt_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
+
+
+class ConversationalQaOutcome(BaseModel):
+    """Diagnostic wrapper around `ConversationalAnswer` for routing trace logging."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    answer: str | None = None
+    failure_reason: str | None = None
+    guard_violations: tuple[str, ...] = ()
+    model_id: str
+    latency_ms: int = Field(ge=0)
+    prompt_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
+
+
 class NarrationOutcome(BaseModel):
     """Full audit outcome of narrating an `AnalysisSnapshot` with Gemini."""
 
@@ -390,20 +417,33 @@ class GeminiNarrator:
             output_tokens=output_tokens,
         )
 
-    async def classify_intent(
+    async def classify_intent_with_diagnostics(
         self,
         text: str,
         *,
         user_id: int | str = "anonymous",
         recent_symbols: Sequence[str] = (),
-    ) -> NlpIntentClassification | None:
-        """Classify natural-language chat intent into structured backend routing metadata."""
+    ) -> IntentClassificationOutcome:
+        """Classify natural-language chat intent and return failure/token diagnostics."""
+        started = time.monotonic()
+
+        def _elapsed() -> int:
+            return max(0, int((time.monotonic() - started) * 1000))
+
         if not text.strip():
-            return None
+            return IntentClassificationOutcome(
+                failure_reason="empty_input",
+                model_id=self._model,
+                latency_ms=_elapsed(),
+            )
         if self._quota_tracker is not None:
-            allowed, _ = self._quota_tracker.try_consume(user_id)
+            allowed, cap_reason = self._quota_tracker.try_consume(user_id)
             if not allowed:
-                return None
+                return IntentClassificationOutcome(
+                    failure_reason=cap_reason or "quota_exceeded",
+                    model_id=self._model,
+                    latency_ms=_elapsed(),
+                )
 
         payload = json.dumps(
             {
@@ -412,6 +452,9 @@ class GeminiNarrator:
             },
             ensure_ascii=False,
         )
+        resolved_model = self._model
+        prompt_tokens: int | None = None
+        output_tokens: int | None = None
         try:
             raw = await asyncio.wait_for(
                 self._transport.generate_json(
@@ -424,34 +467,103 @@ class GeminiNarrator:
                 ),
                 timeout=self._timeout_seconds,
             )
+            resolved_model = raw.model_version or self._model
+            prompt_tokens = raw.prompt_tokens
+            output_tokens = raw.output_tokens
             if not raw.text or not raw.text.strip():
-                return None
+                return IntentClassificationOutcome(
+                    failure_reason="empty_response",
+                    model_id=resolved_model,
+                    latency_ms=_elapsed(),
+                    prompt_tokens=prompt_tokens,
+                    output_tokens=output_tokens,
+                )
             raw_obj = json.loads(raw.text)
             if isinstance(raw_obj, dict):
                 if isinstance(raw_obj.get("timeframe"), str):
                     raw_obj["timeframe"] = raw_obj["timeframe"].strip().lower() or None
                 if isinstance(raw_obj.get("screen_side"), str):
                     raw_obj["screen_side"] = raw_obj["screen_side"].strip().lower() or None
-                return NlpIntentClassification.model_validate(raw_obj)
-            return NlpIntentClassification.model_validate_json(raw.text)
+                classified = NlpIntentClassification.model_validate(raw_obj)
+            else:
+                classified = NlpIntentClassification.model_validate_json(raw.text)
+            return IntentClassificationOutcome(
+                classification=classified,
+                model_id=resolved_model,
+                latency_ms=_elapsed(),
+                prompt_tokens=prompt_tokens,
+                output_tokens=output_tokens,
+            )
+        except TimeoutError:
+            logger.debug("Gemini classify_intent fallback: timeout")
+            return IntentClassificationOutcome(
+                failure_reason="timeout",
+                model_id=resolved_model,
+                latency_ms=_elapsed(),
+                prompt_tokens=prompt_tokens,
+                output_tokens=output_tokens,
+            )
+        except (json.JSONDecodeError, ValidationError, ValueError) as exc:
+            logger.debug("Gemini classify_intent fallback: %s", exc)
+            return IntentClassificationOutcome(
+                failure_reason="invalid_json_or_schema",
+                model_id=resolved_model,
+                latency_ms=_elapsed(),
+                prompt_tokens=prompt_tokens,
+                output_tokens=output_tokens,
+            )
         except Exception as exc:
             logger.debug("Gemini classify_intent fallback: %s", exc)
-            return None
+            return IntentClassificationOutcome(
+                failure_reason=f"error:{type(exc).__name__}",
+                model_id=resolved_model,
+                latency_ms=_elapsed(),
+                prompt_tokens=prompt_tokens,
+                output_tokens=output_tokens,
+            )
 
-    async def answer_research_question(
+    async def classify_intent(
+        self,
+        text: str,
+        *,
+        user_id: int | str = "anonymous",
+        recent_symbols: Sequence[str] = (),
+    ) -> NlpIntentClassification | None:
+        """Classify natural-language chat intent into structured backend routing metadata."""
+        outcome = await self.classify_intent_with_diagnostics(
+            text,
+            user_id=user_id,
+            recent_symbols=recent_symbols,
+        )
+        return outcome.classification
+
+    async def answer_research_question_with_diagnostics(
         self,
         question: str,
         *,
         user_id: int | str = "anonymous",
         user_context: str | None = None,
-    ) -> str | None:
-        """Answer an educational or contextual follow-up question safely."""
+    ) -> ConversationalQaOutcome:
+        """Answer an educational or contextual follow-up question and return diagnostics."""
+        started = time.monotonic()
+
+        def _elapsed() -> int:
+            return max(0, int((time.monotonic() - started) * 1000))
+
         if not question.strip():
-            return None
+            return ConversationalQaOutcome(
+                failure_reason="empty_input",
+                model_id=self._model,
+                latency_ms=_elapsed(),
+            )
         if self._quota_tracker is not None:
-            allowed, _ = self._quota_tracker.try_consume(user_id)
+            allowed, cap_reason = self._quota_tracker.try_consume(user_id)
             if not allowed:
-                return None
+                return ConversationalQaOutcome(
+                    failure_reason=cap_reason or "quota_exceeded",
+                    model_id=self._model,
+                    latency_ms=_elapsed(),
+                )
 
         context_block = (
             f"<untrusted_data>\n{sanitize_untrusted_text(user_context)}\n</untrusted_data>"
@@ -463,6 +575,9 @@ class GeminiNarrator:
             f"Konteks percakapan sebelumnya:\n{context_block}\n\n"
             f"Pertanyaan pengguna:\n<untrusted_data>{safe_q}</untrusted_data>"
         )
+        resolved_model = self._model
+        prompt_tokens: int | None = None
+        output_tokens: int | None = None
         try:
             raw = await asyncio.wait_for(
                 self._transport.generate_json(
@@ -475,8 +590,17 @@ class GeminiNarrator:
                 ),
                 timeout=self._timeout_seconds,
             )
+            resolved_model = raw.model_version or self._model
+            prompt_tokens = raw.prompt_tokens
+            output_tokens = raw.output_tokens
             if not raw.text or not raw.text.strip():
-                return None
+                return ConversationalQaOutcome(
+                    failure_reason="empty_response",
+                    model_id=resolved_model,
+                    latency_ms=_elapsed(),
+                    prompt_tokens=prompt_tokens,
+                    output_tokens=output_tokens,
+                )
             parsed = ConversationalAnswer.model_validate_json(raw.text)
             answer = parsed.answer.strip()
             guard = validate_conversational_answer(answer)
@@ -486,7 +610,57 @@ class GeminiNarrator:
                     user_id,
                     ",".join(guard.reasons),
                 )
-                return None
-            return answer
-        except Exception:
-            return None
+                return ConversationalQaOutcome(
+                    failure_reason="guard_rejected",
+                    guard_violations=guard.reasons,
+                    model_id=resolved_model,
+                    latency_ms=_elapsed(),
+                    prompt_tokens=prompt_tokens,
+                    output_tokens=output_tokens,
+                )
+            return ConversationalQaOutcome(
+                answer=answer,
+                model_id=resolved_model,
+                latency_ms=_elapsed(),
+                prompt_tokens=prompt_tokens,
+                output_tokens=output_tokens,
+            )
+        except TimeoutError:
+            return ConversationalQaOutcome(
+                failure_reason="timeout",
+                model_id=resolved_model,
+                latency_ms=_elapsed(),
+                prompt_tokens=prompt_tokens,
+                output_tokens=output_tokens,
+            )
+        except (ValidationError, ValueError):
+            return ConversationalQaOutcome(
+                failure_reason="invalid_json_or_schema",
+                model_id=resolved_model,
+                latency_ms=_elapsed(),
+                prompt_tokens=prompt_tokens,
+                output_tokens=output_tokens,
+            )
+        except Exception as exc:
+            return ConversationalQaOutcome(
+                failure_reason=f"error:{type(exc).__name__}",
+                model_id=resolved_model,
+                latency_ms=_elapsed(),
+                prompt_tokens=prompt_tokens,
+                output_tokens=output_tokens,
+            )
+
+    async def answer_research_question(
+        self,
+        question: str,
+        *,
+        user_id: int | str = "anonymous",
+        user_context: str | None = None,
+    ) -> str | None:
+        """Answer an educational or contextual follow-up question safely."""
+        outcome = await self.answer_research_question_with_diagnostics(
+            question,
+            user_id=user_id,
+            user_context=user_context,
+        )
+        return outcome.answer

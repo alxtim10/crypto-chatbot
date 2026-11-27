@@ -98,13 +98,13 @@ class StoredMessage(BaseModel):
 
 
 class LlmInteractionRecord(BaseModel):
-    """Audit record for a single Gemini narration attempt."""
+    """Audit record for a single Gemini narration or routing trace event."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     telegram_user_id: int
     request_id: str
-    snapshot_id: str
+    snapshot_id: str | None = None
     model_id: str
     prompt_version: str
     validation_passed: bool
@@ -112,6 +112,12 @@ class LlmInteractionRecord(BaseModel):
     prompt_tokens: int | None = Field(default=None, ge=0)
     output_tokens: int | None = Field(default=None, ge=0)
     latency_ms: int = Field(ge=0)
+    layer: str | None = None
+    detected_symbol: str | None = None
+    intent: str | None = None
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    fallback_reason: str | None = None
+    guard_violations: tuple[str, ...] = ()
     created_at: UtcDatetime | None = None
 
 
@@ -713,6 +719,12 @@ class PostgresUserMemoryRepository:
                 prompt_tokens=record.prompt_tokens,
                 output_tokens=record.output_tokens,
                 latency_ms=record.latency_ms,
+                layer=record.layer,
+                detected_symbol=record.detected_symbol,
+                intent=record.intent,
+                confidence=record.confidence,
+                fallback_reason=record.fallback_reason,
+                guard_violations=list(record.guard_violations),
                 created_at=ts,
             )
             session.add(row)

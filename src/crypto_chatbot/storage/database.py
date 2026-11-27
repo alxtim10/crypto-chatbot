@@ -27,3 +27,33 @@ def init_db(engine: Engine) -> None:
         conn.execute(
             text("ALTER TABLE trade_setups ADD COLUMN IF NOT EXISTS market_type VARCHAR(16);")
         )
+        conn.execute(text("ALTER TABLE llm_interactions ALTER COLUMN snapshot_id DROP NOT NULL;"))
+        conn.execute(
+            text("ALTER TABLE llm_interactions ADD COLUMN IF NOT EXISTS layer VARCHAR(32);")
+        )
+        conn.execute(
+            text(
+                "ALTER TABLE llm_interactions "
+                "ADD COLUMN IF NOT EXISTS detected_symbol VARCHAR(128);"
+            )
+        )
+        conn.execute(
+            text("ALTER TABLE llm_interactions ADD COLUMN IF NOT EXISTS intent VARCHAR(64);")
+        )
+        conn.execute(
+            text(
+                "ALTER TABLE llm_interactions ADD COLUMN IF NOT EXISTS confidence DOUBLE PRECISION;"
+            )
+        )
+        conn.execute(
+            text(
+                "ALTER TABLE llm_interactions "
+                "ADD COLUMN IF NOT EXISTS fallback_reason VARCHAR(128);"
+            )
+        )
+        conn.execute(
+            text(
+                "ALTER TABLE llm_interactions "
+                "ADD COLUMN IF NOT EXISTS guard_violations JSONB NOT NULL DEFAULT '[]'::jsonb;"
+            )
+        )

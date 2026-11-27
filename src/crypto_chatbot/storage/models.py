@@ -193,7 +193,7 @@ class LlmInteractionRow(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     telegram_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
     request_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
-    snapshot_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    snapshot_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     model_id: Mapped[str] = mapped_column(String(128), nullable=False)
     prompt_version: Mapped[str] = mapped_column(String(32), nullable=False)
     validation_passed: Mapped[bool] = mapped_column(Boolean, nullable=False)
@@ -201,6 +201,12 @@ class LlmInteractionRow(Base):
     prompt_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     latency_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    layer: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    detected_symbol: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    intent: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    confidence: Mapped[float | None] = mapped_column(Double, nullable=True)
+    fallback_reason: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    guard_violations: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

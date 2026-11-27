@@ -7,9 +7,10 @@ from typing import Literal, Protocol, runtime_checkable
 
 from crypto_chatbot.llm.gemini import NarrationOutcome
 from crypto_chatbot.llm.guard import validate_narration
+from crypto_chatbot.llm.prompts import PROMPT_VERSION
 from crypto_chatbot.market_data.symbols import resolve_default_perp_symbol
 from crypto_chatbot.schemas.analysis import AnalysisSnapshot
-from crypto_chatbot.schemas.llm import LlmAnalysisNarration
+from crypto_chatbot.schemas.llm import LlmAnalysisNarration, RoutingTrace
 from crypto_chatbot.storage.repositories import (
     ForgetResult,
     LlmInteractionRecord,
@@ -182,6 +183,7 @@ class MemoryService:
         user_id: int,
         request_id: str,
         outcome: NarrationOutcome,
+        routing_trace: RoutingTrace | None = None,
     ) -> None:
         self._repository.record_llm_interaction(
             LlmInteractionRecord(
@@ -195,6 +197,55 @@ class MemoryService:
                 prompt_tokens=outcome.prompt_tokens,
                 output_tokens=outcome.output_tokens,
                 latency_ms=outcome.latency_ms,
+                layer=routing_trace.layer if routing_trace is not None else None,
+                detected_symbol=(
+                    routing_trace.detected_symbol if routing_trace is not None else None
+                ),
+                intent=routing_trace.intent if routing_trace is not None else None,
+                confidence=routing_trace.confidence if routing_trace is not None else None,
+                fallback_reason=(
+                    routing_trace.fallback_reason if routing_trace is not None else None
+                ),
+                guard_violations=(
+                    routing_trace.guard_violations if routing_trace is not None else ()
+                ),
+            )
+        )
+
+    def record_routing_trace(
+        self,
+        *,
+        user_id: int,
+        request_id: str,
+        trace: RoutingTrace,
+        model_id: str = "deterministic",
+        prompt_version: str = PROMPT_VERSION,
+        validation_passed: bool = True,
+        rejection_reasons: tuple[str, ...] = (),
+        latency_ms: int = 0,
+        prompt_tokens: int | None = None,
+        output_tokens: int | None = None,
+        snapshot_id: str | None = None,
+    ) -> None:
+        """Persist PII-free routing trace telemetry in `llm_interactions`."""
+        self._repository.record_llm_interaction(
+            LlmInteractionRecord(
+                telegram_user_id=user_id,
+                request_id=request_id,
+                snapshot_id=snapshot_id,
+                model_id=model_id,
+                prompt_version=prompt_version,
+                validation_passed=validation_passed,
+                rejection_reasons=rejection_reasons,
+                prompt_tokens=prompt_tokens,
+                output_tokens=output_tokens,
+                latency_ms=latency_ms,
+                layer=trace.layer,
+                detected_symbol=trace.detected_symbol,
+                intent=trace.intent,
+                confidence=trace.confidence,
+                fallback_reason=trace.fallback_reason,
+                guard_violations=trace.guard_violations,
             )
         )
 

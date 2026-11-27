@@ -51,7 +51,7 @@ from crypto_chatbot.bot.commands import (
     parse_compare_args,
     parse_watchlist_args,
     parse_whale_args,
-    resolve_followup_intent,
+    resolve_followup_intent_with_trace,
 )
 from crypto_chatbot.bot.templates import (
     TELEGRAM_MAX_MESSAGE_LENGTH,
@@ -62,7 +62,7 @@ from crypto_chatbot.bot.templates import (
     render_watchlist_message,
     split_telegram_message,
 )
-from crypto_chatbot.llm.gemini import GeminiNarrator
+from crypto_chatbot.llm.gemini import GeminiNarrator, IntentClassificationOutcome
 from crypto_chatbot.llm.guard import validate_conversational_answer
 from crypto_chatbot.llm.render import render_analysis_response, render_comparison_response
 from crypto_chatbot.market_data.symbols import resolve_default_perp_symbol
@@ -70,7 +70,7 @@ from crypto_chatbot.market_data.whale_provider import WhaleDataProvider
 from crypto_chatbot.memory.service import MemoryService
 from crypto_chatbot.ops.logging import SecretRedactingFilter as SecretRedactingFilter
 from crypto_chatbot.schemas.commands import WatchlistAction, WhaleAction
-from crypto_chatbot.schemas.llm import AnalysisResponse
+from crypto_chatbot.schemas.llm import AnalysisResponse, RoutingTrace
 from crypto_chatbot.schemas.market import (
     MULTI_STYLE_SCAN_TIMEFRAMES,
     QualityStatus,
@@ -214,6 +214,12 @@ class BotService:
                 timeframe=parsed.timeframe,
                 user_text=user_text,
                 compact=not parsed.detail,
+                routing_trace=RoutingTrace(
+                    layer="command",
+                    detected_symbol=parsed.symbol,
+                    intent="analyze_detail" if parsed.detail else "analyze",
+                    confidence=1.0,
+                ),
             )
         except CommandParseError as exc:
             return split_telegram_message(
@@ -246,6 +252,12 @@ class BotService:
                 symbols=parsed.symbols,
                 timeframe=parsed.timeframe,
                 user_text=user_text,
+                routing_trace=RoutingTrace(
+                    layer="command",
+                    detected_symbol=",".join(parsed.symbols),
+                    intent="compare",
+                    confidence=1.0,
+                ),
             )
         except CommandParseError as exc:
             return split_telegram_message(
@@ -423,12 +435,36 @@ class BotService:
         *,
         symbol: str,
         timeframe: Timeframe,
+        user_id: int | None = None,
+        request_id: str | None = None,
+        routing_trace: RoutingTrace | None = None,
     ) -> tuple[str, ...]:
         snapshot = await self._analysis_service.analyze(symbol, timeframe)
         if snapshot.quality_status is QualityStatus.INSUFFICIENT_DATA:
+            if user_id is not None and request_id is not None and routing_trace is not None:
+                enriched = routing_trace.model_copy(
+                    update={"fallback_reason": "snapshot_insufficient_data"}
+                )
+                await asyncio.to_thread(
+                    self._memory.record_routing_trace,
+                    user_id=user_id,
+                    request_id=request_id,
+                    trace=enriched,
+                    validation_passed=False,
+                    rejection_reasons=("snapshot_insufficient_data",),
+                    snapshot_id=snapshot.snapshot_id,
+                )
             return (
                 f"Data tidak mencukupi (INSUFFICIENT_DATA) untuk membuat Pine Script "
                 f"{html.escape(snapshot.canonical_symbol)} ({snapshot.timeframe.value}).",
+            )
+        if user_id is not None and request_id is not None and routing_trace is not None:
+            await asyncio.to_thread(
+                self._memory.record_routing_trace,
+                user_id=user_id,
+                request_id=request_id,
+                trace=routing_trace,
+                snapshot_id=snapshot.snapshot_id,
             )
 
         pine_code = generate_pine_script(snapshot)
@@ -714,6 +750,20 @@ class BotService:
             "Gunakan /help untuk melihat daftar perintah.",
         )
 
+    @staticmethod
+    def _log_routing_trace(request_id: str, trace: RoutingTrace) -> None:
+        logger.info(
+            "routing_trace request_id=%s layer=%s intent=%s detected_symbol=%s "
+            "confidence=%s fallback_reason=%s guard_violations=%s",
+            request_id,
+            trace.layer,
+            trace.intent,
+            trace.detected_symbol,
+            trace.confidence,
+            trace.fallback_reason,
+            ",".join(trace.guard_violations) if trace.guard_violations else "none",
+        )
+
     async def handle_text_message(
         self,
         user_id: int | None,
@@ -727,13 +777,14 @@ class BotService:
         try:
             prefs = await asyncio.to_thread(self._memory.get_preferences, user_id)
             recent = await asyncio.to_thread(self._memory.get_recent_messages, user_id)
-            intent = resolve_followup_intent(
+            intent, trace = resolve_followup_intent_with_trace(
                 text,
                 recent_messages=recent,
                 default_timeframe=prefs.default_timeframe,
             )
+            cls_outcome: IntentClassificationOutcome | None = None
             if isinstance(intent, RefusalIntent) and not intent.is_hard_refusal:
-                intent = await self._resolve_via_llm_fallback(
+                intent, trace, cls_outcome = await self._resolve_via_llm_fallback_with_trace(
                     text=text,
                     user_id=user_id,
                     recent_messages=recent,
@@ -742,14 +793,49 @@ class BotService:
                 )
 
             if isinstance(intent, RefusalIntent):
+                self._log_routing_trace(request_id, trace)
+                await asyncio.to_thread(
+                    self._memory.record_routing_trace,
+                    user_id=user_id,
+                    request_id=request_id,
+                    trace=trace,
+                    model_id=cls_outcome.model_id if cls_outcome is not None else "deterministic",
+                    validation_passed=False,
+                    rejection_reasons=(trace.fallback_reason,) if trace.fallback_reason else (),
+                    prompt_tokens=cls_outcome.prompt_tokens if cls_outcome is not None else None,
+                    output_tokens=cls_outcome.output_tokens if cls_outcome is not None else None,
+                    latency_ms=cls_outcome.latency_ms if cls_outcome is not None else 0,
+                )
                 return (html.escape(intent.message, quote=False),)
             if isinstance(intent, WhaleIntent):
+                self._log_routing_trace(request_id, trace)
+                await asyncio.to_thread(
+                    self._memory.record_routing_trace,
+                    user_id=user_id,
+                    request_id=request_id,
+                    trace=trace,
+                    model_id=cls_outcome.model_id if cls_outcome is not None else "deterministic",
+                    prompt_tokens=cls_outcome.prompt_tokens if cls_outcome is not None else None,
+                    output_tokens=cls_outcome.output_tokens if cls_outcome is not None else None,
+                    latency_ms=cls_outcome.latency_ms if cls_outcome is not None else 0,
+                )
                 return await self._execute_whale(
                     user_id=user_id,
                     request_id=request_id,
                     intent=intent,
                 )
             if isinstance(intent, ScreenIntent):
+                self._log_routing_trace(request_id, trace)
+                await asyncio.to_thread(
+                    self._memory.record_routing_trace,
+                    user_id=user_id,
+                    request_id=request_id,
+                    trace=trace,
+                    model_id=cls_outcome.model_id if cls_outcome is not None else "deterministic",
+                    prompt_tokens=cls_outcome.prompt_tokens if cls_outcome is not None else None,
+                    output_tokens=cls_outcome.output_tokens if cls_outcome is not None else None,
+                    latency_ms=cls_outcome.latency_ms if cls_outcome is not None else 0,
+                )
                 try:
                     return await self._execute_screen(
                         user_id=user_id,
@@ -761,6 +847,17 @@ class BotService:
                 except ValueError as exc:
                     return (html.escape(str(exc), quote=False),)
             if isinstance(intent, ScanIntent):
+                self._log_routing_trace(request_id, trace)
+                await asyncio.to_thread(
+                    self._memory.record_routing_trace,
+                    user_id=user_id,
+                    request_id=request_id,
+                    trace=trace,
+                    model_id=cls_outcome.model_id if cls_outcome is not None else "deterministic",
+                    prompt_tokens=cls_outcome.prompt_tokens if cls_outcome is not None else None,
+                    output_tokens=cls_outcome.output_tokens if cls_outcome is not None else None,
+                    latency_ms=cls_outcome.latency_ms if cls_outcome is not None else 0,
+                )
                 return await self._execute_scan(
                     user_id=user_id,
                     request_id=request_id,
@@ -771,9 +868,13 @@ class BotService:
                     user_text=text,
                 )
             if isinstance(intent, PineIntent):
+                self._log_routing_trace(request_id, trace)
                 return await self._execute_pine(
                     symbol=intent.symbol,
                     timeframe=intent.timeframe,
+                    user_id=user_id,
+                    request_id=request_id,
+                    routing_trace=trace,
                 )
             if isinstance(intent, AnalyzeIntent):
                 return await self._execute_single_analysis(
@@ -783,6 +884,7 @@ class BotService:
                     timeframe=intent.timeframe,
                     user_text=text,
                     compact=not intent.detail,
+                    routing_trace=trace,
                 )
             if isinstance(intent, CompareIntent):
                 return await self._execute_comparison(
@@ -791,12 +893,14 @@ class BotService:
                     symbols=intent.symbols,
                     timeframe=intent.timeframe,
                     user_text=text,
+                    routing_trace=trace,
                 )
             if isinstance(intent, ChatQaIntent):
                 return await self._execute_chat_qa(
                     user_id=user_id,
                     request_id=request_id,
                     question=intent.question,
+                    routing_trace=trace,
                 )
             return ("Permintaan tidak dapat diproses. Gunakan /help.",)  # pragma: no cover
         except SQLAlchemyError:
@@ -823,37 +927,110 @@ class BotService:
         | ChatQaIntent
         | RefusalIntent
     ):
+        intent, _, _ = await self._resolve_via_llm_fallback_with_trace(
+            text=text,
+            user_id=user_id,
+            recent_messages=recent_messages,
+            default_timeframe=default_timeframe,
+            fallback_refusal=fallback_refusal,
+        )
+        return intent
+
+    async def _resolve_via_llm_fallback_with_trace(
+        self,
+        *,
+        text: str,
+        user_id: int,
+        recent_messages: Sequence[Any],
+        default_timeframe: Timeframe,
+        fallback_refusal: RefusalIntent,
+    ) -> tuple[
+        AnalyzeIntent
+        | CompareIntent
+        | PineIntent
+        | ScanIntent
+        | ScreenIntent
+        | WhaleIntent
+        | ChatQaIntent
+        | RefusalIntent,
+        RoutingTrace,
+        IntentClassificationOutcome,
+    ]:
+        del fallback_refusal
         recent_syms, recent_tf = _extract_recent_context(recent_messages, default_timeframe)
-        classified = await self._narrator.classify_intent(
+        cls_outcome = await self._narrator.classify_intent_with_diagnostics(
             text,
             user_id=user_id,
             recent_symbols=recent_syms,
         )
+        classified = cls_outcome.classification
         if classified is None:
-            return ChatQaIntent(question=text.strip())
-        if classified.intent == "unsupported":
-            return RefusalIntent(
-                message=(
-                    "Bot ini adalah asisten riset dan edukasi kripto. Eksekusi order langsung, "
-                    "perintah beli/jual wajib, jaminan profit, atau alokasi modal pribadi "
-                    "berada di luar cakupan layanan."
+            return (
+                ChatQaIntent(question=text.strip()),
+                RoutingTrace(
+                    layer="layer2_fallback",
+                    intent="chat_qa",
+                    confidence=0.0,
+                    fallback_reason=f"classifier_{cls_outcome.failure_reason or 'failed'}",
                 ),
-                is_hard_refusal=True,
+                cls_outcome,
+            )
+        if classified.intent == "unsupported":
+            return (
+                RefusalIntent(
+                    message=(
+                        "Bot ini adalah asisten riset dan edukasi kripto. Eksekusi order langsung, "
+                        "perintah beli/jual wajib, jaminan profit, atau alokasi modal pribadi "
+                        "berada di luar cakupan layanan."
+                    ),
+                    is_hard_refusal=True,
+                ),
+                RoutingTrace(
+                    layer="layer2",
+                    intent="unsupported",
+                    fallback_reason="classifier_unsupported",
+                ),
+                cls_outcome,
             )
 
         if classified.intent == "whale":
             w_addr = classified.whale_address
             if not w_addr and classified.symbols:
-                return WhaleIntent(action=WhaleAction.OVERVIEW, symbol=classified.symbols[0])
+                return (
+                    WhaleIntent(action=WhaleAction.OVERVIEW, symbol=classified.symbols[0]),
+                    RoutingTrace(
+                        layer="layer2",
+                        detected_symbol=classified.symbols[0],
+                        intent="whale",
+                    ),
+                    cls_outcome,
+                )
             if w_addr:
-                return WhaleIntent(action=WhaleAction.WALLET, address=w_addr)
-            return WhaleIntent(
-                action=WhaleAction(classified.whale_action or "overview"),
-                symbol=classified.symbols[0] if classified.symbols else "BTC",
+                return (
+                    WhaleIntent(action=WhaleAction.WALLET, address=w_addr),
+                    RoutingTrace(layer="layer2", intent="whale"),
+                    cls_outcome,
+                )
+            target_whale_sym = classified.symbols[0] if classified.symbols else "BTC"
+            return (
+                WhaleIntent(
+                    action=WhaleAction(classified.whale_action or "overview"),
+                    symbol=target_whale_sym,
+                ),
+                RoutingTrace(
+                    layer="layer2",
+                    detected_symbol=target_whale_sym,
+                    intent="whale",
+                ),
+                cls_outcome,
             )
 
         if classified.intent == "screen":
-            return ScreenIntent(side=classified.screen_side or "all")
+            return (
+                ScreenIntent(side=classified.screen_side or "all"),
+                RoutingTrace(layer="layer2", intent="screen"),
+                cls_outcome,
+            )
 
         resolved_cls_tf = (
             resolve_primary_timeframe(classified.timeframe)
@@ -871,10 +1048,20 @@ class BotService:
                 resolved_syms.append(canon)
 
         if classified.intent == "scan":
-            return ScanIntent(
-                timeframe=target_tf,
-                timeframes=(None if resolved_cls_tf is not None else MULTI_STYLE_SCAN_TIMEFRAMES),
-                symbols=tuple(resolved_syms) if resolved_syms else None,
+            return (
+                ScanIntent(
+                    timeframe=target_tf,
+                    timeframes=(
+                        None if resolved_cls_tf is not None else MULTI_STYLE_SCAN_TIMEFRAMES
+                    ),
+                    symbols=tuple(resolved_syms) if resolved_syms else None,
+                ),
+                RoutingTrace(
+                    layer="layer2",
+                    detected_symbol=",".join(resolved_syms) if resolved_syms else None,
+                    intent="scan",
+                ),
+                cls_outcome,
             )
         if classified.intent == "pine":
             target_sym = (
@@ -882,25 +1069,96 @@ class BotService:
             )
             tf = target_tf if classified.timeframe is not None or resolved_syms else recent_tf
             if target_sym is not None:
-                return PineIntent(symbol=target_sym, timeframe=tf)
-            return ChatQaIntent(question=text.strip())
+                return (
+                    PineIntent(symbol=target_sym, timeframe=tf),
+                    RoutingTrace(
+                        layer="layer2",
+                        detected_symbol=target_sym,
+                        intent="pine",
+                    ),
+                    cls_outcome,
+                )
+            return (
+                ChatQaIntent(question=text.strip()),
+                RoutingTrace(
+                    layer="layer2",
+                    intent="chat_qa",
+                    fallback_reason="classifier_missing_symbol_fallback_qa",
+                ),
+                cls_outcome,
+            )
         if classified.intent == "compare":
             if len(resolved_syms) >= 2:
-                return CompareIntent(symbols=tuple(resolved_syms[:3]), timeframe=target_tf)
+                syms = tuple(resolved_syms[:3])
+                return (
+                    CompareIntent(symbols=syms, timeframe=target_tf),
+                    RoutingTrace(
+                        layer="layer2",
+                        detected_symbol=",".join(syms),
+                        intent="compare",
+                    ),
+                    cls_outcome,
+                )
             if len(resolved_syms) == 1 and recent_syms:
                 prior = next((s for s in recent_syms if s != resolved_syms[0]), None)
                 if prior is not None:
-                    return CompareIntent(symbols=(prior, resolved_syms[0]), timeframe=target_tf)
-            return ChatQaIntent(question=text.strip())
+                    syms = (prior, resolved_syms[0])
+                    return (
+                        CompareIntent(symbols=syms, timeframe=target_tf),
+                        RoutingTrace(
+                            layer="layer2",
+                            detected_symbol=",".join(syms),
+                            intent="compare",
+                        ),
+                        cls_outcome,
+                    )
+            return (
+                ChatQaIntent(question=text.strip()),
+                RoutingTrace(
+                    layer="layer2",
+                    detected_symbol=",".join(resolved_syms) if resolved_syms else None,
+                    intent="chat_qa",
+                    fallback_reason="classifier_missing_symbol_fallback_qa",
+                ),
+                cls_outcome,
+            )
         if classified.intent in ("analyze", "analyze_detail"):
             is_detail = classified.intent == "analyze_detail"
             if resolved_syms:
-                return AnalyzeIntent(symbol=resolved_syms[0], timeframe=target_tf, detail=is_detail)
+                return (
+                    AnalyzeIntent(symbol=resolved_syms[0], timeframe=target_tf, detail=is_detail),
+                    RoutingTrace(
+                        layer="layer2",
+                        detected_symbol=resolved_syms[0],
+                        intent=classified.intent,
+                    ),
+                    cls_outcome,
+                )
             if recent_syms:
                 tf = target_tf if classified.timeframe is not None else recent_tf
-                return AnalyzeIntent(symbol=recent_syms[0], timeframe=tf, detail=is_detail)
-            return ChatQaIntent(question=text.strip())
-        return ChatQaIntent(question=text.strip())
+                return (
+                    AnalyzeIntent(symbol=recent_syms[0], timeframe=tf, detail=is_detail),
+                    RoutingTrace(
+                        layer="layer2",
+                        detected_symbol=recent_syms[0],
+                        intent=classified.intent,
+                    ),
+                    cls_outcome,
+                )
+            return (
+                ChatQaIntent(question=text.strip()),
+                RoutingTrace(
+                    layer="layer2",
+                    intent="chat_qa",
+                    fallback_reason="classifier_missing_symbol_fallback_qa",
+                ),
+                cls_outcome,
+            )
+        return (
+            ChatQaIntent(question=text.strip()),
+            RoutingTrace(layer="layer2", intent="chat_qa"),
+            cls_outcome,
+        )
 
     async def _execute_chat_qa(
         self,
@@ -908,22 +1166,68 @@ class BotService:
         user_id: int,
         request_id: str,
         question: str,
+        routing_trace: RoutingTrace | None = None,
     ) -> tuple[str, ...]:
         context = await asyncio.to_thread(
             self._memory.build_context_for_llm, user_id, current_question=question
         )
-        answer = await self._narrator.answer_research_question(
+        qa_outcome = await self._narrator.answer_research_question_with_diagnostics(
             question,
             user_id=user_id,
             user_context=context,
         )
-        if answer is None:
+        base_trace = routing_trace or RoutingTrace(layer="layer2", intent="chat_qa")
+        if qa_outcome.answer is None:
+            qa_reason = qa_outcome.failure_reason or "failed"
+            enriched_trace = base_trace.model_copy(
+                update={
+                    "fallback_reason": (
+                        f"qa_{qa_reason}"
+                        if not base_trace.fallback_reason
+                        else f"{base_trace.fallback_reason}|qa_{qa_reason}"
+                    ),
+                    "guard_violations": qa_outcome.guard_violations,
+                }
+            )
+            self._log_routing_trace(request_id, enriched_trace)
+            await asyncio.to_thread(
+                self._memory.record_routing_trace,
+                user_id=user_id,
+                request_id=request_id,
+                trace=enriched_trace,
+                model_id=qa_outcome.model_id,
+                validation_passed=False,
+                rejection_reasons=qa_outcome.guard_violations or (f"qa_{qa_reason}",),
+                prompt_tokens=qa_outcome.prompt_tokens,
+                output_tokens=qa_outcome.output_tokens,
+                latency_ms=qa_outcome.latency_ms,
+            )
             return (
                 "Maaf, layanan diskusi AI sedang mencapai batas kuota atau sibuk saat ini. "
                 "Anda tetap bisa menyebut nama koin (mis. 'analisa BTC') atau /scan.",
             )
+        answer = qa_outcome.answer
         guard = validate_conversational_answer(answer)
         if not guard.is_valid:
+            enriched_trace = base_trace.model_copy(
+                update={
+                    "fallback_reason": "qa_guard_rejected",
+                    "guard_violations": guard.reasons,
+                }
+            )
+            self._log_routing_trace(request_id, enriched_trace)
+            await asyncio.to_thread(
+                self._memory.record_routing_trace,
+                user_id=user_id,
+                request_id=request_id,
+                trace=enriched_trace,
+                model_id=qa_outcome.model_id,
+                validation_passed=False,
+                rejection_reasons=guard.reasons,
+                prompt_tokens=qa_outcome.prompt_tokens,
+                output_tokens=qa_outcome.output_tokens,
+                latency_ms=qa_outcome.latency_ms,
+            )
             logger.warning(
                 "request_id=%s user_id=%s action=chat_qa guard_rejected=%s",
                 request_id,
@@ -935,6 +1239,18 @@ class BotService:
                 "instruksi eksekusi langsung, atau tautan terlarang). Silakan ajukan pertanyaan "
                 "edukasi lain atau gunakan /analyze BTC.",
             )
+        self._log_routing_trace(request_id, base_trace)
+        await asyncio.to_thread(
+            self._memory.record_routing_trace,
+            user_id=user_id,
+            request_id=request_id,
+            trace=base_trace,
+            model_id=qa_outcome.model_id,
+            validation_passed=True,
+            prompt_tokens=qa_outcome.prompt_tokens,
+            output_tokens=qa_outcome.output_tokens,
+            latency_ms=qa_outcome.latency_ms,
+        )
         await asyncio.to_thread(self._memory.record_user_message, user_id, question)
         await asyncio.to_thread(self._memory.record_assistant_text, user_id, answer)
         logger.info("request_id=%s user_id=%s action=chat_qa", request_id, user_id)
@@ -952,6 +1268,7 @@ class BotService:
         timeframe: Timeframe,
         user_text: str,
         compact: bool = True,
+        routing_trace: RoutingTrace | None = None,
     ) -> tuple[str, ...]:
         context = await asyncio.to_thread(
             self._memory.build_context_for_llm, user_id, current_question=user_text
@@ -962,6 +1279,24 @@ class BotService:
             user_id=user_id,
             user_context=context,
         )
+        trace_to_save = routing_trace
+        if trace_to_save is not None:
+            if snapshot.quality_status is QualityStatus.INSUFFICIENT_DATA:
+                trace_to_save = trace_to_save.model_copy(
+                    update={"fallback_reason": "snapshot_insufficient_data"}
+                )
+            elif not outcome.validation_passed:
+                trace_to_save = trace_to_save.model_copy(
+                    update={
+                        "fallback_reason": (
+                            outcome.rejection_reasons[0]
+                            if outcome.rejection_reasons
+                            else "narration_fallback"
+                        ),
+                        "guard_violations": outcome.rejection_reasons,
+                    }
+                )
+            self._log_routing_trace(request_id, trace_to_save)
         await asyncio.to_thread(self._memory.record_user_message, user_id, user_text)
         await asyncio.to_thread(
             self._memory.record_assistant_turn,
@@ -974,6 +1309,7 @@ class BotService:
             user_id=user_id,
             request_id=request_id,
             outcome=outcome,
+            routing_trace=trace_to_save,
         )
         logger.info(
             "request_id=%s user_id=%s action=analyze snapshot_id=%s quality=%s narration=%s",
@@ -994,6 +1330,7 @@ class BotService:
         symbols: Sequence[str],
         timeframe: Timeframe,
         user_text: str,
+        routing_trace: RoutingTrace | None = None,
     ) -> tuple[str, ...]:
         context = await asyncio.to_thread(
             self._memory.build_context_for_llm, user_id, current_question=user_text
@@ -1008,11 +1345,30 @@ class BotService:
                 user_id=user_id,
                 user_context=context,
             )
+            trace_to_save = routing_trace
+            if trace_to_save is not None:
+                if snap.quality_status is QualityStatus.INSUFFICIENT_DATA:
+                    trace_to_save = trace_to_save.model_copy(
+                        update={"fallback_reason": "snapshot_insufficient_data"}
+                    )
+                elif not outcome.validation_passed:
+                    trace_to_save = trace_to_save.model_copy(
+                        update={
+                            "fallback_reason": (
+                                outcome.rejection_reasons[0]
+                                if outcome.rejection_reasons
+                                else "narration_fallback"
+                            ),
+                            "guard_violations": outcome.rejection_reasons,
+                        }
+                    )
+                self._log_routing_trace(request_id, trace_to_save)
             await asyncio.to_thread(
                 self._memory.record_llm_outcome,
                 user_id=user_id,
                 request_id=request_id,
                 outcome=outcome,
+                routing_trace=trace_to_save,
             )
             logger.info(
                 "request_id=%s user_id=%s action=compare snapshot_id=%s quality=%s narration=%s",
