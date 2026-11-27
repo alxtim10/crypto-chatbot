@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
-from crypto_chatbot.market_data.symbols import resolve_default_perp_symbol
+from crypto_chatbot.market_data.symbols import (
+    AMBIGUOUS_PERP_TICKERS,
+    DEFAULT_PERP_UNIVERSE,
+    resolve_default_perp_symbol,
+)
 from crypto_chatbot.market_data.whale_provider import detect_network_type
 from crypto_chatbot.schemas.commands import (
     AnalyzeCommandArgs,
@@ -80,6 +84,7 @@ _SYMBOL_ALIASES: tuple[tuple[re.Pattern[str], str], ...] = (
 
 _USDT_PAIR_TEXT_RE = re.compile(r"\b([A-Z0-9]{2,12})/USDT\b", re.IGNORECASE)
 _USDT_SUFFIX_TEXT_RE = re.compile(r"\b([A-Z0-9]{2,12})USDT\b", re.IGNORECASE)
+_CASHTAG_TEXT_RE = re.compile(r"(?<!\w)\$([A-Za-z][A-Za-z0-9]{1,11})\b")
 _KOIN_CUE_TEXT_RE = re.compile(
     r"\b(?:koin|coin|token|pair|simbol)\s+([A-Za-z0-9]{2,12})\b",
     re.IGNORECASE,
@@ -250,7 +255,6 @@ _NON_TICKER_ACRONYMS: frozenset[str] = frozenset(
         "BUATKAN",
         "CARI",
         "CARIIN",
-        "ADA",
         "ENAK",
         "SIH",
         "NIH",
@@ -702,30 +706,62 @@ def parse_whale_args(args: Sequence[str]) -> WhaleCommandArgs:
     return WhaleCommandArgs(action=WhaleAction.OVERVIEW, symbol=clean_sym)
 
 
-def _extract_mvp_symbols(text: str) -> list[str]:
+def _in_perp_universe(base: str, universe: frozenset[str]) -> bool:
+    upper = base.upper()
+    return upper in universe or f"1000{upper}" in universe
+
+
+def _extract_mvp_symbols(
+    text: str,
+    *,
+    perp_universe: Collection[str] | None = None,
+) -> list[str]:
+    universe = (
+        frozenset(s.upper() for s in perp_universe)
+        if perp_universe is not None
+        else DEFAULT_PERP_UNIVERSE
+    )
+    has_tf = _extract_timeframe_or_style_from_text(text) is not None
     found: list[tuple[int, str]] = []
+
     for pattern, canonical in _SYMBOL_ALIASES:
+        base = canonical.split("/")[0]
+        if not _in_perp_universe(base, universe):
+            continue
         for match in pattern.finditer(text):
             found.append((match.start(), canonical))
 
-    for pair_re in (
-        _USDT_PAIR_TEXT_RE,
-        _USDT_SUFFIX_TEXT_RE,
-        _KOIN_CUE_TEXT_RE,
-        _ACTION_CUE_TEXT_RE,
-    ):
-        for match in pair_re.finditer(text):
+    # Strong explicit cues: $TICKER, TICKER/USDT, TICKERUSDT
+    for strong_re in (_CASHTAG_TEXT_RE, _USDT_PAIR_TEXT_RE, _USDT_SUFFIX_TEXT_RE):
+        for match in strong_re.finditer(text):
             token = match.group(1).upper()
-            if token in _NON_TICKER_ACRONYMS:
+            if token in _NON_TICKER_ACRONYMS or not _in_perp_universe(token, universe):
                 continue
             try:
                 found.append((match.start(), resolve_default_perp_symbol(token).canonical_symbol))
             except ValueError:
                 continue
 
+    # Cue verbs / nouns: require universe membership; ambiguous tickers must be uppercase.
+    for cue_re in (_KOIN_CUE_TEXT_RE, _ACTION_CUE_TEXT_RE):
+        for match in cue_re.finditer(text):
+            raw_token = match.group(1)
+            token = raw_token.upper()
+            if token in _NON_TICKER_ACRONYMS or not _in_perp_universe(token, universe):
+                continue
+            if token in AMBIGUOUS_PERP_TICKERS and not raw_token.isupper():
+                continue
+            try:
+                found.append((match.start(), resolve_default_perp_symbol(token).canonical_symbol))
+            except ValueError:
+                continue
+
+    # Bare uppercase tickers: must be in universe; ambiguous tickers also need a timeframe cue.
     for match in _UPPER_TICKER_RE.finditer(text):
         token = match.group(1)
-        if token in _NON_TICKER_ACRONYMS:
+        if token in _NON_TICKER_ACRONYMS or not _in_perp_universe(token, universe):
+            continue
+        if token in AMBIGUOUS_PERP_TICKERS and not has_tf:
             continue
         try:
             found.append((match.start(), resolve_default_perp_symbol(token).canonical_symbol))
@@ -743,6 +779,8 @@ def _extract_mvp_symbols(text: str) -> list[str]:
 def _extract_recent_context(
     recent_messages: Sequence[StoredMessage],
     default_timeframe: Timeframe,
+    *,
+    perp_universe: Collection[str] | None = None,
 ) -> tuple[list[str], Timeframe]:
     recent_symbols: list[str] = []
     recent_tf = default_timeframe
@@ -773,7 +811,7 @@ def _extract_recent_context(
                 break
             continue
 
-        msg_syms = _extract_mvp_symbols(msg.content)
+        msg_syms = _extract_mvp_symbols(msg.content, perp_universe=perp_universe)
         if msg_syms:
             for sym in msg_syms:
                 if sym not in recent_symbols:
@@ -792,6 +830,7 @@ def resolve_followup_intent_with_trace(
     *,
     recent_messages: Sequence[StoredMessage],
     default_timeframe: Timeframe = Timeframe.H4,
+    perp_universe: Collection[str] | None = None,
 ) -> tuple[FollowupIntent, RoutingTrace]:
     """Resolve a bounded natural-language message and return PII-free routing telemetry."""
     cleaned = text.strip()
@@ -893,12 +932,16 @@ def resolve_followup_intent_with_trace(
             ),
         )
 
-    recent_symbols, recent_tf = _extract_recent_context(recent_messages, default_timeframe)
+    recent_symbols, recent_tf = _extract_recent_context(
+        recent_messages,
+        default_timeframe,
+        perp_universe=perp_universe,
+    )
     explicit_tf = _extract_timeframe_or_style_from_text(cleaned)
     new_query_tf = explicit_tf if explicit_tf is not None else default_timeframe
     followup_tf = explicit_tf if explicit_tf is not None else recent_tf
 
-    mentioned = _extract_mvp_symbols(cleaned)
+    mentioned = _extract_mvp_symbols(cleaned, perp_universe=perp_universe)
     is_compare = _COMPARE_WORD_RE.search(cleaned) is not None
     is_pine = _PINE_INTENT_RE.search(cleaned) is not None
     is_detail = _DETAIL_INTENT_RE.search(cleaned) is not None
@@ -1072,11 +1115,13 @@ def resolve_followup_intent(
     *,
     recent_messages: Sequence[StoredMessage],
     default_timeframe: Timeframe = Timeframe.H4,
+    perp_universe: Collection[str] | None = None,
 ) -> FollowupIntent:
     """Resolve a bounded natural-language message into an explicit backend analysis intent."""
     intent, _ = resolve_followup_intent_with_trace(
         text,
         recent_messages=recent_messages,
         default_timeframe=default_timeframe,
+        perp_universe=perp_universe,
     )
     return intent

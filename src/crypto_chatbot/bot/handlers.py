@@ -6,8 +6,9 @@ import asyncio
 import html
 import logging
 import math
+import time
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from typing import Any, Literal
 
 from sqlalchemy.exc import SQLAlchemyError
@@ -65,7 +66,10 @@ from crypto_chatbot.bot.templates import (
 from crypto_chatbot.llm.gemini import GeminiNarrator, IntentClassificationOutcome
 from crypto_chatbot.llm.guard import validate_conversational_answer
 from crypto_chatbot.llm.render import render_analysis_response, render_comparison_response
-from crypto_chatbot.market_data.symbols import resolve_default_perp_symbol
+from crypto_chatbot.market_data.symbols import (
+    DEFAULT_PERP_UNIVERSE,
+    resolve_default_perp_symbol,
+)
 from crypto_chatbot.market_data.whale_provider import WhaleDataProvider
 from crypto_chatbot.memory.service import MemoryService
 from crypto_chatbot.ops.logging import SecretRedactingFilter as SecretRedactingFilter
@@ -113,6 +117,32 @@ class BotService:
         self._whale_provider = whale_provider or WhaleDataProvider()
         self._whale_watchlist = whale_watchlist or WhaleWatchlistManager()
         self._forward_track_provider = forward_track_provider
+        self._perp_universe_cache: tuple[float, frozenset[str]] | None = None
+
+    _PERP_UNIVERSE_CACHE_TTL_SECONDS = 600.0
+
+    async def _get_perp_universe(self) -> frozenset[str]:
+        now_mono = time.monotonic()
+        cached = self._perp_universe_cache
+        if cached is not None and (now_mono - cached[0]) < self._PERP_UNIVERSE_CACHE_TTL_SECONDS:
+            return cached[1]
+        get_tickers = getattr(self._analysis_service, "get_futures_tickers", None)
+        if callable(get_tickers):
+            try:
+                batch = await get_tickers()
+                if not batch.has_provider_error and batch.tickers:
+                    bases: set[str] = set()
+                    for ticker in batch.tickers:
+                        base = ticker.canonical_symbol.split("/")[0].upper()
+                        bases.add(base)
+                        if base.startswith("1000") and len(base) > 4:
+                            bases.add(base[4:])
+                    frozen = frozenset(bases)
+                    self._perp_universe_cache = (now_mono, frozen)
+                    return frozen
+            except Exception as exc:
+                logger.debug("Failed to refresh perp universe cache: %s", exc)
+        return DEFAULT_PERP_UNIVERSE
 
     async def handle_track(
         self,
@@ -777,10 +807,12 @@ class BotService:
         try:
             prefs = await asyncio.to_thread(self._memory.get_preferences, user_id)
             recent = await asyncio.to_thread(self._memory.get_recent_messages, user_id)
+            perp_universe = await self._get_perp_universe()
             intent, trace = resolve_followup_intent_with_trace(
                 text,
                 recent_messages=recent,
                 default_timeframe=prefs.default_timeframe,
+                perp_universe=perp_universe,
             )
             cls_outcome: IntentClassificationOutcome | None = None
             if isinstance(intent, RefusalIntent) and not intent.is_hard_refusal:
@@ -790,6 +822,7 @@ class BotService:
                     recent_messages=recent,
                     default_timeframe=prefs.default_timeframe,
                     fallback_refusal=intent,
+                    perp_universe=perp_universe,
                 )
 
             if isinstance(intent, RefusalIntent):
@@ -944,6 +977,7 @@ class BotService:
         recent_messages: Sequence[Any],
         default_timeframe: Timeframe,
         fallback_refusal: RefusalIntent,
+        perp_universe: Collection[str] | None = None,
     ) -> tuple[
         AnalyzeIntent
         | CompareIntent
@@ -957,7 +991,11 @@ class BotService:
         IntentClassificationOutcome,
     ]:
         del fallback_refusal
-        recent_syms, recent_tf = _extract_recent_context(recent_messages, default_timeframe)
+        recent_syms, recent_tf = _extract_recent_context(
+            recent_messages,
+            default_timeframe,
+            perp_universe=perp_universe,
+        )
         cls_outcome = await self._narrator.classify_intent_with_diagnostics(
             text,
             user_id=user_id,

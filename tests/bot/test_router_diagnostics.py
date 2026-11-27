@@ -788,3 +788,128 @@ async def test_evaluate_router_casual_id_fixture_diagnostics() -> None:
     print(f"\nGuard false-positive probes: {guard_hits}")
 
     assert sum(l1_total.values()) == 100
+    assert len(l1_false_pos_symbols) == 0
+    assert len(l1_ada_missed) == 0
+
+
+@pytest.mark.asyncio
+async def test_pr1_symbol_extraction_cues_and_cached_universe() -> None:
+    """PR1: Ambiguous tickers require strong cues; cue verbs reject non-universe words."""
+    # Strong cues and explicit uppercase + timeframe match ambiguous tickers
+    for msg, expected_sym in (
+        ("$ADA gimana?", "ADA/USDT:USDT"),
+        ("$GAS 4h", "GAS/USDT:USDT"),
+        ("cek $MEME", "MEME/USDT:USDT"),
+        ("ADA/USDT 4h", "ADA/USDT:USDT"),
+        ("ADAUSDT gimana?", "ADA/USDT:USDT"),
+        ("analisa ADA sekarang", "ADA/USDT:USDT"),
+        ("cek koin ADA 1h", "ADA/USDT:USDT"),
+        ("GAS 4h gimana?", "GAS/USDT:USDT"),
+        ("OMG 15m dong", "OMG/USDT:USDT"),
+    ):
+        intent, _ = resolve_followup_intent_with_trace(msg, recent_messages=())
+        assert isinstance(intent, AnalyzeIntent), f"Expected AnalyzeIntent for {msg!r}, got {intent}"
+        assert intent.symbol == expected_sym
+
+    # Colliding words, slang, and non-universe acronyms must NOT extract symbols
+    for casual in (
+        "ada token yang bisa disetup gak?",
+        "GAS tidur dulu",
+        "OMG pusing liat chart hari ini",
+        "koin meme lagi rame ya?",
+        "WKWK mantap",
+        "HAHA bener juga",
+        "OTW makan siang",
+        "OKAY siap",
+        "apa itu DXY dan efeknya ke kripto?",
+        "apa itu DCA?",
+        "apa arti FOMO dan FUD?",
+        "apa itu ATH dan ATL?",
+        "lihat berita hari ini dong",
+        "cek ombak market dulu",
+        "koin favorit kamu apa?",
+        "analisa saham BBCA dong",
+    ):
+        intent, _ = resolve_followup_intent_with_trace(casual, recent_messages=())
+        assert not isinstance(intent, (AnalyzeIntent, CompareIntent, PineIntent)), (
+            f"Unexpected symbol analysis for {casual!r}: {intent}"
+        )
+
+    # Cached exchange universe in BotService accepts newly listed tickers and rejects bogus words
+    class _CustomUniverseService(_DiagnosticAnalysisService):
+        async def get_futures_tickers(self) -> FuturesTickerBatch:
+            return FuturesTickerBatch(
+                venue="binance",
+                received_time=ANCHOR,
+                tickers=(
+                    FuturesTickerSnapshot(
+                        venue="binance",
+                        canonical_symbol="NEWCOIN/USDT:USDT",
+                        provider_symbol="BINANCE:NEWCOINUSDT.P",
+                        last_price=1.0,
+                        change_24h_pct=5.0,
+                        quote_volume_24h_usd=8_000_000.0,
+                        observed_time=ANCHOR,
+                    ),
+                ),
+            )
+
+        async def analyze(
+            self,
+            symbol: str,
+            timeframe: Timeframe,
+            *,
+            include_mtf: bool = True,
+            include_derivatives: bool = True,
+            persist: bool = True,
+        ) -> AnalysisSnapshot:
+            del include_mtf, include_derivatives, persist
+            mapping = resolve_default_perp_symbol(symbol)
+            return AnalysisSnapshot(
+                snapshot_id=f"snap-{mapping.base}",
+                provider="ccxt",
+                venue="binance",
+                canonical_symbol=mapping.canonical_symbol,
+                provider_symbol=mapping.provider_symbol,
+                market_type=MarketType.PERPETUAL,
+                timeframe=timeframe,
+                as_of=ANCHOR,
+                input_range=InputRange(
+                    first_open_time=ANCHOR - timedelta(hours=100),
+                    last_open_time=ANCHOR - timeframe.duration,
+                    candle_count=50,
+                    sha256="e" * 64,
+                ),
+                calc_version="1.0.0",
+                technical=TechnicalMetrics(last_close=1.0),
+                regime=Regime.TRENDING_UP,
+                market_structure=MarketStructure.BULLISH,
+                facts=(
+                    Fact(
+                        fact_id="F1",
+                        label="Harga penutupan terakhir",
+                        value=1.0,
+                        unit="USDT",
+                        display_format="price",
+                        source="ccxt:binance",
+                        as_of=ANCHOR,
+                    ),
+                ),
+                quality_status=QualityStatus.READY,
+            )
+
+    repo = _RecordingMemoryRepo()
+    bot = BotService(
+        access=AccessController((111,)),
+        analysis_service=_CustomUniverseService(),  # type: ignore[arg-type]
+        narrator=GeminiNarrator(
+            model="gemini-2.5-flash",
+            transport=_HealthyFakeGeminiTransport(),
+            max_guard_retries=0,
+        ),
+        memory=MemoryService(repo),
+    )
+    out = "\n".join(await bot.handle_text_message(111, "cek NEWCOIN 4h"))
+    assert "NEWCOIN/USDT:USDT (4h)" in out
+    assert repo.interactions[-1].layer == "layer1"
+    assert repo.interactions[-1].detected_symbol == "NEWCOIN/USDT:USDT"
