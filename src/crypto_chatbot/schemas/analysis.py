@@ -21,7 +21,7 @@ from crypto_chatbot.schemas.market import (
     UtcDatetime,
     validate_symbol_market_type,
 )
-from crypto_chatbot.schemas.news import SentimentMetrics
+from crypto_chatbot.schemas.news import FearGreedObservation, SentimentMetrics
 from crypto_chatbot.schemas.prediction_market import PredictionMarketSummary
 from crypto_chatbot.schemas.tradingview import TradingViewMetrics
 
@@ -483,6 +483,7 @@ class AnalysisSnapshot(BaseModel):
     prediction_markets: PredictionMarketSummary | None = None
     macro_context: MacroBenchmarkContext | None = None
     positioning: PositioningPanel | None = None
+    fear_greed: FearGreedObservation | None = None
     ml_prediction: ModelPredictionSummary | None = None
     facts: tuple[Fact, ...] = ()
     regime: Regime | None = None
@@ -569,6 +570,9 @@ class AnalysisSnapshot(BaseModel):
 
         if self.positioning is not None and self.positioning.as_of > self.as_of:
             raise ValueError("positioning as_of cannot exceed snapshot as_of (lookahead)")
+
+        if self.fear_greed is not None and self.fear_greed.available_time > self.as_of:
+            raise ValueError("fear_greed available_time cannot exceed snapshot as_of (lookahead)")
 
         if self.quality_status in (QualityStatus.READY, QualityStatus.DEGRADED):
             if self.input_range is None:

@@ -44,6 +44,7 @@ from crypto_chatbot.storage.database import create_db_engine, init_db
 from crypto_chatbot.storage.repositories import (
     PostgresContractStatsRepository,
     PostgresDerivativesRepository,
+    PostgresFearGreedRepository,
     PostgresMarketRepository,
     PostgresNewsRepository,
     PostgresSetupLogRepository,
@@ -87,6 +88,7 @@ def build_telegram_application(
     news_repo = PostgresNewsRepository(engine)
     memory_repo = PostgresUserMemoryRepository(engine)
     contract_stats_repo = PostgresContractStatsRepository(engine)
+    fear_greed_repo = PostgresFearGreedRepository(engine)
     provider, derivatives_provider = build_futures_providers(
         settings.futures_exchange_chain,
         cooldown_minutes=settings.venue_cooldown_min,
@@ -116,6 +118,7 @@ def build_telegram_application(
         news_repository=news_repo,
         dxy_provider=dxy_provider,
         contract_stats_repository=contract_stats_repo,
+        fear_greed_repository=fear_greed_repo,
         risk_tiers_client=risk_tiers_client,
         resample_from=Timeframe(settings.resample_from) if settings.resample_from else None,
         cache_ttl_seconds=45.0,

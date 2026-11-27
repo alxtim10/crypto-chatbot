@@ -93,11 +93,12 @@ from crypto_chatbot.schemas.market import (
     QualityStatus,
     Timeframe,
 )
-from crypto_chatbot.schemas.news import SentimentMetrics, SentimentObservation
+from crypto_chatbot.schemas.news import FearGreedObservation, SentimentMetrics, SentimentObservation
 from crypto_chatbot.schemas.tradingview import TradingViewMetrics, TradingViewPacket
 from crypto_chatbot.storage.repositories import (
     ContractStatsRepository,
     DerivativesRepository,
+    FearGreedRepository,
     MarketRepository,
     ModelPredictionRepository,
     NewsRepository,
@@ -1226,6 +1227,7 @@ def build_analysis_snapshot(
     btc_candles: Sequence[MarketCandle] | None = None,
     macro_context: MacroBenchmarkContext | None = None,
     positioning: PositioningPanel | None = None,
+    fear_greed: FearGreedObservation | None = None,
     maintenance_margin_rate: float | None = None,
     venue_max_leverage: float | None = None,
 ) -> AnalysisSnapshot:
@@ -1534,6 +1536,7 @@ def build_analysis_snapshot(
         cross_venue_derivatives=cross_venue_derivatives,
         macro_context=macro_context,
         positioning=positioning,
+        fear_greed=fear_greed,
         facts=facts,
         regime=regime,
         market_structure=structure.market_structure,
@@ -1611,6 +1614,7 @@ class AnalysisService:
         prediction_repository: ModelPredictionRepository | None = None,
         dxy_provider: DxyMarketDataProvider | None = None,
         contract_stats_repository: ContractStatsRepository | None = None,
+        fear_greed_repository: FearGreedRepository | None = None,
         risk_tiers_client: GateRiskTiersClient | None = None,
         default_position_notional_usdt: float = 1_000.0,
         resample_from: Timeframe | None = None,
@@ -1629,6 +1633,7 @@ class AnalysisService:
         self._prediction_repository = prediction_repository
         self._dxy_provider = dxy_provider
         self._contract_stats_repository = contract_stats_repository
+        self._fear_greed_repository = fear_greed_repository
         self._risk_tiers_client = risk_tiers_client
         self._default_position_notional_usdt = max(0.0, float(default_position_notional_usdt))
         self._resample_from = resample_from
@@ -2152,6 +2157,16 @@ class AnalysisService:
                 use_available_time=True,
             )
 
+        fear_greed_obs: FearGreedObservation | None = None
+        if self._fear_greed_repository is not None and primary_ok and primary.candles:
+            fg_rows = self._fear_greed_repository.load_observations(
+                source="alternative.me",
+                end_available_time=primary.candles[-1].close_time,
+                limit=1,
+            )
+            if fg_rows:
+                fear_greed_obs = fg_rows[-1]
+
         mmr_rate: float | None = None
         venue_max_lev: float | None = None
         if primary_ok:
@@ -2170,6 +2185,7 @@ class AnalysisService:
             dxy_candles=dxy_candles,
             btc_candles=btc_candles,
             positioning=positioning_panel,
+            fear_greed=fear_greed_obs,
             maintenance_margin_rate=mmr_rate,
             venue_max_leverage=venue_max_lev,
         )
