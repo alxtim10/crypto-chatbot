@@ -36,6 +36,7 @@ from crypto_chatbot.schemas.analysis import (
     SetupStatus,
     TradeSetup,
 )
+from crypto_chatbot.schemas.derivatives import FundingRateObservation
 from crypto_chatbot.schemas.market import MarketCandle, Timeframe, UtcDatetime
 from crypto_chatbot.schemas.ml import CostAssumptions
 
@@ -642,16 +643,37 @@ def _simulate_setup_forward(
     )
 
 
+def _coerce_funding_pairs(
+    funding_history: Sequence[tuple[datetime, float] | FundingRateObservation] | None,
+    *,
+    use_available_time: bool = False,
+) -> tuple[tuple[datetime, float], ...]:
+    if not funding_history:
+        return ()
+    out: list[tuple[datetime, float]] = []
+    for item in funding_history:
+        if isinstance(item, FundingRateObservation):
+            ts = item.available_time if use_available_time else item.observed_time
+            out.append((ts, item.funding_rate))
+        else:
+            out.append(item)
+    return tuple(out)
+
+
 def run_setup_backtest(
     candles: Sequence[MarketCandle],
     *,
     config: BacktestConfig | None = None,
     ltf_candles: Sequence[MarketCandle] | None = None,
-    funding_history: Sequence[tuple[datetime, float]] | None = None,
+    funding_history: Sequence[tuple[datetime, float] | FundingRateObservation] | None = None,
     use_available_time: bool = False,
 ) -> BacktestReport:
     """Replay `build_trade_setup` bar-by-bar with strict causal slicing and no overlap."""
     cfg = config or BacktestConfig()
+    coerced_funding = _coerce_funding_pairs(
+        funding_history,
+        use_available_time=use_available_time,
+    )
     closed = sorted((c for c in candles if c.is_closed), key=lambda c: c.open_time)
     if len(closed) < cfg.warmup_bars + 2:
         raise ValueError(
@@ -843,7 +865,7 @@ def run_setup_backtest(
             fill_price=fill_price,
             risk=risk,
             remaining_history=sim_obj.remaining_history,
-            funding_history=funding_history,
+            funding_history=[pair for pair in coerced_funding if pair[0] <= exit_time] or None,
         )
         if funding_assumed:
             funding_rate = (held_hours / 24.0) * (
@@ -1076,6 +1098,7 @@ def run_dual_paper_book_backtest(
     config: BacktestConfig | None = None,
     boundary_mode: RoundBoundaryMode = RoundBoundaryMode.DAILY_UTC,
     ltf_candles: Sequence[MarketCandle] | None = None,
+    funding_history: Sequence[tuple[datetime, float] | FundingRateObservation] | None = None,
     use_available_time: bool = False,
 ) -> DualBookComparisonReport:
     """Run Always-On vs Flat-at-Boundary paper books over the exact same closed candles."""
@@ -1100,12 +1123,14 @@ def run_dual_paper_book_backtest(
         candles,
         config=always_cfg,
         ltf_candles=ltf_candles,
+        funding_history=funding_history,
         use_available_time=use_available_time,
     )
     flat_report = run_setup_backtest(
         candles,
         config=flat_cfg,
         ltf_candles=ltf_candles,
+        funding_history=funding_history,
         use_available_time=use_available_time,
     )
 

@@ -1113,6 +1113,32 @@ async def _fetch_live_ohlcv_for_backtest(
         await deriv_provider.close()
 
 
+def _load_causal_funding_for_backtest(
+    *,
+    venue: str,
+    canonical_symbol: str,
+    as_of: datetime,
+) -> tuple[tuple[datetime, float], ...] | None:
+    db_url = os.environ.get("DATABASE_URL")
+    if not db_url:
+        return None
+    engine = create_db_engine(db_url)
+    try:
+        repo = PostgresDerivativesRepository(engine)
+        obs = repo.load_funding_observations(
+            venue=venue,
+            canonical_symbol=canonical_symbol,
+            end_available_time=as_of,
+        )
+        if not obs:
+            return None
+        return tuple((o.observed_time, o.funding_rate) for o in obs)
+    except Exception:
+        return None
+    finally:
+        engine.dispose()
+
+
 def _run_backtest(
     *,
     symbol_raw: str,
@@ -1167,11 +1193,21 @@ def _run_backtest(
             max_hold_bars=max_hold,
             step_bars=step,
         )
+        funding_pairs = (
+            _load_causal_funding_for_backtest(
+                venue=batch.metadata.venue,
+                canonical_symbol=batch.canonical_symbol,
+                as_of=batch.candles[-1].close_time,
+            )
+            if fixture_path is None
+            else None
+        )
         if dual_book:
             dual_report = run_dual_paper_book_backtest(
                 batch.candles,
                 config=config,
                 boundary_mode=RoundBoundaryMode(boundary),
+                funding_history=funding_pairs,
             )
             events = (
                 *dual_report.always_on.decision_log,
@@ -1197,7 +1233,11 @@ def _run_backtest(
                 print(render_dual_book_report(dual_report))
             return 0
 
-        report = run_setup_backtest(batch.candles, config=config)
+        report = run_setup_backtest(
+            batch.candles,
+            config=config,
+            funding_history=funding_pairs,
+        )
         _record_cli_trial(
             TrialRecord.create(
                 family="setup_backtest",
@@ -1728,6 +1768,69 @@ def _run_ingest_gate_history(
     return 0
 
 
+def _run_sync_gate_funding(
+    *,
+    symbols_raw: str | None,
+    days: int,
+    as_json: bool,
+    database_url: str | None,
+) -> int:
+    from crypto_chatbot.market_data.gate_contract_stats import DEFAULT_CONTRACT_STATS_UNIVERSE
+    from crypto_chatbot.market_data.gate_funding import (
+        GateFundingHistoryClient,
+        sync_gate_funding_history,
+    )
+
+    resolved_url = database_url or os.environ.get("DATABASE_URL")
+    if not resolved_url:
+        try:
+            settings = load_settings()
+            resolved_url = settings.database_url.get_secret_value()
+        except Exception:
+            resolved_url = None
+    if not resolved_url:
+        print("Error: DATABASE_URL is required for sync-gate-funding.", file=sys.stderr)
+        return 1
+
+    symbols = (
+        tuple(item.strip() for item in symbols_raw.split(",") if item.strip())
+        if symbols_raw
+        else DEFAULT_CONTRACT_STATS_UNIVERSE
+    )
+    engine = create_db_engine(resolved_url)
+    init_db(engine)
+    deriv_repo = PostgresDerivativesRepository(engine)
+
+    async def _run_async() -> dict[str, int]:
+        client = GateFundingHistoryClient()
+        try:
+            return await sync_gate_funding_history(
+                symbols,
+                client=client,
+                repository=deriv_repo,
+                days=days,
+            )
+        finally:
+            await client.close()
+
+    try:
+        counts = asyncio.run(_run_async())
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        engine.dispose()
+
+    if as_json:
+        print(json.dumps({"days": days, "inserted": counts}, indent=2))
+    else:
+        total = sum(counts.values())
+        print(f"sync-gate-funding ({days}d): symbols={len(counts)} total_inserted={total}")
+        for sym, count in counts.items():
+            print(f"- {sym}: {count}")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="crypto-chatbot")
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -2216,6 +2319,32 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Print JSON output.",
     )
 
+    funding_parser = subcommands.add_parser(
+        "sync-gate-funding",
+        help="Fetch paginated Gate /futures/usdt/funding_rate history into PostgreSQL.",
+    )
+    funding_parser.add_argument(
+        "--symbols",
+        default=None,
+        help="Comma-separated symbols (default: liquid perpetual basket).",
+    )
+    funding_parser.add_argument(
+        "--days",
+        type=int,
+        default=90,
+        help="Lookback window in days (1..180, default: 90).",
+    )
+    funding_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Optional PostgreSQL URL override.",
+    )
+    funding_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print JSON output.",
+    )
+
     args = parser.parse_args(argv)
     if args.command == "check-config":
         return _check_config()
@@ -2350,6 +2479,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             types_raw=args.types,
             data_dir=args.data_dir,
             validate_contiguity=not args.no_contiguity_check,
+            as_json=args.json,
+            database_url=args.database_url,
+        )
+    if args.command == "sync-gate-funding":
+        return _run_sync_gate_funding(
+            symbols_raw=args.symbols,
+            days=args.days,
             as_json=args.json,
             database_url=args.database_url,
         )

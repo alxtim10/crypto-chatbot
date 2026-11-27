@@ -1932,6 +1932,28 @@ class AnalysisService:
                 ),
                 deriv_source.get_liquidations(effective_base),
             )
+            if (
+                (funding_batch.observation is None or funding_batch.has_provider_error)
+                and self._derivatives_repository is not None
+                and primary.candles
+            ):
+                cached_funding = self._derivatives_repository.load_funding_observations(
+                    venue=primary.metadata.venue,
+                    canonical_symbol=effective_symbol,
+                    end_available_time=primary.candles[-1].close_time,
+                    limit=1,
+                )
+                if cached_funding:
+                    funding_batch = funding_batch.model_copy(
+                        update={
+                            "observation": cached_funding[-1],
+                            "quality_flags": tuple(
+                                f
+                                for f in funding_batch.quality_flags
+                                if f is not QualityFlag.PROVIDER_ERROR
+                            ),
+                        }
+                    )
             derivatives_context = DerivativesContext(
                 funding=funding_batch,
                 open_interest=oi_batch,
