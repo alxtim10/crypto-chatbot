@@ -779,3 +779,30 @@ class FearGreedRow(Base):
     normalized_score: Mapped[float] = mapped_column(Double, nullable=False)
     is_backfilled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     raw_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+
+
+class NewsVoteSnapshotRow(Base):
+    """Append-only point-in-time vote & engagement snapshots (`news_vote_snapshots`, S-03)."""
+
+    __tablename__ = "news_vote_snapshots"
+    __table_args__ = (
+        UniqueConstraint("snapshot_id", name="uq_news_vote_snapshot_id"),
+        Index("ix_news_vote_snapshots_lookup", "article_id", "snapshot_time"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    snapshot_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    article_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    snapshot_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    positive_votes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    negative_votes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    important_votes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    liked_votes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    disliked_votes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    lol_votes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    toxic_votes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    saved_votes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    comments_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    attribution_text: Mapped[str] = mapped_column(Text, nullable=False)
+    raw_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)

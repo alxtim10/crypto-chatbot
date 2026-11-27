@@ -7,6 +7,14 @@ from crypto_chatbot.news.fear_greed import (
     normalize_fear_greed_payload,
     sync_fear_greed,
 )
+from crypto_chatbot.news.ingestor import (
+    VERIFIED_PUBLIC_RSS_FEEDS,
+    NewsSyncResult,
+    PublicRssNewsClient,
+    build_article_vote_snapshots,
+    build_news_attribution,
+    sync_public_rss_news,
+)
 from crypto_chatbot.news.pipeline import (
     aggregate_sentiment,
     build_sentiment_observations,
@@ -20,9 +28,14 @@ from crypto_chatbot.news.pipeline import (
 
 __all__ = [
     "DEFAULT_FNG_API_URL",
+    "VERIFIED_PUBLIC_RSS_FEEDS",
     "FearGreedClient",
     "FearGreedSyncResult",
+    "NewsSyncResult",
+    "PublicRssNewsClient",
     "aggregate_sentiment",
+    "build_article_vote_snapshots",
+    "build_news_attribution",
     "build_sentiment_observations",
     "canonicalize_url",
     "classify_article_sentiment",
@@ -32,4 +45,5 @@ __all__ = [
     "normalize_fear_greed_payload",
     "parse_rss_xml",
     "sync_fear_greed",
+    "sync_public_rss_news",
 ]

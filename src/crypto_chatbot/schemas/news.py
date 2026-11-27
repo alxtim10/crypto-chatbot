@@ -195,3 +195,25 @@ class FearGreedObservation(BaseModel):
         if self.available_time < self.observed_time:
             raise ValueError("available_time cannot precede observed_time")
         return self
+
+
+class NewsVoteSnapshot(BaseModel):
+    """Append-only point-in-time vote/engagement snapshot for a tracked news article (S-03)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    snapshot_id: str = Field(min_length=12, max_length=64)
+    article_id: str = Field(min_length=16, max_length=64)
+    source_provider: str = Field(min_length=1)
+    snapshot_time: UtcDatetime
+    positive_votes: int = Field(default=0, ge=0)
+    negative_votes: int = Field(default=0, ge=0)
+    important_votes: int = Field(default=0, ge=0)
+    liked_votes: int = Field(default=0, ge=0)
+    disliked_votes: int = Field(default=0, ge=0)
+    lol_votes: int = Field(default=0, ge=0)
+    toxic_votes: int = Field(default=0, ge=0)
+    saved_votes: int = Field(default=0, ge=0)
+    comments_count: int = Field(default=0, ge=0)
+    attribution_text: str = Field(min_length=1)
+    raw_payload: dict[str, Any] = Field(default_factory=dict)

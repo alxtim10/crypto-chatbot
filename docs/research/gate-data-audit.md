@@ -197,3 +197,25 @@ URL pattern: `https://download.gatedata.org/futures_usdt/{dataset}/{YYYYMM}/{CON
   - Live unauthenticated requests from this environment are blocked by Cloudflare/API-key enforcement (`auth_token` required per CryptoPanic API v2 docs).
   - Exact live field quirks (e.g., whether v2 free/developer tier exposes `votes`, `instruments`, `source`, and domain limits) **could not be verified against a live 200 JSON payload**.
   - Implementation of `D-06`, `D-01`, `D-02`, `D-04`, `D-05`, `D-07`, `S-01`, `S-02`, `D-03`, `D-08`, `D-09` proceeds first using verified Gate.io and Alternative.me schemas. `S-03`/`S-05` will either require a valid `CRYPTOPANIC_API_KEY` from the operator (or fixture/fallback RSS/public feed approval) before making live calls.
+
+---
+
+## 6. Verified Public Crypto News RSS Feeds (`S-03` / `S-05`)
+
+- `https://cryptopanic.com/news/rss/` returned **`HTTP 410 Gone`** (retired endpoint).
+- Public RSS 2.0 feeds verified live with **`HTTP 200 OK`** (`2026-11-28`, total `334` raw items in a single pass):
+  - `CoinDesk` (`https://www.coindesk.com/arc/outboundfeeds/rss/`): `25` items
+  - `CoinTelegraph` (`https://cointelegraph.com/rss`): `30` items
+  - `Decrypt` (`https://decrypt.co/feed`): `34` items
+  - `The Block` (`https://www.theblock.co/rss.xml`): `20` items
+  - `BeInCrypto` (`https://beincrypto.com/feed/`): `12` items
+  - `U.Today` (`https://u.today/rss`): `90` items
+  - `NewsBTC` (`https://www.newsbtc.com/feed/`): `10` items
+  - `AMBCrypto` (`https://ambcrypto.com/feed/`): `16` items
+  - `CryptoPotato` (`https://cryptopotato.com/feed/`): `36` items
+  - `Bitcoinist` (`https://bitcoinist.com/feed/`): `8` items
+  - `The Daily Hodl` (`https://dailyhodl.com/feed/`): `10` items
+  - `ZyCrypto` (`https://zycrypto.com/feed/`): `14` items
+  - `CoinJournal` (`https://coinjournal.net/news/feed/`): `9` items
+  - `CryptoNews` (`https://cryptonews.com/news/feed/`): `20` items
+- Excluded due to block/TLS failure in live verification: `cryptoslate.com/feed/` (`403`), `bitcoinmagazine.com/.rss/full/` (`403`), `news.bitcoin.com/feed/` (`SSL hostname mismatch`).

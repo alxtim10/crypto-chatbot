@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import Engine, delete, select, update
@@ -34,6 +34,7 @@ from crypto_chatbot.schemas.ml import MlExperimentReport, ShadowPredictionRecord
 from crypto_chatbot.schemas.news import (
     MIN_ENTITY_MATCH_CONFIDENCE,
     FearGreedObservation,
+    NewsVoteSnapshot,
     NormalizedNewsArticle,
     SentimentLabel,
     SentimentObservation,
@@ -58,6 +59,7 @@ from crypto_chatbot.storage.models import (
     MlExperimentRow,
     ModelPredictionRow,
     NewsArticleRow,
+    NewsVoteSnapshotRow,
     OpenInterestRow,
     OrderBookSnapshotRow,
     SentimentObservationRow,
@@ -1583,6 +1585,21 @@ class NewsRepository(Protocol):
     ) -> tuple[SentimentObservation, ...]: ...
 
 
+@runtime_checkable
+class NewsVoteSnapshotRepository(Protocol):
+    """Append-only persistence & causal queries for `news_vote_snapshots` (S-03)."""
+
+    def save_vote_snapshots(self, snapshots: Sequence[NewsVoteSnapshot]) -> int: ...
+
+    def load_vote_snapshots(
+        self,
+        *,
+        article_id: str,
+        end_snapshot_time: datetime | None = None,
+        limit: int | None = None,
+    ) -> tuple[NewsVoteSnapshot, ...]: ...
+
+
 def _row_to_sentiment_observation(row: SentimentObservationRow) -> SentimentObservation:
     return SentimentObservation(
         observation_id=row.observation_id,
@@ -1710,6 +1727,87 @@ class PostgresNewsRepository:
         if limit is not None:
             db_rows.reverse()
         return tuple(_row_to_sentiment_observation(row) for row in db_rows)
+
+    def save_vote_snapshots(self, snapshots: Sequence[NewsVoteSnapshot]) -> int:
+        items = list(snapshots)
+        if not items:
+            return 0
+        payloads = [
+            {
+                "snapshot_id": snap.snapshot_id,
+                "article_id": snap.article_id,
+                "source_provider": snap.source_provider,
+                "snapshot_time": _to_utc(snap.snapshot_time),
+                "positive_votes": snap.positive_votes,
+                "negative_votes": snap.negative_votes,
+                "important_votes": snap.important_votes,
+                "liked_votes": snap.liked_votes,
+                "disliked_votes": snap.disliked_votes,
+                "lol_votes": snap.lol_votes,
+                "toxic_votes": snap.toxic_votes,
+                "saved_votes": snap.saved_votes,
+                "comments_count": snap.comments_count,
+                "attribution_text": snap.attribution_text,
+                "raw_payload": dict(snap.raw_payload),
+            }
+            for snap in items
+        ]
+        stmt = (
+            insert(NewsVoteSnapshotRow)
+            .values(payloads)
+            .on_conflict_do_nothing()
+            .returning(NewsVoteSnapshotRow.id)
+        )
+        with Session(self._engine) as session, session.begin():
+            inserted_ids = session.scalars(stmt).all()
+            return len(inserted_ids)
+
+    def load_vote_snapshots(
+        self,
+        *,
+        article_id: str,
+        end_snapshot_time: datetime | None = None,
+        limit: int | None = None,
+    ) -> tuple[NewsVoteSnapshot, ...]:
+        stmt = select(NewsVoteSnapshotRow).where(NewsVoteSnapshotRow.article_id == article_id)
+        if end_snapshot_time is not None:
+            stmt = stmt.where(NewsVoteSnapshotRow.snapshot_time <= _to_utc(end_snapshot_time))
+        if limit is not None:
+            if limit < 1:
+                raise ValueError("limit must be >= 1")
+            stmt = stmt.order_by(
+                NewsVoteSnapshotRow.snapshot_time.desc(),
+                NewsVoteSnapshotRow.id.desc(),
+            ).limit(limit)
+        else:
+            stmt = stmt.order_by(
+                NewsVoteSnapshotRow.snapshot_time.asc(),
+                NewsVoteSnapshotRow.id.asc(),
+            )
+        with Session(self._engine) as session:
+            db_rows = list(session.scalars(stmt))
+        if limit is not None:
+            db_rows.reverse()
+        return tuple(
+            NewsVoteSnapshot(
+                snapshot_id=row.snapshot_id,
+                article_id=row.article_id,
+                source_provider=row.source_provider,
+                snapshot_time=_to_utc(row.snapshot_time),
+                positive_votes=row.positive_votes,
+                negative_votes=row.negative_votes,
+                important_votes=row.important_votes,
+                liked_votes=row.liked_votes,
+                disliked_votes=row.disliked_votes,
+                lol_votes=row.lol_votes,
+                toxic_votes=row.toxic_votes,
+                saved_votes=row.saved_votes,
+                comments_count=row.comments_count,
+                attribution_text=row.attribution_text,
+                raw_payload=dict(row.raw_payload),
+            )
+            for row in db_rows
+        )
 
 
 class MlExperimentRepository(Protocol):

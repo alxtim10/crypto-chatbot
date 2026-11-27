@@ -1996,6 +1996,81 @@ def _run_resample_parity(
     return 0
 
 
+def _run_sync_news(
+    *,
+    source: str,
+    as_json: bool,
+    database_url: str | None,
+) -> int:
+    from crypto_chatbot.news.ingestor import PublicRssNewsClient, sync_public_rss_news
+    from crypto_chatbot.storage.database import create_db_engine, init_db
+    from crypto_chatbot.storage.repositories import PostgresNewsRepository
+
+    src = source.strip().lower()
+    if src == "cryptopanic":
+        print(
+            "Error: CryptoPanic API live endpoints return HTTP 403 Cloudflare challenge "
+            "without a verified CRYPTOPANIC_API_KEY; use --source rss instead.",
+            file=sys.stderr,
+        )
+        return 1
+    if src != "rss":
+        print(f"Error: unsupported news source '{source}' (expected: rss)", file=sys.stderr)
+        return 1
+
+    try:
+        db_url = _resolve_database_url(database_url)
+    except ConfigError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    engine = create_db_engine(db_url)
+    init_db(engine)
+    repo = PostgresNewsRepository(engine)
+
+    async def _run_async() -> tuple[int, int, int, int, int, int]:
+        client = PublicRssNewsClient()
+        try:
+            summary, _arts, _obs = await sync_public_rss_news(client=client, repository=repo)
+            return (
+                summary.feeds_attempted,
+                summary.feeds_succeeded,
+                summary.dedup_articles,
+                summary.inserted_articles,
+                summary.inserted_observations,
+                summary.inserted_snapshots,
+            )
+        finally:
+            await client.close()
+
+    try:
+        attempted, ok, dedup, ins_art, ins_obs, ins_snap = asyncio.run(_run_async())
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        engine.dispose()
+
+    payload = {
+        "source": "rss",
+        "feeds_attempted": attempted,
+        "feeds_succeeded": ok,
+        "dedup_articles": dedup,
+        "inserted_articles": ins_art,
+        "inserted_observations": ins_obs,
+        "inserted_snapshots": ins_snap,
+    }
+    if as_json:
+        print(json.dumps(payload, indent=2))
+    else:
+        print(
+            f"sync-news (rss): feeds={ok}/{attempted}, dedup={dedup}, "
+            f"inserted_articles={ins_art}, inserted_observations={ins_obs}, "
+            f"inserted_snapshots={ins_snap}"
+        )
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="crypto-chatbot")
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -2557,6 +2632,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Print JSON output.",
     )
 
+    sync_news_parser = subcommands.add_parser(
+        "sync-news",
+        help="Ingest verified public crypto RSS news feeds and append vote snapshots.",
+    )
+    sync_news_parser.add_argument(
+        "--source",
+        default="rss",
+        choices=("rss", "cryptopanic"),
+        help="News source (default: rss).",
+    )
+    sync_news_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Optional PostgreSQL URL override.",
+    )
+    sync_news_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print JSON output.",
+    )
+
     args = parser.parse_args(argv)
     if args.command == "check-config":
         return _check_config()
@@ -2713,6 +2809,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             bars=args.bars,
             out_path=args.out,
             as_json=args.json,
+        )
+    if args.command == "sync-news":
+        return _run_sync_news(
+            source=args.source,
+            as_json=args.json,
+            database_url=args.database_url,
         )
     parser.error(f"unknown command: {args.command}")  # pragma: no cover
 
