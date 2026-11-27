@@ -13,7 +13,7 @@ import ccxt
 import ccxt.async_support as ccxt_async
 from tenacity import (
     AsyncRetrying,
-    retry_if_exception_type,
+    retry_if_exception,
     stop_after_attempt,
     wait_exponential_jitter,
 )
@@ -33,6 +33,7 @@ from crypto_chatbot.market_data.symbols import (
     resolve_default_perp_symbol,
     resolve_symbol,
 )
+from crypto_chatbot.market_data.venue_health import is_venue_block_error
 from crypto_chatbot.schemas.market import (
     MarketType,
     ProviderMetadata,
@@ -220,7 +221,9 @@ class CcxtMarketDataProvider:
         since: int | None = None,
     ) -> Sequence[Sequence[Any]]:
         retrying = AsyncRetrying(
-            retry=retry_if_exception_type(_TRANSIENT_EXCEPTIONS),
+            retry=retry_if_exception(
+                lambda exc: isinstance(exc, _TRANSIENT_EXCEPTIONS) and not is_venue_block_error(exc)
+            ),
             stop=stop_after_attempt(self._max_attempts),
             wait=wait_exponential_jitter(
                 initial=self._retry_initial_seconds,
@@ -587,7 +590,9 @@ class CcxtMarketDataProvider:
 
     async def _fetch_tickers_with_retries(self) -> dict[str, Any]:
         retrying = AsyncRetrying(
-            retry=retry_if_exception_type(_TRANSIENT_EXCEPTIONS),
+            retry=retry_if_exception(
+                lambda exc: isinstance(exc, _TRANSIENT_EXCEPTIONS) and not is_venue_block_error(exc)
+            ),
             stop=stop_after_attempt(self._max_attempts),
             wait=wait_exponential_jitter(
                 initial=self._retry_initial_seconds,

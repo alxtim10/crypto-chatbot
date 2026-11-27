@@ -53,11 +53,18 @@ class Settings(BaseSettings):
         TRADINGVIEW_PUBLISHED_WEBHOOK_IPS
     )
     ml_inference_mode: MlInferenceMode = MlInferenceMode.OFF
-    futures_exchange: str = Field(default="binance")
+    futures_exchange: str = Field(default="gate")
     futures_exchange_fallbacks: Annotated[tuple[str, ...], NoDecode] = Field(
         default=(),
         validate_default=True,
     )
+    primary_venue: str = Field(default="gateio")
+    venue_fallbacks: Annotated[tuple[str, ...], NoDecode] = Field(
+        default=(),
+        validate_default=True,
+    )
+    binance_enabled: bool = Field(default=False)
+    venue_cooldown_min: int = Field(default=360, ge=1, le=10080)
     gate_contract_stats_enabled: bool = Field(default=False)
     gate_contract_stats_interval_seconds: int = Field(default=300, ge=10, le=3600)
     gate_contract_stats_backfill_days: int = Field(default=179, ge=1, le=180)
@@ -66,13 +73,25 @@ class Settings(BaseSettings):
     @classmethod
     def _validate_futures_exchange(cls, value: object) -> str:
         if value is None or (isinstance(value, str) and not value.strip()):
-            return "binance"
+            return "gate"
         cleaned = str(value).strip().lower()
+        if cleaned == "gateio":
+            return "gate"
         if cleaned not in {"binance", "gate", "bingx"}:
-            raise ValueError("must be one of: binance, gate, bingx")
+            raise ValueError("must be one of: binance, gate, gateio, bingx")
         return cleaned
 
-    @field_validator("futures_exchange_fallbacks", mode="before")
+    @field_validator("primary_venue", mode="before")
+    @classmethod
+    def _validate_primary_venue(cls, value: object) -> str:
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return "gateio"
+        cleaned = str(value).strip().lower()
+        if cleaned not in {"binance", "gate", "gateio", "bingx"}:
+            raise ValueError("must be one of: gateio, gate, bingx, binance")
+        return cleaned
+
+    @field_validator("futures_exchange_fallbacks", "venue_fallbacks", mode="before")
     @classmethod
     def _validate_futures_exchange_fallbacks(cls, value: object) -> tuple[str, ...]:
         if value is None:
@@ -85,18 +104,39 @@ class Settings(BaseSettings):
         else:
             raise ValueError("must be a comma-separated list of exchanges")
 
-        allowed = {"binance", "gate", "bingx"}
+        allowed = {"binance", "gate", "gateio", "bingx"}
+        normalized: list[str] = []
         for item in items:
             if item not in allowed:
                 raise ValueError(
-                    f"unsupported fallback exchange '{item}'; must be one of: binance, gate, bingx"
+                    f"unsupported fallback exchange '{item}'; "
+                    "must be one of: binance, gate, gateio, bingx"
                 )
-        return tuple(dict.fromkeys(items))
+            mapped = "gate" if item == "gateio" else item
+            if mapped not in normalized:
+                normalized.append(mapped)
+        return tuple(normalized)
 
     @property
     def futures_exchange_chain(self) -> tuple[str, ...]:
-        """Ordered, deduplicated exchange chain starting with the primary futures exchange."""
-        return tuple(dict.fromkeys((self.futures_exchange, *self.futures_exchange_fallbacks)))
+        """Ordered, deduplicated exchange chain honoring D-01 defaults and legacy flags."""
+        if (
+            "futures_exchange" in self.model_fields_set
+            or "futures_exchange_fallbacks" in self.model_fields_set
+        ):
+            return tuple(dict.fromkeys((self.futures_exchange, *self.futures_exchange_fallbacks)))
+
+        primary_norm = "gate" if self.primary_venue == "gateio" else self.primary_venue
+        raw_chain = tuple(dict.fromkeys((primary_norm, *self.venue_fallbacks)))
+        if not self.binance_enabled:
+            filtered = tuple(ex for ex in raw_chain if ex != "binance")
+            if not filtered:
+                raise ValueError(
+                    "No enabled venue remains when binance_enabled is false; "
+                    "set PRIMARY_VENUE=gateio or BINANCE_ENABLED=true"
+                )
+            return filtered
+        return raw_chain
 
     @field_validator("tradingview_webhook_secret", mode="before")
     @classmethod

@@ -46,6 +46,10 @@ from crypto_chatbot.market_data.base import (
     OhlcvBatch,
 )
 from crypto_chatbot.market_data.bybit_derivatives import BybitDerivativesProvider
+from crypto_chatbot.market_data.fallback_provider import (
+    FallbackDerivativesLiquidityProvider,
+    FallbackMarketDataProvider,
+)
 from crypto_chatbot.market_data.macro_provider import DxyMarketDataProvider
 from crypto_chatbot.market_data.quality import (
     determine_quality_status,
@@ -1686,17 +1690,27 @@ class AnalysisService:
                 return limit
             return 100
 
-        core_results = await asyncio.gather(
-            *(
-                self._fetch_closed_ohlcv(
-                    mapping.canonical_symbol,
-                    tf,
-                    _fetch_limit(tf),
+        core_requests = [(mapping.canonical_symbol, tf, _fetch_limit(tf)) for tf in core_tfs]
+        pinned_provider: MarketDataProvider = self._provider
+        pinned_venue: str | None = None
+        if isinstance(self._provider, FallbackMarketDataProvider):
+            bundle = await self._provider.get_closed_ohlcv_bundle(core_requests)
+            if bundle.provider is not None:
+                pinned_provider = bundle.provider
+                pinned_venue = bundle.venue
+            batches = {tf: bundle.batches[(mapping.canonical_symbol, tf)] for tf in core_tfs}
+        else:
+            core_results = await asyncio.gather(
+                *(
+                    self._fetch_closed_ohlcv(
+                        mapping.canonical_symbol,
+                        tf,
+                        _fetch_limit(tf),
+                    )
+                    for tf in core_tfs
                 )
-                for tf in core_tfs
             )
-        )
-        batches: dict[Timeframe, OhlcvBatch] = dict(zip(core_tfs, core_results, strict=True))
+            batches = dict(zip(core_tfs, core_results, strict=True))
 
         effective_symbol = mapping.canonical_symbol
         effective_base = mapping.base
@@ -1712,7 +1726,13 @@ class AnalysisService:
                 if not any_requested_ok:
                     effective_symbol = batch.canonical_symbol
                     effective_base = batch.metadata.base_unit
+                    if pinned_venue is None:
+                        pinned_venue = batch.metadata.venue
                 any_requested_ok = True
+
+        deriv_source: DerivativesLiquidityProvider | None = self._derivatives_provider
+        if isinstance(deriv_source, FallbackDerivativesLiquidityProvider) and pinned_venue:
+            deriv_source = deriv_source.provider_for_venue(pinned_venue) or deriv_source
 
         derivatives_context: DerivativesContext | None = None
         cross_venue: CrossVenueDerivativesSummary | None = None
@@ -1722,11 +1742,12 @@ class AnalysisService:
                     effective_symbol,
                     Timeframe.M5,
                     limit=150,
+                    provider=pinned_provider,
                 )
                 if m5_batch is not None:
                     batches[Timeframe.M5] = m5_batch
 
-            if self._derivatives_provider is not None and include_derivatives:
+            if deriv_source is not None and include_derivatives:
                 oi_tf = max(
                     requested_tfs,
                     key=lambda t: (
@@ -1738,13 +1759,13 @@ class AnalysisService:
                     ).index(t),
                 )
                 funding_batch, oi_batch, ob_batch, liq_batch = await asyncio.gather(
-                    self._derivatives_provider.get_funding_rate(effective_base),
-                    self._derivatives_provider.get_open_interest(effective_base, oi_tf),
-                    self._derivatives_provider.get_order_book(
+                    deriv_source.get_funding_rate(effective_base),
+                    deriv_source.get_open_interest(effective_base, oi_tf),
+                    deriv_source.get_order_book(
                         effective_symbol,
                         market_type=mapping.market_type,
                     ),
-                    self._derivatives_provider.get_liquidations(effective_base),
+                    deriv_source.get_liquidations(effective_base),
                 )
                 derivatives_context = DerivativesContext(
                     funding=funding_batch,
@@ -1786,13 +1807,17 @@ class AnalysisService:
         tf: Timeframe,
         *,
         limit: int = 200,
+        provider: MarketDataProvider | None = None,
     ) -> OhlcvBatch | None:
         try:
-            batch = await self._fetch_closed_ohlcv(
-                canonical_symbol,
-                tf,
-                limit,
-            )
+            if provider is not None and provider is not self._provider:
+                batch = await provider.get_closed_ohlcv(canonical_symbol, tf, limit=limit)
+            else:
+                batch = await self._fetch_closed_ohlcv(
+                    canonical_symbol,
+                    tf,
+                    limit,
+                )
         except KeyError:
             return None
         if batch.has_provider_error or not batch.candles:
@@ -1811,11 +1836,35 @@ class AnalysisService:
     ) -> AnalysisSnapshot:
         """Fetch market data, build an `AnalysisSnapshot`, and optionally persist it."""
         mapping = resolve_default_perp_symbol(symbol)
-        primary = await self._fetch_closed_ohlcv(
-            mapping.canonical_symbol,
-            timeframe,
-            limit,
+        other_tfs = (
+            [tf for tf in (Timeframe.H1, Timeframe.H4, Timeframe.D1) if tf is not timeframe]
+            if include_mtf
+            else []
         )
+        pinned_provider: MarketDataProvider = self._provider
+        pinned_venue: str | None = None
+        mtf_batches: dict[Timeframe, OhlcvBatch] | None = None
+
+        if isinstance(self._provider, FallbackMarketDataProvider):
+            bundle_requests: list[tuple[str, Timeframe, int]] = [
+                (mapping.canonical_symbol, timeframe, limit),
+                *((mapping.canonical_symbol, tf, 100) for tf in other_tfs),
+            ]
+            bundle = await self._provider.get_closed_ohlcv_bundle(bundle_requests)
+            primary = bundle.batches[(mapping.canonical_symbol, timeframe)]
+            if bundle.provider is not None:
+                pinned_provider = bundle.provider
+                pinned_venue = bundle.venue
+            if include_mtf:
+                mtf_batches = {
+                    tf: bundle.batches[(mapping.canonical_symbol, tf)] for tf in other_tfs
+                }
+        else:
+            primary = await self._fetch_closed_ohlcv(
+                mapping.canonical_symbol,
+                timeframe,
+                limit,
+            )
 
         primary_ok = (
             bool(primary.candles)
@@ -1825,32 +1874,41 @@ class AnalysisService:
 
         effective_symbol = primary.canonical_symbol if primary_ok else mapping.canonical_symbol
         effective_base = primary.metadata.base_unit if primary_ok else mapping.base
+        if primary_ok and pinned_venue is None:
+            pinned_venue = primary.metadata.venue
 
-        mtf_batches: dict[Timeframe, OhlcvBatch] | None = None
         if include_mtf and primary_ok:
-            other_tfs = [
-                tf for tf in (Timeframe.H1, Timeframe.H4, Timeframe.D1) if tf is not timeframe
-            ]
-            fetched = await asyncio.gather(
-                *(
-                    self._provider.get_closed_ohlcv(effective_symbol, tf, limit=100)
-                    for tf in other_tfs
+            if mtf_batches is None:
+                fetched = await asyncio.gather(
+                    *(
+                        self._provider.get_closed_ohlcv(effective_symbol, tf, limit=100)
+                        for tf in other_tfs
+                    )
                 )
-            )
-            mtf_batches = dict(zip(other_tfs, fetched, strict=True))
+                mtf_batches = dict(zip(other_tfs, fetched, strict=True))
             optional_tasks: list[tuple[Timeframe, Any]] = []
             if timeframe is not Timeframe.M15:
                 optional_tasks.append(
                     (
                         Timeframe.M15,
-                        self._fetch_optional_ltf(effective_symbol, Timeframe.M15, limit=200),
+                        self._fetch_optional_ltf(
+                            effective_symbol,
+                            Timeframe.M15,
+                            limit=200,
+                            provider=pinned_provider,
+                        ),
                     )
                 )
             if timeframe is not Timeframe.M5:
                 optional_tasks.append(
                     (
                         Timeframe.M5,
-                        self._fetch_optional_ltf(effective_symbol, Timeframe.M5, limit=150),
+                        self._fetch_optional_ltf(
+                            effective_symbol,
+                            Timeframe.M5,
+                            limit=150,
+                            provider=pinned_provider,
+                        ),
                     )
                 )
             if optional_tasks:
@@ -1859,16 +1917,20 @@ class AnalysisService:
                     if opt_batch is not None:
                         mtf_batches[opt_tf] = opt_batch
 
+        deriv_source = self._derivatives_provider
+        if isinstance(deriv_source, FallbackDerivativesLiquidityProvider) and pinned_venue:
+            deriv_source = deriv_source.provider_for_venue(pinned_venue) or deriv_source
+
         derivatives_context: DerivativesContext | None = None
-        if self._derivatives_provider is not None and include_derivatives and primary_ok:
+        if deriv_source is not None and include_derivatives and primary_ok:
             funding_batch, oi_batch, ob_batch, liq_batch = await asyncio.gather(
-                self._derivatives_provider.get_funding_rate(effective_base),
-                self._derivatives_provider.get_open_interest(effective_base, timeframe),
-                self._derivatives_provider.get_order_book(
+                deriv_source.get_funding_rate(effective_base),
+                deriv_source.get_open_interest(effective_base, timeframe),
+                deriv_source.get_order_book(
                     effective_symbol,
                     market_type=mapping.market_type,
                 ),
-                self._derivatives_provider.get_liquidations(effective_base),
+                deriv_source.get_liquidations(effective_base),
             )
             derivatives_context = DerivativesContext(
                 funding=funding_batch,
@@ -1923,7 +1985,7 @@ class AnalysisService:
         btc_candles: tuple[MarketCandle, ...] | None = None
         if "BTC" not in mapping.canonical_symbol.upper() and primary_ok:
             try:
-                btc_batch = await self._provider.get_closed_ohlcv(
+                btc_batch = await pinned_provider.get_closed_ohlcv(
                     "BTC/USDT:USDT",
                     timeframe,
                     limit=limit,

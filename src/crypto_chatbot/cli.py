@@ -376,10 +376,35 @@ def _analyze_from_fixture(
 
 
 def _resolve_exchange_chain_from_env() -> tuple[str, ...]:
-    primary = os.environ.get("FUTURES_EXCHANGE", "binance").strip().lower() or "binance"
-    raw_fallbacks = os.environ.get("FUTURES_EXCHANGE_FALLBACKS", "")
+    legacy_primary = os.environ.get("FUTURES_EXCHANGE", "").strip().lower()
+    legacy_fallbacks = os.environ.get("FUTURES_EXCHANGE_FALLBACKS", "").strip()
+    if legacy_primary or legacy_fallbacks:
+        primary = legacy_primary or "gate"
+        fallbacks = [part.strip().lower() for part in legacy_fallbacks.split(",") if part.strip()]
+        return normalize_exchange_chain((primary, *fallbacks), default=("gate",))
+
+    primary_venue = os.environ.get("PRIMARY_VENUE", "gateio").strip().lower() or "gateio"
+    raw_fallbacks = os.environ.get("VENUE_FALLBACKS", "")
     fallbacks = [part.strip().lower() for part in raw_fallbacks.split(",") if part.strip()]
-    return normalize_exchange_chain((primary, *fallbacks))
+    binance_enabled = os.environ.get("BINANCE_ENABLED", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    chain = normalize_exchange_chain((primary_venue, *fallbacks), default=("gate",))
+    if not binance_enabled:
+        chain = tuple(ex for ex in chain if ex != "binance")
+    return chain or ("gate",)
+
+
+def _resolve_venue_cooldown_from_env() -> int:
+    raw = os.environ.get("VENUE_COOLDOWN_MIN", "360").strip()
+    try:
+        parsed = int(raw)
+    except ValueError:
+        return 360
+    return max(1, parsed)
 
 
 async def _analyze_live(
@@ -395,7 +420,10 @@ async def _analyze_live(
     news_repository: NewsRepository | None = None,
 ) -> AnalysisSnapshot:
     chain = _resolve_exchange_chain_from_env()
-    provider, deriv_provider = build_futures_providers(chain)
+    provider, deriv_provider = build_futures_providers(
+        chain,
+        cooldown_minutes=_resolve_venue_cooldown_from_env(),
+    )
     bybit_provider = BybitDerivativesProvider() if "binance" in chain else None
     dxy_provider = DxyMarketDataProvider() if include_derivatives else None
     try:
@@ -1064,7 +1092,10 @@ async def _fetch_live_ohlcv_for_backtest(
     limit: int,
 ) -> OhlcvBatch:
     chain = _resolve_exchange_chain_from_env()
-    provider, deriv_provider = build_futures_providers(chain)
+    provider, deriv_provider = build_futures_providers(
+        chain,
+        cooldown_minutes=_resolve_venue_cooldown_from_env(),
+    )
     try:
         if isinstance(provider, HistoryMarketDataProvider):
             return await provider.get_closed_ohlcv_history(symbol, timeframe, limit=limit)
@@ -1272,7 +1303,10 @@ async def _run_scan_live(
     timeframes: Sequence[Timeframe] | None = None,
 ) -> Any:
     chain = _resolve_exchange_chain_from_env()
-    provider, deriv_provider = build_futures_providers(chain)
+    provider, deriv_provider = build_futures_providers(
+        chain,
+        cooldown_minutes=_resolve_venue_cooldown_from_env(),
+    )
     bybit_provider = BybitDerivativesProvider() if "binance" in chain else None
     dxy_provider = DxyMarketDataProvider()
     try:
@@ -1339,7 +1373,10 @@ async def _run_screen_live(
     top_per_side: int,
 ) -> Any:
     chain = _resolve_exchange_chain_from_env()
-    provider, deriv_provider = build_futures_providers(chain)
+    provider, deriv_provider = build_futures_providers(
+        chain,
+        cooldown_minutes=_resolve_venue_cooldown_from_env(),
+    )
     bybit_provider = BybitDerivativesProvider() if "binance" in chain else None
     dxy_provider = DxyMarketDataProvider()
     try:
