@@ -414,6 +414,15 @@ def _resolve_gate_direct_candles_from_env() -> bool:
     return raw not in {"0", "false", "no", "off"}
 
 
+def _resolve_resample_from_env() -> Timeframe | None:
+    raw = os.environ.get("RESAMPLE_FROM", "").strip().lower()
+    if not raw:
+        return None
+    if raw not in {"1m", "5m", "15m", "1h"}:
+        raise ConfigError(f"RESAMPLE_FROM must be one of 1m, 5m, 15m, 1h (got {raw!r})")
+    return Timeframe(raw)
+
+
 async def _analyze_live(
     *,
     symbol: str,
@@ -445,6 +454,7 @@ async def _analyze_live(
             tradingview_repository=tradingview_repository,
             news_repository=news_repository,
             dxy_provider=dxy_provider,
+            resample_from=_resolve_resample_from_env(),
         )
         return await service.analyze(
             symbol,
@@ -1887,6 +1897,100 @@ def _run_sync_fear_greed(
     return 0
 
 
+def _run_resample_parity(
+    *,
+    symbol_raw: str,
+    bars: int,
+    out_path: str | None,
+    as_json: bool,
+) -> int:
+    from crypto_chatbot.market_data.gate_candles import GateFuturesMarketDataProvider
+    from crypto_chatbot.market_data.resampling import (
+        ResampleParityReport,
+        compare_resampled_with_native,
+        resample_candles,
+    )
+
+    try:
+        mapping = resolve_default_perp_symbol(symbol_raw)
+    except SymbolError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    target_bars = max(1, bars)
+
+    async def _run_async() -> ResampleParityReport:
+        provider = GateFuturesMarketDataProvider()
+        try:
+            needed_1h = target_bars * 24 + 24
+            base_batch, native_4h, native_1d = await asyncio.gather(
+                provider.get_closed_ohlcv_history(
+                    mapping.canonical_symbol, Timeframe.H1, limit=needed_1h
+                ),
+                provider.get_closed_ohlcv_history(
+                    mapping.canonical_symbol, Timeframe.H4, limit=target_bars + 2
+                ),
+                provider.get_closed_ohlcv_history(
+                    mapping.canonical_symbol, Timeframe.D1, limit=target_bars + 2
+                ),
+            )
+            if not base_batch.candles:
+                raise RuntimeError(base_batch.error_message or "No closed 1h Gate candles received")
+            as_of = base_batch.candles[-1].close_time
+            res_4h = resample_candles(
+                base_batch.candles, target_timeframe=Timeframe.H4, as_of=as_of
+            )
+            res_1d = resample_candles(
+                base_batch.candles, target_timeframe=Timeframe.D1, as_of=as_of
+            )
+            summary_4h = compare_resampled_with_native(
+                res_4h.candles,
+                native_4h.candles,
+                base_timeframe=Timeframe.H1,
+                target_timeframe=Timeframe.H4,
+                max_bars=target_bars,
+            )
+            summary_1d = compare_resampled_with_native(
+                res_1d.candles,
+                native_1d.candles,
+                base_timeframe=Timeframe.H1,
+                target_timeframe=Timeframe.D1,
+                max_bars=target_bars,
+            )
+            return ResampleParityReport(
+                generated_at=datetime.now(UTC),
+                venue="gate",
+                canonical_symbol=mapping.canonical_symbol,
+                base_timeframe=Timeframe.H1,
+                targets=(summary_4h, summary_1d),
+            )
+        finally:
+            await provider.close()
+
+    try:
+        report = asyncio.run(_run_async())
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    rendered = report.model_dump_json(indent=2)
+    if out_path:
+        dest = Path(out_path)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(rendered + "\n", encoding="utf-8")
+
+    if as_json:
+        print(rendered)
+    else:
+        for t in report.targets:
+            print(
+                f"{report.canonical_symbol} {t.base_timeframe.value}->{t.target_timeframe.value}: "
+                f"matched={t.matched_bars}, max_diff_bps={t.max_close_diff_bps:.4f}, "
+                f"mean_diff_bps={t.mean_close_diff_bps:.4f}, mismatch={t.mismatch_flagged}"
+            )
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="crypto-chatbot")
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -2422,6 +2526,32 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Print JSON output.",
     )
 
+    parity_parser = subcommands.add_parser(
+        "resample-parity",
+        help="Compare UTC-resampled 1h->4h/1d candles against native Gate candlesticks.",
+    )
+    parity_parser.add_argument(
+        "--symbol",
+        default="BTC",
+        help="Target symbol (default: BTC).",
+    )
+    parity_parser.add_argument(
+        "--bars",
+        type=int,
+        default=200,
+        help="Number of overlapping bars to compare per target timeframe (default: 200).",
+    )
+    parity_parser.add_argument(
+        "--out",
+        default=None,
+        help="Optional JSON report output file path.",
+    )
+    parity_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print JSON output.",
+    )
+
     args = parser.parse_args(argv)
     if args.command == "check-config":
         return _check_config()
@@ -2571,6 +2701,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             limit=args.limit,
             as_json=args.json,
             database_url=args.database_url,
+        )
+    if args.command == "resample-parity":
+        return _run_resample_parity(
+            symbol_raw=args.symbol,
+            bars=args.bars,
+            out_path=args.out,
+            as_json=args.json,
         )
     parser.error(f"unknown command: {args.command}")  # pragma: no cover
 

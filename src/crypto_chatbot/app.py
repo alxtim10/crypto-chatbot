@@ -34,6 +34,7 @@ from crypto_chatbot.market_data.gate_contract_stats import (
 )
 from crypto_chatbot.market_data.macro_provider import DxyMarketDataProvider
 from crypto_chatbot.memory.service import MemoryService
+from crypto_chatbot.schemas.market import Timeframe
 from crypto_chatbot.storage.database import create_db_engine, init_db
 from crypto_chatbot.storage.repositories import (
     PostgresContractStatsRepository,
@@ -101,6 +102,7 @@ def build_telegram_application(
         news_repository=news_repo,
         dxy_provider=dxy_provider,
         contract_stats_repository=contract_stats_repo,
+        resample_from=Timeframe(settings.resample_from) if settings.resample_from else None,
         cache_ttl_seconds=45.0,
     )
 

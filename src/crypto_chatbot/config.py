@@ -66,6 +66,7 @@ class Settings(BaseSettings):
     binance_enabled: bool = Field(default=False)
     venue_cooldown_min: int = Field(default=360, ge=1, le=10080)
     gate_direct_candles: bool = Field(default=True)
+    resample_from: str | None = Field(default=None)
     gate_contract_stats_enabled: bool = Field(default=False)
     gate_contract_stats_interval_seconds: int = Field(default=300, ge=10, le=3600)
     gate_contract_stats_backfill_days: int = Field(default=179, ge=1, le=180)
@@ -138,6 +139,16 @@ class Settings(BaseSettings):
                 )
             return filtered
         return raw_chain
+
+    @field_validator("resample_from", mode="before")
+    @classmethod
+    def _validate_resample_from(cls, value: object) -> str | None:
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return None
+        cleaned = str(value).strip().lower()
+        if cleaned not in {"1m", "5m", "15m", "1h"}:
+            raise ValueError("resample_from must be one of: 1m, 5m, 15m, 1h")
+        return cleaned
 
     @field_validator("tradingview_webhook_secret", mode="before")
     @classmethod

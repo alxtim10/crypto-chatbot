@@ -43,6 +43,7 @@ from crypto_chatbot.market_data.base import (
     DerivativesLiquidityProvider,
     FuturesTickerBatch,
     FuturesTickerProvider,
+    HistoryMarketDataProvider,
     MarketDataProvider,
     OhlcvBatch,
 )
@@ -56,6 +57,7 @@ from crypto_chatbot.market_data.quality import (
     determine_quality_status,
     is_candle_stale,
 )
+from crypto_chatbot.market_data.resampling import resample_candles
 from crypto_chatbot.market_data.symbols import resolve_default_perp_symbol
 from crypto_chatbot.market_data.tradingview import compare_packet_with_exchange_candles
 from crypto_chatbot.ml.shadow import ShadowInferenceEngine
@@ -1604,6 +1606,7 @@ class AnalysisService:
         prediction_repository: ModelPredictionRepository | None = None,
         dxy_provider: DxyMarketDataProvider | None = None,
         contract_stats_repository: ContractStatsRepository | None = None,
+        resample_from: Timeframe | None = None,
         cache_ttl_seconds: float = 0.0,
         cache_max_entries: int = 256,
     ) -> None:
@@ -1619,6 +1622,7 @@ class AnalysisService:
         self._prediction_repository = prediction_repository
         self._dxy_provider = dxy_provider
         self._contract_stats_repository = contract_stats_repository
+        self._resample_from = resample_from
         self._cache_ttl_seconds = max(0.0, float(cache_ttl_seconds))
         self._cache_max_entries = max(1, int(cache_max_entries))
         self._ohlcv_cache: OrderedDict[tuple[str, Timeframe, int], tuple[float, OhlcvBatch]] = (
@@ -1670,6 +1674,97 @@ class AnalysisService:
         """Fetch normalized closed candles for one symbol/timeframe via active provider."""
         return await self._fetch_closed_ohlcv(symbol, timeframe, limit)
 
+    def _can_resample(self, target: Timeframe) -> bool:
+        if self._resample_from is None:
+            return False
+        base_secs = int(self._resample_from.duration.total_seconds())
+        target_secs = int(target.duration.total_seconds())
+        return target_secs > base_secs and target_secs % base_secs == 0
+
+    async def _fetch_timeframe_bundle(
+        self,
+        canonical_symbol: str,
+        requests: Sequence[tuple[Timeframe, int]],
+    ) -> tuple[dict[Timeframe, OhlcvBatch], MarketDataProvider, str | None]:
+        """Fetch a coherent set of timeframes from one pinned venue, resampling when configured."""
+        dedup_limits: dict[Timeframe, int] = {}
+        for tf, req_limit in requests:
+            dedup_limits[tf] = max(dedup_limits.get(tf, 0), max(1, req_limit))
+
+        resample_reqs: list[tuple[Timeframe, int]] = []
+        fetch_limits: dict[Timeframe, int] = {}
+        base_tf = self._resample_from
+        for tf, req_limit in dedup_limits.items():
+            if base_tf is not None and self._can_resample(tf):
+                resample_reqs.append((tf, req_limit))
+                ratio = int(tf.duration.total_seconds()) // int(base_tf.duration.total_seconds())
+                needed_base = req_limit * ratio + ratio
+                fetch_limits[base_tf] = max(fetch_limits.get(base_tf, 0), needed_base)
+            else:
+                fetch_limits[tf] = max(fetch_limits.get(tf, 0), req_limit)
+
+        pinned_provider: MarketDataProvider = self._provider
+        pinned_venue: str | None = None
+        if isinstance(self._provider, FallbackMarketDataProvider):
+            bundle_requests = [(canonical_symbol, tf, lim) for tf, lim in fetch_limits.items()]
+            bundle = await self._provider.get_closed_ohlcv_bundle(bundle_requests)
+            if bundle.provider is not None:
+                pinned_provider = bundle.provider
+                pinned_venue = bundle.venue
+            batches = {tf: bundle.batches[(canonical_symbol, tf)] for tf in fetch_limits}
+            if (
+                base_tf is not None
+                and base_tf in batches
+                and fetch_limits[base_tf] > 999
+                and len(batches[base_tf].candles) < fetch_limits[base_tf]
+                and isinstance(pinned_provider, HistoryMarketDataProvider)
+            ):
+                batches[base_tf] = await pinned_provider.get_closed_ohlcv_history(
+                    canonical_symbol,
+                    base_tf,
+                    limit=fetch_limits[base_tf],
+                )
+        else:
+            ordered_reqs = list(fetch_limits.items())
+
+            async def _fetch_one(tf: Timeframe, lim: int) -> OhlcvBatch:
+                if lim > 999 and isinstance(self._provider, HistoryMarketDataProvider):
+                    return await self._provider.get_closed_ohlcv_history(
+                        canonical_symbol, tf, limit=lim
+                    )
+                return await self._fetch_closed_ohlcv(canonical_symbol, tf, lim)
+
+            results = await asyncio.gather(*(_fetch_one(tf, lim) for tf, lim in ordered_reqs))
+            batches = dict(zip((tf for tf, _ in ordered_reqs), results, strict=True))
+
+        if resample_reqs and base_tf is not None:
+            base_batch = batches[base_tf]
+            for target_tf, req_limit in resample_reqs:
+                if base_batch.candles and not base_batch.has_provider_error:
+                    synthesized = resample_candles(
+                        base_batch.candles,
+                        target_timeframe=target_tf,
+                        as_of=base_batch.candles[-1].close_time,
+                    )
+                    if len(synthesized.candles) > req_limit:
+                        synthesized = synthesized.model_copy(
+                            update={"candles": synthesized.candles[-req_limit:]}
+                        )
+                    batches[target_tf] = synthesized
+                else:
+                    batches[target_tf] = OhlcvBatch(
+                        metadata=base_batch.metadata,
+                        canonical_symbol=base_batch.canonical_symbol,
+                        provider_symbol=base_batch.provider_symbol,
+                        timeframe=target_tf,
+                        received_time=base_batch.received_time,
+                        candles=(),
+                        quality_flags=base_batch.quality_flags or (QualityFlag.PROVIDER_ERROR,),
+                        error_message=base_batch.error_message,
+                    )
+
+        return batches, pinned_provider, pinned_venue
+
     async def analyze_multi_style(
         self,
         symbol: str,
@@ -1697,27 +1792,11 @@ class AnalysisService:
                 return limit
             return 100
 
-        core_requests = [(mapping.canonical_symbol, tf, _fetch_limit(tf)) for tf in core_tfs]
-        pinned_provider: MarketDataProvider = self._provider
-        pinned_venue: str | None = None
-        if isinstance(self._provider, FallbackMarketDataProvider):
-            bundle = await self._provider.get_closed_ohlcv_bundle(core_requests)
-            if bundle.provider is not None:
-                pinned_provider = bundle.provider
-                pinned_venue = bundle.venue
-            batches = {tf: bundle.batches[(mapping.canonical_symbol, tf)] for tf in core_tfs}
-        else:
-            core_results = await asyncio.gather(
-                *(
-                    self._fetch_closed_ohlcv(
-                        mapping.canonical_symbol,
-                        tf,
-                        _fetch_limit(tf),
-                    )
-                    for tf in core_tfs
-                )
-            )
-            batches = dict(zip(core_tfs, core_results, strict=True))
+        core_requests = [(tf, _fetch_limit(tf)) for tf in core_tfs]
+        batches, pinned_provider, pinned_venue = await self._fetch_timeframe_bundle(
+            mapping.canonical_symbol,
+            core_requests,
+        )
 
         effective_symbol = mapping.canonical_symbol
         effective_base = mapping.base
@@ -1848,30 +1927,18 @@ class AnalysisService:
             if include_mtf
             else []
         )
-        pinned_provider: MarketDataProvider = self._provider
-        pinned_venue: str | None = None
-        mtf_batches: dict[Timeframe, OhlcvBatch] | None = None
-
-        if isinstance(self._provider, FallbackMarketDataProvider):
-            bundle_requests: list[tuple[str, Timeframe, int]] = [
-                (mapping.canonical_symbol, timeframe, limit),
-                *((mapping.canonical_symbol, tf, 100) for tf in other_tfs),
-            ]
-            bundle = await self._provider.get_closed_ohlcv_bundle(bundle_requests)
-            primary = bundle.batches[(mapping.canonical_symbol, timeframe)]
-            if bundle.provider is not None:
-                pinned_provider = bundle.provider
-                pinned_venue = bundle.venue
-            if include_mtf:
-                mtf_batches = {
-                    tf: bundle.batches[(mapping.canonical_symbol, tf)] for tf in other_tfs
-                }
-        else:
-            primary = await self._fetch_closed_ohlcv(
-                mapping.canonical_symbol,
-                timeframe,
-                limit,
-            )
+        bundle_requests: list[tuple[Timeframe, int]] = [
+            (timeframe, limit),
+            *((tf, 100) for tf in other_tfs),
+        ]
+        batches, pinned_provider, pinned_venue = await self._fetch_timeframe_bundle(
+            mapping.canonical_symbol,
+            bundle_requests,
+        )
+        primary = batches[timeframe]
+        mtf_batches: dict[Timeframe, OhlcvBatch] | None = (
+            {tf: batches[tf] for tf in other_tfs} if include_mtf else None
+        )
 
         primary_ok = (
             bool(primary.candles)
@@ -1885,14 +1952,8 @@ class AnalysisService:
             pinned_venue = primary.metadata.venue
 
         if include_mtf and primary_ok:
-            if mtf_batches is None:
-                fetched = await asyncio.gather(
-                    *(
-                        self._provider.get_closed_ohlcv(effective_symbol, tf, limit=100)
-                        for tf in other_tfs
-                    )
-                )
-                mtf_batches = dict(zip(other_tfs, fetched, strict=True))
+            if mtf_batches is None:  # pragma: no cover
+                mtf_batches = {}
             optional_tasks: list[tuple[Timeframe, Any]] = []
             if timeframe is not Timeframe.M15:
                 optional_tasks.append(
@@ -2014,11 +2075,18 @@ class AnalysisService:
         btc_candles: tuple[MarketCandle, ...] | None = None
         if "BTC" not in mapping.canonical_symbol.upper() and primary_ok:
             try:
-                btc_batch = await pinned_provider.get_closed_ohlcv(
-                    "BTC/USDT:USDT",
-                    timeframe,
-                    limit=limit,
-                )
+                if self._can_resample(timeframe):
+                    btc_batches, _, _ = await self._fetch_timeframe_bundle(
+                        "BTC/USDT:USDT",
+                        [(timeframe, limit)],
+                    )
+                    btc_batch = btc_batches[timeframe]
+                else:
+                    btc_batch = await pinned_provider.get_closed_ohlcv(
+                        "BTC/USDT:USDT",
+                        timeframe,
+                        limit=limit,
+                    )
                 if btc_batch.candles:
                     btc_candles = btc_batch.candles
             except Exception:
