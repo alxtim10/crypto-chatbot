@@ -77,6 +77,10 @@ from crypto_chatbot.market_data.whale_provider import (
     WhaleDataProvider,
 )
 from crypto_chatbot.ml.experiment import run_offline_experiment
+from crypto_chatbot.ml.meta_labels import (
+    build_meta_label_dataset,
+    run_meta_labeling_experiment,
+)
 from crypto_chatbot.ml.shadow import compute_shadow_monitoring_report
 from crypto_chatbot.ml.trials import (
     JsonlTrialRegistry,
@@ -725,6 +729,7 @@ def _run_ml_experiment(
     news_fixture_path: Path | None,
     as_json: bool,
     persist: bool,
+    target: str = "legacy",
 ) -> int:
     engine: Any = None
     try:
@@ -767,6 +772,26 @@ def _run_ml_experiment(
             now=received_time,
         )
         news_obs = _load_news_observations_from_fixture(news_fixture_path)
+        if target == "meta":
+            meta_ds = build_meta_label_dataset(
+                {mapping.canonical_symbol: batch.candles},
+                timeframe=timeframe,
+                sentiment_by_symbol=(
+                    {mapping.canonical_symbol: news_obs} if news_obs is not None else None
+                ),
+            )
+            meta_res = run_meta_labeling_experiment(meta_ds)
+            if as_json:
+                print(meta_res.model_dump_json(indent=2))
+            else:
+                print(
+                    f"Meta-Labeling {meta_res.timeframe.value} ({', '.join(meta_res.symbols)}) "
+                    f"| status={meta_res.status} | model={meta_res.model_version} "
+                    f"| filled={meta_res.filled_events_count} "
+                    f"| no_fill={meta_res.no_fill_excluded_count} "
+                    f"| promoted={meta_res.promoted}"
+                )
+            return 0
         config = MlExperimentConfig(
             canonical_symbol=mapping.canonical_symbol,
             timeframe=timeframe,
@@ -1523,6 +1548,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Optional Phase 11 news JSON fixture.",
     )
     ml_parser.add_argument(
+        "--target",
+        choices=("legacy", "meta"),
+        default="legacy",
+        help="ML target mode: 'meta' (PRD v1.7 meta-labeling) or 'legacy' (shadow-only 24h).",
+    )
+    ml_parser.add_argument(
         "--json", action="store_true", help="Print full MlExperimentReport JSON."
     )
     ml_parser.add_argument(
@@ -1889,6 +1920,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             news_fixture_path=args.news_fixture,
             as_json=args.json,
             persist=args.persist,
+            target=args.target,
         )
     if args.command == "backup-db":
         return _run_backup_db(
