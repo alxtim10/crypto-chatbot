@@ -226,6 +226,106 @@ def _append_ml_prediction_lines(
     lines.append(f"- Peringatan: {_esc(pred.non_guarantee_notice, html_mode)}")
 
 
+def _append_positioning_lines(
+    lines: list[str],
+    snapshot: AnalysisSnapshot,
+    *,
+    html_mode: bool,
+) -> None:
+    pos = snapshot.positioning
+    if pos is None:
+        return
+    lines.append("")
+    lines.append(
+        _bold(
+            f"Panel Positioning Derivatif ({pos.parity_mode} — {pos.venue.upper()})",
+            html_mode,
+        )
+    )
+    if pos.status == "UNAVAILABLE":
+        lines.append(
+            _esc(
+                f"- Status: UNAVAILABLE ({pos.note or 'belum ada histori contract_stats'})",
+                html_mode,
+            )
+        )
+        return
+    parts: list[str] = [f"Status: {pos.status}"]
+    if pos.top_lsr_account is not None:
+        top_txt = f"Top L/S: {format_indonesian_number(pos.top_lsr_account, 2)}"
+        if pos.top_lsr_account_pct_30d is not None and pos.top_lsr_account_z_30d is not None:
+            pct = format_indonesian_number(pos.top_lsr_account_pct_30d, 1)
+            z = format_indonesian_number(pos.top_lsr_account_z_30d, 2, signed=True)
+            top_txt += f" (P{pct} / z={z})"
+        parts.append(top_txt)
+    if pos.lsr_taker is not None:
+        tkr_txt = f"Taker L/S: {format_indonesian_number(pos.lsr_taker, 2)}"
+        if pos.lsr_taker_pct_30d is not None and pos.lsr_taker_z_30d is not None:
+            pct = format_indonesian_number(pos.lsr_taker_pct_30d, 1)
+            z = format_indonesian_number(pos.lsr_taker_z_30d, 2, signed=True)
+            tkr_txt += f" (P{pct} / z={z})"
+        parts.append(tkr_txt)
+    if pos.oi_24h_delta_pct is not None:
+        parts.append(f"OI 24h: {format_indonesian_number(pos.oi_24h_delta_pct, 2, signed=True)}%")
+    if pos.liq_skew_24h is not None:
+        parts.append(f"Liq skew: {format_indonesian_number(pos.liq_skew_24h, 2, signed=True)}")
+    lines.append(_esc("- " + " | ".join(parts), html_mode))
+    if pos.note:
+        lines.append(_esc(f"- Catatan: {pos.note}", html_mode))
+
+
+def _append_positioning_lines(
+    lines: list[str],
+    snapshot: AnalysisSnapshot,
+    *,
+    html_mode: bool,
+) -> None:
+    pos = snapshot.positioning
+    if pos is None:
+        return
+    lines.append("")
+    lines.append(
+        _bold(
+            f"Panel Positioning Derivatif ({pos.parity_mode} — {pos.venue.upper()})",
+            html_mode,
+        )
+    )
+    if pos.status == "UNAVAILABLE":
+        lines.append(
+            _esc(
+                f"- Status: UNAVAILABLE ({pos.note or 'belum ada histori contract_stats'})",
+                html_mode,
+            )
+        )
+        return
+    parts: list[str] = [f"Status: {pos.status}"]
+    if pos.top_lsr_account is not None:
+        top_txt = f"Top L/S: {format_indonesian_number(pos.top_lsr_account, 2)}"
+        if pos.top_lsr_account_pct_30d is not None and pos.top_lsr_account_z_30d is not None:
+            pct = format_indonesian_number(pos.top_lsr_account_pct_30d, 1)
+            z = format_indonesian_number(pos.top_lsr_account_z_30d, 2, signed=True)
+            top_txt += f" (P{pct} / z={z})"
+        parts.append(top_txt)
+    if pos.lsr_taker is not None:
+        tkr_txt = f"Taker L/S: {format_indonesian_number(pos.lsr_taker, 2)}"
+        if pos.lsr_taker_pct_30d is not None and pos.lsr_taker_z_30d is not None:
+            pct = format_indonesian_number(pos.lsr_taker_pct_30d, 1)
+            z = format_indonesian_number(pos.lsr_taker_z_30d, 2, signed=True)
+            tkr_txt += f" (P{pct} / z={z})"
+        parts.append(tkr_txt)
+    if pos.oi_24h_delta_pct is not None:
+        parts.append(
+            f"OI 24h: {format_indonesian_number(pos.oi_24h_delta_pct, 2, signed=True)}%"
+        )
+    if pos.liq_skew_24h is not None:
+        parts.append(
+            f"Liq skew: {format_indonesian_number(pos.liq_skew_24h, 2, signed=True)}"
+        )
+    lines.append(_esc("- " + " | ".join(parts), html_mode))
+    if pos.note:
+        lines.append(_esc(f"- Catatan: {pos.note}", html_mode))
+
+
 def render_deterministic_snapshot(
     snapshot: AnalysisSnapshot,
     *,
@@ -469,6 +569,9 @@ def render_deterministic_snapshot(
 
         if snapshot.sentiment is not None:
             _append_sentiment_lines(lines, snapshot, html_mode=html_mode, max_sources=3)
+
+        if snapshot.positioning is not None:
+            _append_positioning_lines(lines, snapshot, html_mode=html_mode)
 
         if snapshot.prediction_markets is not None and snapshot.prediction_markets.observations:
             pm = snapshot.prediction_markets
@@ -787,6 +890,27 @@ def render_compact_snapshot(
                 )
             macro_parts.append(btc_info)
         lines.append(_esc("Konteks Makro & Posisi: " + " | ".join(macro_parts), html_mode))
+
+    if snapshot.positioning is not None:
+        pos = snapshot.positioning
+        pos_parts: list[str] = [f"Status: {pos.status}"]
+        if pos.top_lsr_account is not None:
+            top_tok = format_indonesian_number(pos.top_lsr_account, 2)
+            if pos.top_lsr_account_pct_30d is not None:
+                top_tok += f" (P{format_indonesian_number(pos.top_lsr_account_pct_30d, 0)})"
+            pos_parts.append(f"Top L/S: {top_tok}")
+        if pos.lsr_taker is not None:
+            pos_parts.append(f"Taker: {format_indonesian_number(pos.lsr_taker, 2)}")
+        if pos.oi_24h_delta_pct is not None:
+            pos_parts.append(
+                f"OI 24h: {format_indonesian_number(pos.oi_24h_delta_pct, 1, signed=True)}%"
+            )
+        lines.append(
+            _esc(
+                f"Positioning ({pos.parity_mode}): " + " | ".join(pos_parts),
+                html_mode,
+            )
+        )
 
     if len(snapshot.mtf_overview) >= 2:
         tf_chain = " → ".join(ov.timeframe.value for ov in snapshot.mtf_overview)

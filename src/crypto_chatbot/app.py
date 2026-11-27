@@ -80,6 +80,7 @@ def build_telegram_application(
     tradingview_repo = PostgresTradingViewRepository(engine)
     news_repo = PostgresNewsRepository(engine)
     memory_repo = PostgresUserMemoryRepository(engine)
+    contract_stats_repo = PostgresContractStatsRepository(engine)
     provider, derivatives_provider = build_futures_providers(
         settings.futures_exchange_chain,
         cooldown_minutes=settings.venue_cooldown_min,
@@ -99,6 +100,7 @@ def build_telegram_application(
         tradingview_repository=tradingview_repo,
         news_repository=news_repo,
         dxy_provider=dxy_provider,
+        contract_stats_repository=contract_stats_repo,
         cache_ttl_seconds=45.0,
     )
 
@@ -139,7 +141,7 @@ def build_telegram_application(
         contract_stats_client = GateContractStatsClient()
         contract_stats_recorder = ContractStatsRecorder(
             client=contract_stats_client,
-            repository=PostgresContractStatsRepository(engine),
+            repository=contract_stats_repo,
         )
         contract_stats_scheduler = ContractStatsScheduler(
             contract_stats_recorder,

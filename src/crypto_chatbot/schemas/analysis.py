@@ -401,6 +401,38 @@ class DerivativesMetrics(BaseModel):
     cross_source_pair: str | None = None
 
 
+PositioningStatus = Literal["READY", "WARMING_UP", "UNAVAILABLE"]
+
+
+class PositioningPanel(BaseModel):
+    """Gate.io perpetual crowd/top-trader positioning sentiment panel (FORWARD_ONLY, S-01)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    parity_mode: Literal["FORWARD_ONLY"] = "FORWARD_ONLY"
+    status: PositioningStatus = "UNAVAILABLE"
+    venue: str = Field(default="gateio", min_length=1)
+    canonical_symbol: str = Field(min_length=1)
+    as_of: UtcDatetime
+    history_days: FiniteFloat = Field(default=0.0, ge=0.0)
+    observation_count: int = Field(default=0, ge=0)
+    top_lsr_account: FiniteFloat | None = None
+    lsr_taker: FiniteFloat | None = None
+    lsr_account: FiniteFloat | None = None
+    top_lsr_size: FiniteFloat | None = None
+    open_interest_usd: FiniteFloat | None = Field(default=None, ge=0.0)
+    oi_24h_delta_pct: FiniteFloat | None = None
+    long_liq_24h_usd: FiniteFloat | None = Field(default=None, ge=0.0)
+    short_liq_24h_usd: FiniteFloat | None = Field(default=None, ge=0.0)
+    liq_skew_24h: FiniteFloat | None = Field(default=None, ge=-1.0, le=1.0)
+    top_lsr_account_pct_30d: FiniteFloat | None = Field(default=None, ge=0.0, le=100.0)
+    top_lsr_account_z_30d: FiniteFloat | None = None
+    lsr_taker_pct_30d: FiniteFloat | None = Field(default=None, ge=0.0, le=100.0)
+    lsr_taker_z_30d: FiniteFloat | None = None
+    summary_label: str = "tidak_tersedia"
+    note: str | None = None
+
+
 class ModelPredictionSummary(BaseModel):
     """User-facing experimental prediction attached only when ML release mode is PROMOTED."""
 
@@ -450,6 +482,7 @@ class AnalysisSnapshot(BaseModel):
     cross_venue_derivatives: CrossVenueDerivativesSummary | None = None
     prediction_markets: PredictionMarketSummary | None = None
     macro_context: MacroBenchmarkContext | None = None
+    positioning: PositioningPanel | None = None
     ml_prediction: ModelPredictionSummary | None = None
     facts: tuple[Fact, ...] = ()
     regime: Regime | None = None
@@ -533,6 +566,9 @@ class AnalysisSnapshot(BaseModel):
                 and self.macro_context.btc_benchmark.as_of > self.as_of
             ):
                 raise ValueError("btc_benchmark as_of cannot exceed snapshot as_of (lookahead)")
+
+        if self.positioning is not None and self.positioning.as_of > self.as_of:
+            raise ValueError("positioning as_of cannot exceed snapshot as_of (lookahead)")
 
         if self.quality_status in (QualityStatus.READY, QualityStatus.DEGRADED):
             if self.input_range is None:

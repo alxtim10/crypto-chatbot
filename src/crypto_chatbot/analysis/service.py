@@ -27,6 +27,7 @@ from crypto_chatbot.analysis.indicators import (
 )
 from crypto_chatbot.analysis.macro import build_macro_benchmark_context
 from crypto_chatbot.analysis.orderflow import compute_closed_candle_orderflow
+from crypto_chatbot.analysis.positioning import compute_positioning_panel
 from crypto_chatbot.analysis.regimes import classify_regime, classify_volatility_regime
 from crypto_chatbot.analysis.setup import SETUP_PARAMETERS, build_trade_setup
 from crypto_chatbot.analysis.smc import analyze_smc
@@ -64,6 +65,7 @@ from crypto_chatbot.schemas.analysis import (
     DerivativesMetrics,
     Fact,
     InputRange,
+    PositioningPanel,
     Regime,
     SetupStatus,
     SmcSummary,
@@ -91,6 +93,7 @@ from crypto_chatbot.schemas.market import (
 from crypto_chatbot.schemas.news import SentimentMetrics, SentimentObservation
 from crypto_chatbot.schemas.tradingview import TradingViewMetrics, TradingViewPacket
 from crypto_chatbot.storage.repositories import (
+    ContractStatsRepository,
     DerivativesRepository,
     MarketRepository,
     ModelPredictionRepository,
@@ -1219,6 +1222,7 @@ def build_analysis_snapshot(
     dxy_candles: Sequence[MarketCandle] | None = None,
     btc_candles: Sequence[MarketCandle] | None = None,
     macro_context: MacroBenchmarkContext | None = None,
+    positioning: PositioningPanel | None = None,
 ) -> AnalysisSnapshot:
     """Assemble a complete deterministic `AnalysisSnapshot` from spot and optional inputs."""
     if batch.has_provider_error or not batch.candles:
@@ -1522,6 +1526,7 @@ def build_analysis_snapshot(
         order_flow=actual_order_flow,
         cross_venue_derivatives=cross_venue_derivatives,
         macro_context=macro_context,
+        positioning=positioning,
         facts=facts,
         regime=regime,
         market_structure=structure.market_structure,
@@ -1598,6 +1603,7 @@ class AnalysisService:
         shadow_engine: ShadowInferenceEngine | None = None,
         prediction_repository: ModelPredictionRepository | None = None,
         dxy_provider: DxyMarketDataProvider | None = None,
+        contract_stats_repository: ContractStatsRepository | None = None,
         cache_ttl_seconds: float = 0.0,
         cache_max_entries: int = 256,
     ) -> None:
@@ -1612,6 +1618,7 @@ class AnalysisService:
         self._shadow_engine = shadow_engine
         self._prediction_repository = prediction_repository
         self._dxy_provider = dxy_provider
+        self._contract_stats_repository = contract_stats_repository
         self._cache_ttl_seconds = max(0.0, float(cache_ttl_seconds))
         self._cache_max_entries = max(1, int(cache_max_entries))
         self._ohlcv_cache: OrderedDict[tuple[str, Timeframe, int], tuple[float, OhlcvBatch]] = (
@@ -2017,6 +2024,32 @@ class AnalysisService:
             except Exception:
                 btc_candles = None
 
+        positioning_panel: PositioningPanel | None = None
+        if self._contract_stats_repository is not None and primary_ok and primary.candles:
+            primary_as_of = primary.candles[-1].close_time
+            win_start = primary_as_of - timedelta(days=30)
+            stats_obs = self._contract_stats_repository.load_contract_stats(
+                venue="gateio",
+                canonical_symbol=mapping.canonical_symbol,
+                interval="5m",
+                start_time=win_start,
+                end_available_time=primary_as_of,
+            )
+            if not stats_obs:
+                stats_obs = self._contract_stats_repository.load_contract_stats(
+                    venue="gate",
+                    canonical_symbol=mapping.canonical_symbol,
+                    interval="5m",
+                    start_time=win_start,
+                    end_available_time=primary_as_of,
+                )
+            positioning_panel = compute_positioning_panel(
+                stats_obs,
+                canonical_symbol=mapping.canonical_symbol,
+                as_of=primary_as_of,
+                use_available_time=True,
+            )
+
         snapshot = build_analysis_snapshot(
             primary,
             mtf_batches=mtf_batches,
@@ -2026,6 +2059,7 @@ class AnalysisService:
             cross_venue_derivatives=cross_venue,
             dxy_candles=dxy_candles,
             btc_candles=btc_candles,
+            positioning=positioning_panel,
         )
 
         if self._shadow_engine is not None:

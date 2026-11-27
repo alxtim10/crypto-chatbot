@@ -68,6 +68,11 @@ from crypto_chatbot.analysis.momentum_screener import (
     screen_momentum_movers,
 )
 from crypto_chatbot.analysis.pine_export import generate_pine_script
+from crypto_chatbot.analysis.positioning import (
+    DEFAULT_POSITIONING_WARMUP_DAYS,
+    DEFAULT_POSITIONING_WINDOW_DAYS,
+    compute_positioning_panel,
+)
 from crypto_chatbot.analysis.regimes import (
     HIGH_VOLATILITY_ATR_PERCENTILE,
     RANGING_ADX_MAX,
@@ -104,6 +109,8 @@ __all__ = [
     "DEFAULT_FAILED_BREAKOUT_WINDOW",
     "DEFAULT_MIN_VOLUME_24H_USD",
     "DEFAULT_PIVOT_K",
+    "DEFAULT_POSITIONING_WARMUP_DAYS",
+    "DEFAULT_POSITIONING_WINDOW_DAYS",
     "DEFAULT_SCAN_BASKET",
     "DERIVATIVES_PARAMETERS",
     "HIGH_VOLATILITY_ATR_PERCENTILE",
@@ -153,6 +160,7 @@ __all__ = [
     "compute_candles_sha256",
     "compute_derivatives_metrics",
     "compute_mtf_rsi_alignment",
+    "compute_positioning_panel",
     "compute_previous_period_levels",
     "compute_technical_metrics",
     "detect_confirmed_swings",
