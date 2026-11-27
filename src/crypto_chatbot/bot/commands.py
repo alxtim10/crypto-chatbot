@@ -487,6 +487,8 @@ def _find_non_usdt_pairs(text: str, universe: frozenset[str]) -> list[str]:
         if quote in _KNOWN_NON_USDT_QUOTES and _in_perp_universe(base, universe):
             matches.append(f"{match.group(1)}/{match.group(2)}")
     return matches
+
+
 _ORDER_OR_ADVICE_RE = re.compile(
     r"(?:\bpasang\s+order\b|\bexecute\s+order\b|\border\s+sekarang\b|"
     r"\bbeli\s+sekarang\b|\bjual\s+sekarang\b|\bbelikan\b|\bjualkan\b|"

@@ -64,7 +64,6 @@ from crypto_chatbot.bot.templates import (
     split_telegram_message,
 )
 from crypto_chatbot.llm.gemini import GeminiNarrator, IntentClassificationOutcome
-from crypto_chatbot.llm.guard import validate_conversational_answer
 from crypto_chatbot.llm.render import render_analysis_response, render_comparison_response
 from crypto_chatbot.market_data.symbols import (
     DEFAULT_PERP_UNIVERSE,
@@ -1217,6 +1216,47 @@ class BotService:
         base_trace = routing_trace or RoutingTrace(layer="layer2", intent="chat_qa")
         if qa_outcome.answer is None:
             qa_reason = qa_outcome.failure_reason or "failed"
+            if qa_reason == "guard_rejected":
+                primary_rule = (
+                    qa_outcome.guard_violations[0] if qa_outcome.guard_violations else "unknown"
+                )
+                reason_tag = f"guard_rejected:{primary_rule}"
+                fallback_reason = (
+                    reason_tag
+                    if not base_trace.fallback_reason
+                    else f"{base_trace.fallback_reason}|{reason_tag}"
+                )
+                enriched_trace = base_trace.model_copy(
+                    update={
+                        "fallback_reason": fallback_reason,
+                        "guard_violations": qa_outcome.guard_violations,
+                    }
+                )
+                self._log_routing_trace(request_id, enriched_trace)
+                await asyncio.to_thread(
+                    self._memory.record_routing_trace,
+                    user_id=user_id,
+                    request_id=request_id,
+                    trace=enriched_trace,
+                    model_id=qa_outcome.model_id,
+                    validation_passed=False,
+                    rejection_reasons=qa_outcome.guard_violations,
+                    prompt_tokens=qa_outcome.prompt_tokens,
+                    output_tokens=qa_outcome.output_tokens,
+                    latency_ms=qa_outcome.latency_ms,
+                )
+                logger.warning(
+                    "request_id=%s user_id=%s action=chat_qa guard_rejected=%s",
+                    request_id,
+                    user_id,
+                    ",".join(qa_outcome.guard_violations),
+                )
+                return (
+                    "Maaf, jawaban tidak lolos filter keamanan riset (mengandung klaim kepastian, "
+                    "instruksi eksekusi langsung, atau tautan terlarang). Silakan ajukan "
+                    "pertanyaan edukasi lain atau gunakan /analyze BTC.",
+                )
+
             enriched_trace = base_trace.model_copy(
                 update={
                     "fallback_reason": (
@@ -1245,38 +1285,6 @@ class BotService:
                 "Anda tetap bisa menyebut nama koin (mis. 'analisa BTC') atau /scan.",
             )
         answer = qa_outcome.answer
-        guard = validate_conversational_answer(answer)
-        if not guard.is_valid:
-            enriched_trace = base_trace.model_copy(
-                update={
-                    "fallback_reason": "qa_guard_rejected",
-                    "guard_violations": guard.reasons,
-                }
-            )
-            self._log_routing_trace(request_id, enriched_trace)
-            await asyncio.to_thread(
-                self._memory.record_routing_trace,
-                user_id=user_id,
-                request_id=request_id,
-                trace=enriched_trace,
-                model_id=qa_outcome.model_id,
-                validation_passed=False,
-                rejection_reasons=guard.reasons,
-                prompt_tokens=qa_outcome.prompt_tokens,
-                output_tokens=qa_outcome.output_tokens,
-                latency_ms=qa_outcome.latency_ms,
-            )
-            logger.warning(
-                "request_id=%s user_id=%s action=chat_qa guard_rejected=%s",
-                request_id,
-                user_id,
-                ",".join(guard.reasons),
-            )
-            return (
-                "Maaf, jawaban tidak lolos filter keamanan riset (mengandung klaim kepastian, "
-                "instruksi eksekusi langsung, atau tautan terlarang). Silakan ajukan pertanyaan "
-                "edukasi lain atau gunakan /analyze BTC.",
-            )
         self._log_routing_trace(request_id, base_trace)
         await asyncio.to_thread(
             self._memory.record_routing_trace,

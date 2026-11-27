@@ -521,8 +521,8 @@ async def test_routing_trace_persisted_without_pii_across_paths(
         [
             # 1) Layer 2 classify_intent -> chat_qa
             json.dumps({"intent": "chat_qa", "symbols": [], "timeframe": None}),
-            # 2) QA answer -> blocked by guard ("pasti")
-            json.dumps({"answer": "RSI 70 pasti membuat harga berbalik turun."}),
+            # 2) QA answer -> blocked by guard ("pasti turun")
+            json.dumps({"answer": "RSI 70 pasti turun sehingga langsung short."}),
             # 3) Layer 2 classify_intent -> chat_qa
             json.dumps({"intent": "chat_qa", "symbols": [], "timeframe": None}),
             # 4) QA answer -> valid
@@ -562,14 +562,16 @@ async def test_routing_trace_persisted_without_pii_across_paths(
     assert rec_whale.intent == "whale"
     assert rec_whale.detected_symbol is None
 
-    # 3) Chat QA guard rejected -> records guard_violations
-    await bot.handle_text_message(111, "apa itu RSI 70?")
+    # 3) Chat QA guard rejected -> records guard_violations & guard-specific reply
+    qa_guard_reply = "\n".join(await bot.handle_text_message(111, "apa itu RSI 70?"))
     rec_qa_guard = repo.interactions[-1]
     assert rec_qa_guard.layer == "layer2"
     assert rec_qa_guard.intent == "chat_qa"
-    assert rec_qa_guard.fallback_reason == "qa_guard_rejected"
+    assert rec_qa_guard.fallback_reason == "guard_rejected:overconfidence_lexicon:pasti"
     assert "overconfidence_lexicon:pasti" in rec_qa_guard.guard_violations
     assert rec_qa_guard.validation_passed is False
+    assert "filter keamanan riset" in qa_guard_reply.lower()
+    assert "kuota atau sibuk" not in qa_guard_reply.lower()
 
     # 4) Chat QA valid
     await bot.handle_text_message(111, "apa itu RSI 70?")
@@ -791,6 +793,7 @@ async def test_evaluate_router_casual_id_fixture_diagnostics() -> None:
     assert len(l1_false_pos_symbols) == 0
     assert len(l1_ada_missed) == 0
     assert l1_hard_refusal["EDU_QA"] == 0
+    assert diag_healthy.guard_rejections["EDU_QA"] == 0
 
 
 @pytest.mark.asyncio

@@ -228,3 +228,60 @@ def test_conversational_answer_guard_blocks_unsafe_claims_and_allows_education()
     ):
         res = validate_conversational_answer(unsafe)
         assert res.is_valid is False
+
+
+@pytest.mark.parametrize(
+    "responsible_text",
+    [
+        "RSI 70 bukan jaminan harga pasti turun, tetap kelola risiko.",
+        "Tidak ada indikator yang pasti 100% akurat di semua kondisi pasar.",
+        "Hindari all-in pada satu posisi agar modal tetap terkendali.",
+        "Tidak ada strategi trading yang bebas risiko, selalu gunakan stop loss.",
+        "RSI 70 merupakan level jenuh beli, bukan jaminan pembalikan arah.",
+        "Jangan pernah menganggap sinyal teknikal sebagai garansi keuntungan.",
+        "Perdagangan futures kripto tidak pernah bebas risiko karena volatilitas tinggi.",
+        "Fakta masa lalu tidak dapat dijadikan jaminan profit di masa depan.",
+        "Hindari perilaku beli sekarang karena FOMO tanpa rencana invalidasi.",
+        "Dilarang all-in menggunakan leverage tinggi pada satu entry.",
+        "Indikator momentum pasti memiliki sinyal palsu saat pasar sideways.",
+        "Belum tentu harga berbalik meskipun RSI berada di area ekstrem.",
+        "Edukasi ini tidak menjanjikan posisi risk-free atau tanpa kerugian.",
+        "Jangan berharap profit pasti dari satu pola candle saja.",
+        "Pola struktur pasar bukan garansi harga akan langsung bergerak sesuai skenario.",
+    ],
+)
+def test_conversational_guard_allows_responsible_disclaimers(responsible_text: str) -> None:
+    from crypto_chatbot.llm.guard import validate_conversational_answer
+
+    res = validate_conversational_answer(responsible_text)
+    assert res.is_valid is True, f"False positive guard rejection: {res.reasons}"
+
+
+@pytest.mark.parametrize(
+    "overconfident_text",
+    [
+        "BTC pasti naik menembus resistance malam ini.",
+        "Altcoin ini pasti turun tajam besok pagi.",
+        "Ikuti setup ini karena pasti untung besar.",
+        "Sinyal ini pasti cuan tanpa perlu ragu.",
+        "Strategi breakout ini pasti profit setiap minggu.",
+        "Metode ini dijamin berhasil untuk semua kondisi market.",
+        "Ada jaminan balik modal jika ikut sinyal VIP.",
+        "Sistem ini memberi garansi hasil konsisten.",
+        "Posisi ini tanpa risiko sama sekali.",
+        "Trading futures dengan metode ini bebas risiko kerugian.",
+        "Setup ini tidak ada risiko karena memakai stop ketat.",
+        "Wajib beli ETH sebelum candle berikutnya tutup.",
+        "Wajib jual semua aset kripto Anda sekarang.",
+        "Segera beli sekarang sebelum harga terbang tinggi.",
+        "Waktunya all-in seluruh modal di BTC hari ini.",
+        "Strategi ini 100% profit dan sure win.",
+    ],
+)
+def test_conversational_guard_blocks_positive_overconfidence_claims(
+    overconfident_text: str,
+) -> None:
+    from crypto_chatbot.llm.guard import validate_conversational_answer
+
+    res = validate_conversational_answer(overconfident_text)
+    assert res.is_valid is False, f"Missed overconfident claim: {overconfident_text!r}"
