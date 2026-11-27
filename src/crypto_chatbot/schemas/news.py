@@ -173,3 +173,25 @@ class SentimentMetrics(BaseModel):
     sentiment_backfilled: bool = False
     buckets: tuple[SentimentBucket, ...] = ()
     sources: tuple[NewsSourceLink, ...] = ()
+
+
+class FearGreedObservation(BaseModel):
+    """Daily Alternative.me Crypto Fear & Greed Index observation (S-02)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    source: str = Field(default="alternative.me", min_length=1)
+    observed_time: UtcDatetime
+    received_time: UtcDatetime
+    available_time: UtcDatetime
+    value: int = Field(ge=0, le=100)
+    classification: str = Field(min_length=1)
+    normalized_score: FiniteFloat = Field(ge=-1.0, le=1.0)
+    is_backfilled: bool = False
+    raw_payload: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _validate_times(self) -> FearGreedObservation:
+        if self.available_time < self.observed_time:
+            raise ValueError("available_time cannot precede observed_time")
+        return self

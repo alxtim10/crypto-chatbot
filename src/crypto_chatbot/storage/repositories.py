@@ -33,6 +33,7 @@ from crypto_chatbot.schemas.market import (
 from crypto_chatbot.schemas.ml import MlExperimentReport, ShadowPredictionRecord
 from crypto_chatbot.schemas.news import (
     MIN_ENTITY_MATCH_CONFIDENCE,
+    FearGreedObservation,
     NormalizedNewsArticle,
     SentimentLabel,
     SentimentObservation,
@@ -47,6 +48,7 @@ from crypto_chatbot.storage.models import (
     AnalysisSnapshotRow,
     ContractStatsRow,
     ConversationRow,
+    FearGreedRow,
     FundingRateRow,
     GateIngestLedgerRow,
     LiquidationEventRow,
@@ -303,6 +305,20 @@ class GateIngestRepository(Protocol):
         inserted_rows: int,
         ingested_at: datetime,
     ) -> None: ...
+
+
+class FearGreedRepository(Protocol):
+    """Repository protocol for daily Fear & Greed Index snapshots (S-02)."""
+
+    def save_observations(self, observations: Sequence[FearGreedObservation]) -> int: ...
+
+    def load_observations(
+        self,
+        *,
+        source: str = "alternative.me",
+        end_available_time: datetime | None = None,
+        limit: int | None = None,
+    ) -> tuple[FearGreedObservation, ...]: ...
 
 
 class SetupLogRepository(Protocol):
@@ -2263,3 +2279,77 @@ class PostgresGateIngestRepository:
         )
         with Session(self._engine) as session, session.begin():
             session.execute(stmt)
+
+
+class PostgresFearGreedRepository:
+    """Synchronous PostgreSQL repository for Alternative.me Fear & Greed observations."""
+
+    _INSERT_BATCH_SIZE = 500
+
+    def __init__(self, engine: Engine) -> None:
+        self._engine = engine
+
+    def save_observations(self, observations: Sequence[FearGreedObservation]) -> int:
+        if not observations:
+            return 0
+        rows = [
+            {
+                "source": obs.source,
+                "observed_time": _to_utc(obs.observed_time),
+                "received_time": _to_utc(obs.received_time),
+                "available_time": _to_utc(obs.available_time),
+                "value": obs.value,
+                "classification": obs.classification,
+                "normalized_score": obs.normalized_score,
+                "is_backfilled": obs.is_backfilled,
+                "raw_payload": obs.raw_payload,
+            }
+            for obs in observations
+        ]
+        inserted_total = 0
+        with Session(self._engine) as session, session.begin():
+            for idx in range(0, len(rows), self._INSERT_BATCH_SIZE):
+                chunk = rows[idx : idx + self._INSERT_BATCH_SIZE]
+                stmt = (
+                    insert(FearGreedRow)
+                    .values(chunk)
+                    .on_conflict_do_nothing(constraint="uq_fear_greed_source_time")
+                    .returning(FearGreedRow.id)
+                )
+                inserted_total += len(session.scalars(stmt).all())
+        return inserted_total
+
+    def load_observations(
+        self,
+        *,
+        source: str = "alternative.me",
+        end_available_time: datetime | None = None,
+        limit: int | None = None,
+    ) -> tuple[FearGreedObservation, ...]:
+        stmt = select(FearGreedRow).where(FearGreedRow.source == source)
+        if end_available_time is not None:
+            stmt = stmt.where(FearGreedRow.available_time <= _to_utc(end_available_time))
+        if limit is not None:
+            if limit < 1:
+                raise ValueError("limit must be >= 1")
+            stmt = stmt.order_by(FearGreedRow.observed_time.desc()).limit(limit)
+        else:
+            stmt = stmt.order_by(FearGreedRow.observed_time.asc())
+        with Session(self._engine) as session:
+            db_rows = list(session.scalars(stmt))
+        if limit is not None:
+            db_rows.reverse()
+        return tuple(
+            FearGreedObservation(
+                source=row.source,
+                observed_time=_to_utc(row.observed_time),
+                received_time=_to_utc(row.received_time),
+                available_time=_to_utc(row.available_time),
+                value=row.value,
+                classification=row.classification,
+                normalized_score=row.normalized_score,
+                is_backfilled=row.is_backfilled,
+                raw_payload=dict(row.raw_payload),
+            )
+            for row in db_rows
+        )

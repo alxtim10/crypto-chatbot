@@ -116,6 +116,7 @@ from crypto_chatbot.storage.repositories import (
     NewsRepository,
     PostgresContractStatsRepository,
     PostgresDerivativesRepository,
+    PostgresFearGreedRepository,
     PostgresGateIngestRepository,
     PostgresMarketRepository,
     PostgresMlExperimentRepository,
@@ -1831,6 +1832,61 @@ def _run_sync_gate_funding(
     return 0
 
 
+def _run_sync_fear_greed(
+    *,
+    limit: int,
+    as_json: bool,
+    database_url: str | None,
+) -> int:
+    from crypto_chatbot.news.fear_greed import FearGreedClient, sync_fear_greed
+
+    resolved_url = database_url or os.environ.get("DATABASE_URL")
+    if not resolved_url:
+        try:
+            settings = load_settings()
+            resolved_url = settings.database_url.get_secret_value()
+        except Exception:
+            resolved_url = None
+    if not resolved_url:
+        print("Error: DATABASE_URL is required for sync-fear-greed.", file=sys.stderr)
+        return 1
+
+    engine = create_db_engine(resolved_url)
+    init_db(engine)
+    repo = PostgresFearGreedRepository(engine)
+
+    async def _run_async() -> Any:
+        client = FearGreedClient()
+        try:
+            return await sync_fear_greed(client=client, repository=repo, limit=limit)
+        finally:
+            await client.close()
+
+    try:
+        res = asyncio.run(_run_async())
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        engine.dispose()
+
+    payload = {
+        "fetched_rows": res.fetched_rows,
+        "inserted_rows": res.inserted_rows,
+        "skipped_duplicates": res.skipped_duplicates,
+        "latest_value": res.latest.value if res.latest else None,
+        "latest_classification": res.latest.classification if res.latest else None,
+    }
+    if as_json:
+        print(json.dumps(payload, indent=2))
+    else:
+        print(
+            f"sync-fear-greed: fetched={res.fetched_rows}, inserted={res.inserted_rows}, "
+            f"dupes={res.skipped_duplicates}"
+        )
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="crypto-chatbot")
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -2345,6 +2401,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Print JSON output.",
     )
 
+    fng_parser = subcommands.add_parser(
+        "sync-fear-greed",
+        help="Fetch Alternative.me Crypto Fear & Greed daily observations into PostgreSQL.",
+    )
+    fng_parser.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Days to fetch (0 = full historical backfill since 2018-02-01, default: 0).",
+    )
+    fng_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Optional PostgreSQL URL override.",
+    )
+    fng_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print JSON output.",
+    )
+
     args = parser.parse_args(argv)
     if args.command == "check-config":
         return _check_config()
@@ -2486,6 +2563,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_sync_gate_funding(
             symbols_raw=args.symbols,
             days=args.days,
+            as_json=args.json,
+            database_url=args.database_url,
+        )
+    if args.command == "sync-fear-greed":
+        return _run_sync_fear_greed(
+            limit=args.limit,
             as_json=args.json,
             database_url=args.database_url,
         )

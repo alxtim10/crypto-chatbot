@@ -758,3 +758,24 @@ class GateIngestLedgerRow(Base):
     row_count: Mapped[int] = mapped_column(Integer, nullable=False)
     inserted_rows: Mapped[int] = mapped_column(Integer, nullable=False)
     ingested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class FearGreedRow(Base):
+    """Idempotent daily Crypto Fear & Greed Index observations (`fear_greed_observations`, S-02)."""
+
+    __tablename__ = "fear_greed_observations"
+    __table_args__ = (
+        UniqueConstraint("source", "observed_time", name="uq_fear_greed_source_time"),
+        Index("ix_fear_greed_available", "source", "available_time"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    source: Mapped[str] = mapped_column(String(64), nullable=False)
+    observed_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    received_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    available_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    value: Mapped[int] = mapped_column(Integer, nullable=False)
+    classification: Mapped[str] = mapped_column(String(64), nullable=False)
+    normalized_score: Mapped[float] = mapped_column(Double, nullable=False)
+    is_backfilled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    raw_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
