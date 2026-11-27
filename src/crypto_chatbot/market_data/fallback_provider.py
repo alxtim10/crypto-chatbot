@@ -22,6 +22,7 @@ from crypto_chatbot.market_data.ccxt_provider import (
     CcxtMarketDataProvider,
 )
 from crypto_chatbot.market_data.derivatives_provider import CcxtDerivativesLiquidityProvider
+from crypto_chatbot.market_data.gate_candles import GateFuturesMarketDataProvider
 from crypto_chatbot.market_data.symbols import resolve_default_perp_symbol
 from crypto_chatbot.market_data.venue_health import (
     DEFAULT_VENUE_COOLDOWN_MINUTES,
@@ -549,11 +550,23 @@ def normalize_exchange_chain(
     return tuple(cleaned) if cleaned else default
 
 
+def _make_ohlcv_provider(
+    exchange_id: str,
+    *,
+    health_cache: VenueHealthCache,
+    gate_direct_candles: bool,
+) -> MarketDataProvider:
+    if exchange_id == "gate" and gate_direct_candles:
+        return GateFuturesMarketDataProvider(health_cache=health_cache)
+    return CcxtMarketDataProvider(exchange_id=exchange_id)
+
+
 def build_futures_providers(
     exchange_chain: Sequence[str],
     *,
     cooldown_minutes: int = DEFAULT_VENUE_COOLDOWN_MINUTES,
     health_cache: VenueHealthCache | None = None,
+    gate_direct_candles: bool = True,
 ) -> tuple[MarketDataProvider, DerivativesLiquidityProvider]:
     """Build single or fallback OHLCV + derivatives providers sharing one health cache."""
     chain = normalize_exchange_chain(exchange_chain)
@@ -561,11 +574,22 @@ def build_futures_providers(
     if len(chain) == 1:
         ex = chain[0]
         return (
-            CcxtMarketDataProvider(exchange_id=ex),
+            _make_ohlcv_provider(
+                ex,
+                health_cache=shared_cache,
+                gate_direct_candles=gate_direct_candles,
+            ),
             CcxtDerivativesLiquidityProvider(exchange_id=ex),
         )
 
-    ohlcv_providers = [CcxtMarketDataProvider(exchange_id=ex) for ex in chain]
+    ohlcv_providers = [
+        _make_ohlcv_provider(
+            ex,
+            health_cache=shared_cache,
+            gate_direct_candles=gate_direct_candles,
+        )
+        for ex in chain
+    ]
     deriv_providers = [CcxtDerivativesLiquidityProvider(exchange_id=ex) for ex in chain]
     return (
         FallbackMarketDataProvider(

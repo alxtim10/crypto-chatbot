@@ -64,6 +64,7 @@ class MarketCandleRow(Base):
     high: Mapped[float] = mapped_column(Double, nullable=False)
     low: Mapped[float] = mapped_column(Double, nullable=False)
     close: Mapped[float] = mapped_column(Double, nullable=False)
+    raw_contracts: Mapped[float | None] = mapped_column(Double, nullable=True)
     base_volume: Mapped[float] = mapped_column(Double, nullable=False)
     quote_volume: Mapped[float | None] = mapped_column(Double, nullable=True)
     taker_buy_base_volume: Mapped[float | None] = mapped_column(Double, nullable=True)

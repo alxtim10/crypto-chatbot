@@ -46,6 +46,13 @@ from crypto_chatbot.market_data.fallback_provider import (
     build_futures_providers,
     normalize_exchange_chain,
 )
+from crypto_chatbot.market_data.gate_candles import (
+    GATE_CANDLESTICK_PAGE_LIMIT,
+    GateFuturesMarketDataProvider,
+    GateFuturesRestClient,
+    normalize_gate_candlesticks,
+    parse_contract_multipliers,
+)
 from crypto_chatbot.market_data.gate_contract_stats import (
     DEFAULT_GATE_API_URL,
     ContractStatsGapReport,
@@ -120,6 +127,7 @@ __all__ = [
     "DEFAULT_VENUE_COOLDOWN_MINUTES",
     "DEFAULT_WEBHOOK_PORT",
     "DEFAULT_WEBHOOK_RATE_LIMIT_PER_MINUTE",
+    "GATE_CANDLESTICK_PAGE_LIMIT",
     "MAX_CANDLE_LIMIT",
     "MIN_DEGRADED_HISTORY_CANDLES",
     "MIN_FULL_HISTORY_CANDLES",
@@ -144,6 +152,8 @@ __all__ = [
     "FuturesTickerProvider",
     "FuturesTickerSnapshot",
     "GateContractStatsClient",
+    "GateFuturesMarketDataProvider",
+    "GateFuturesRestClient",
     "MarketDataProvider",
     "OhlcvBatch",
     "OrderBookSynchronizer",
@@ -172,6 +182,7 @@ __all__ = [
     "normalize_exchange_chain",
     "normalize_funding_rate_payload",
     "normalize_funding_rate_value",
+    "normalize_gate_candlesticks",
     "normalize_liquidation_events",
     "normalize_ohlcv_rows",
     "normalize_open_interest_payload",
@@ -179,6 +190,7 @@ __all__ = [
     "normalize_order_book_payload",
     "normalize_venue_id",
     "parse_ai_agent_lens_packet",
+    "parse_contract_multipliers",
     "resolve_default_perp_symbol",
     "resolve_mvp_spot_symbol",
     "resolve_symbol",

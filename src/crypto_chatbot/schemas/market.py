@@ -132,6 +132,7 @@ class QualityFlag(StrEnum):
     SEVERE_PRICE_MISMATCH = "SEVERE_PRICE_MISMATCH"
     UNIT_MISMATCH = "UNIT_MISMATCH"
     BACKFILL = "BACKFILL"
+    QUOTE_VOL_ESTIMATED = "QUOTE_VOL_ESTIMATED"
 
 
 class QualityStatus(StrEnum):
@@ -214,6 +215,7 @@ class MarketCandle(BaseModel):
     high: FiniteFloat = Field(gt=0)
     low: FiniteFloat = Field(gt=0)
     close: FiniteFloat = Field(gt=0)
+    raw_contracts: FiniteFloat | None = Field(default=None, ge=0)
     base_volume: FiniteFloat = Field(ge=0)
     quote_volume: FiniteFloat | None = Field(default=None, ge=0)
     taker_buy_base_volume: FiniteFloat | None = Field(default=None, ge=0)

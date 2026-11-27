@@ -21,6 +21,12 @@ def init_db(engine: Engine) -> None:
         conn.execute(
             text(
                 "ALTER TABLE market_candles "
+                "ADD COLUMN IF NOT EXISTS raw_contracts DOUBLE PRECISION;"
+            )
+        )
+        conn.execute(
+            text(
+                "ALTER TABLE market_candles "
                 "ADD COLUMN IF NOT EXISTS taker_buy_base_volume DOUBLE PRECISION;"
             )
         )

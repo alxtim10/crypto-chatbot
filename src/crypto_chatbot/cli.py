@@ -407,6 +407,11 @@ def _resolve_venue_cooldown_from_env() -> int:
     return max(1, parsed)
 
 
+def _resolve_gate_direct_candles_from_env() -> bool:
+    raw = os.environ.get("GATE_DIRECT_CANDLES", "true").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
 async def _analyze_live(
     *,
     symbol: str,
@@ -423,6 +428,7 @@ async def _analyze_live(
     provider, deriv_provider = build_futures_providers(
         chain,
         cooldown_minutes=_resolve_venue_cooldown_from_env(),
+        gate_direct_candles=_resolve_gate_direct_candles_from_env(),
     )
     bybit_provider = BybitDerivativesProvider() if "binance" in chain else None
     dxy_provider = DxyMarketDataProvider() if include_derivatives else None
@@ -1095,6 +1101,7 @@ async def _fetch_live_ohlcv_for_backtest(
     provider, deriv_provider = build_futures_providers(
         chain,
         cooldown_minutes=_resolve_venue_cooldown_from_env(),
+        gate_direct_candles=_resolve_gate_direct_candles_from_env(),
     )
     try:
         if isinstance(provider, HistoryMarketDataProvider):
@@ -1306,6 +1313,7 @@ async def _run_scan_live(
     provider, deriv_provider = build_futures_providers(
         chain,
         cooldown_minutes=_resolve_venue_cooldown_from_env(),
+        gate_direct_candles=_resolve_gate_direct_candles_from_env(),
     )
     bybit_provider = BybitDerivativesProvider() if "binance" in chain else None
     dxy_provider = DxyMarketDataProvider()
@@ -1376,6 +1384,7 @@ async def _run_screen_live(
     provider, deriv_provider = build_futures_providers(
         chain,
         cooldown_minutes=_resolve_venue_cooldown_from_env(),
+        gate_direct_candles=_resolve_gate_direct_candles_from_env(),
     )
     bybit_provider = BybitDerivativesProvider() if "binance" in chain else None
     dxy_provider = DxyMarketDataProvider()

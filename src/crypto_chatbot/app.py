@@ -83,6 +83,7 @@ def build_telegram_application(
     provider, derivatives_provider = build_futures_providers(
         settings.futures_exchange_chain,
         cooldown_minutes=settings.venue_cooldown_min,
+        gate_direct_candles=settings.gate_direct_candles,
     )
     bybit_provider = (
         BybitDerivativesProvider() if "binance" in settings.futures_exchange_chain else None

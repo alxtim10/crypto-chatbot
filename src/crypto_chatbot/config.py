@@ -65,6 +65,7 @@ class Settings(BaseSettings):
     )
     binance_enabled: bool = Field(default=False)
     venue_cooldown_min: int = Field(default=360, ge=1, le=10080)
+    gate_direct_candles: bool = Field(default=True)
     gate_contract_stats_enabled: bool = Field(default=False)
     gate_contract_stats_interval_seconds: int = Field(default=300, ge=10, le=3600)
     gate_contract_stats_backfill_days: int = Field(default=179, ge=1, le=180)
