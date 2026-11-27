@@ -92,6 +92,14 @@ from crypto_chatbot.market_data.gate_history_ingest import (
     validate_candle_contiguity,
     validate_dataset_type,
 )
+from crypto_chatbot.market_data.gate_risk_tiers import (
+    GateRiskLimitTier,
+    GateRiskTiersClient,
+    parse_gate_risk_limit_tiers,
+    resolve_tier_mmr,
+    select_risk_limit_tier,
+    to_gate_perp_contract_name,
+)
 from crypto_chatbot.market_data.gate_taker_flow import (
     GateTradesClient,
     TakerBarCrossCheck,
@@ -213,6 +221,8 @@ __all__ = [
     "GateFuturesMarketDataProvider",
     "GateFuturesRestClient",
     "GateHistoryIngestor",
+    "GateRiskLimitTier",
+    "GateRiskTiersClient",
     "GateTradesClient",
     "MarketDataProvider",
     "OhlcvBatch",
@@ -265,6 +275,7 @@ __all__ = [
     "normalize_venue_id",
     "parse_ai_agent_lens_packet",
     "parse_contract_multipliers",
+    "parse_gate_risk_limit_tiers",
     "parse_gatedata_candlesticks_csv",
     "parse_gatedata_funding_applies_csv",
     "parse_rest_trades_payload",
@@ -272,10 +283,13 @@ __all__ = [
     "resolve_default_perp_symbol",
     "resolve_mvp_spot_symbol",
     "resolve_symbol",
+    "resolve_tier_mmr",
     "sanitize_tradingview_payload",
+    "select_risk_limit_tier",
     "sync_gate_funding_history",
     "to_backtest_funding_tuples",
     "to_gate_contract_symbol",
+    "to_gate_perp_contract_name",
     "validate_candle_contiguity",
     "validate_dataset_type",
 ]

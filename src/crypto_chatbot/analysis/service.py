@@ -52,6 +52,7 @@ from crypto_chatbot.market_data.fallback_provider import (
     FallbackDerivativesLiquidityProvider,
     FallbackMarketDataProvider,
 )
+from crypto_chatbot.market_data.gate_risk_tiers import GateRiskTiersClient
 from crypto_chatbot.market_data.macro_provider import DxyMarketDataProvider
 from crypto_chatbot.market_data.quality import (
     determine_quality_status,
@@ -1225,6 +1226,8 @@ def build_analysis_snapshot(
     btc_candles: Sequence[MarketCandle] | None = None,
     macro_context: MacroBenchmarkContext | None = None,
     positioning: PositioningPanel | None = None,
+    maintenance_margin_rate: float | None = None,
+    venue_max_leverage: float | None = None,
 ) -> AnalysisSnapshot:
     """Assemble a complete deterministic `AnalysisSnapshot` from spot and optional inputs."""
     if batch.has_provider_error or not batch.candles:
@@ -1438,6 +1441,8 @@ def build_analysis_snapshot(
         as_of=as_of,
         use_available_time=use_available_time,
         macro_context=macro_context,
+        maintenance_margin_rate=maintenance_margin_rate,
+        venue_max_leverage=venue_max_leverage,
     )
     source = f"{batch.metadata.venue}:{batch.canonical_symbol}:{batch.timeframe.value}"
     facts, fact_ids_by_key = _build_facts(
@@ -1606,6 +1611,8 @@ class AnalysisService:
         prediction_repository: ModelPredictionRepository | None = None,
         dxy_provider: DxyMarketDataProvider | None = None,
         contract_stats_repository: ContractStatsRepository | None = None,
+        risk_tiers_client: GateRiskTiersClient | None = None,
+        default_position_notional_usdt: float = 1_000.0,
         resample_from: Timeframe | None = None,
         cache_ttl_seconds: float = 0.0,
         cache_max_entries: int = 256,
@@ -1622,6 +1629,8 @@ class AnalysisService:
         self._prediction_repository = prediction_repository
         self._dxy_provider = dxy_provider
         self._contract_stats_repository = contract_stats_repository
+        self._risk_tiers_client = risk_tiers_client
+        self._default_position_notional_usdt = max(0.0, float(default_position_notional_usdt))
         self._resample_from = resample_from
         self._cache_ttl_seconds = max(0.0, float(cache_ttl_seconds))
         self._cache_max_entries = max(1, int(cache_max_entries))
@@ -1680,6 +1689,21 @@ class AnalysisService:
         base_secs = int(self._resample_from.duration.total_seconds())
         target_secs = int(target.duration.total_seconds())
         return target_secs > base_secs and target_secs % base_secs == 0
+
+    async def _resolve_maintenance_margin(
+        self,
+        canonical_symbol: str,
+        *,
+        pinned_venue: str | None,
+    ) -> tuple[float | None, float | None]:
+        if self._risk_tiers_client is None:
+            return None, None
+        if pinned_venue is not None and pinned_venue not in {"gate", "gateio"}:
+            return None, None
+        return await self._risk_tiers_client.get_mmr_for_symbol(
+            canonical_symbol,
+            notional_usdt=self._default_position_notional_usdt,
+        )
 
     async def _fetch_timeframe_bundle(
         self,
@@ -1875,6 +1899,14 @@ class AnalysisService:
                 except Exception:
                     cross_venue = None
 
+        mmr_rate: float | None = None
+        venue_max_lev: float | None = None
+        if any_requested_ok:
+            mmr_rate, venue_max_lev = await self._resolve_maintenance_margin(
+                effective_symbol,
+                pinned_venue=pinned_venue,
+            )
+
         snapshots: dict[Timeframe, AnalysisSnapshot] = {}
         for tf in requested_tfs:
             primary = batches[tf]
@@ -1884,6 +1916,8 @@ class AnalysisService:
                 mtf_batches=mtf_batches,
                 derivatives_context=derivatives_context,
                 cross_venue_derivatives=cross_venue,
+                maintenance_margin_rate=mmr_rate,
+                venue_max_leverage=venue_max_lev,
             )
         return snapshots
 
@@ -2118,6 +2152,14 @@ class AnalysisService:
                 use_available_time=True,
             )
 
+        mmr_rate: float | None = None
+        venue_max_lev: float | None = None
+        if primary_ok:
+            mmr_rate, venue_max_lev = await self._resolve_maintenance_margin(
+                effective_symbol,
+                pinned_venue=pinned_venue or primary.metadata.venue,
+            )
+
         snapshot = build_analysis_snapshot(
             primary,
             mtf_batches=mtf_batches,
@@ -2128,6 +2170,8 @@ class AnalysisService:
             dxy_candles=dxy_candles,
             btc_candles=btc_candles,
             positioning=positioning_panel,
+            maintenance_margin_rate=mmr_rate,
+            venue_max_leverage=venue_max_lev,
         )
 
         if self._shadow_engine is not None:

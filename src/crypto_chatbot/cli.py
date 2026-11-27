@@ -62,6 +62,7 @@ from crypto_chatbot.market_data.fallback_provider import (
     build_futures_providers,
     normalize_exchange_chain,
 )
+from crypto_chatbot.market_data.gate_risk_tiers import GateRiskTiersClient
 from crypto_chatbot.market_data.macro_provider import DxyMarketDataProvider
 from crypto_chatbot.market_data.orderbook import normalize_order_book_payload
 from crypto_chatbot.market_data.quality import normalize_ohlcv_rows
@@ -443,6 +444,7 @@ async def _analyze_live(
     )
     bybit_provider = BybitDerivativesProvider() if "binance" in chain else None
     dxy_provider = DxyMarketDataProvider() if include_derivatives else None
+    risk_tiers_client = GateRiskTiersClient() if "gate" in chain else None
     try:
         service = AnalysisService(
             provider=provider,
@@ -454,6 +456,7 @@ async def _analyze_live(
             tradingview_repository=tradingview_repository,
             news_repository=news_repository,
             dxy_provider=dxy_provider,
+            risk_tiers_client=risk_tiers_client,
             resample_from=_resolve_resample_from_env(),
         )
         return await service.analyze(
@@ -466,6 +469,8 @@ async def _analyze_live(
     finally:
         await provider.close()
         await deriv_provider.close()
+        if risk_tiers_client is not None:
+            await risk_tiers_client.close()
         if bybit_provider is not None:
             await bybit_provider.close()
         if dxy_provider is not None:

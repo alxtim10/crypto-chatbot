@@ -487,6 +487,7 @@ def compute_leverage_ceiling(
     cost_rate: float,
     *,
     maintenance_margin_rate: float | None = None,
+    venue_max_leverage: float | None = None,
 ) -> tuple[int, bool]:
     """Compute theoretical leverage ceiling with maintenance margin rate (PRD v1.7 §5.4).
 
@@ -503,7 +504,14 @@ def compute_leverage_ceiling(
     denom = ((sl_dist_ratio + cost_rate) / 0.75) + mmr
     if denom <= 0.0:
         return 1, mmr_assumed
-    lev = min(20, max(1, math.floor(1.0 / denom)))
+    upper = 20
+    if (
+        venue_max_leverage is not None
+        and math.isfinite(venue_max_leverage)
+        and venue_max_leverage > 0
+    ):
+        upper = min(20, max(1, math.floor(venue_max_leverage)))
+    lev = min(upper, max(1, math.floor(1.0 / denom)))
     return lev, mmr_assumed
 
 
@@ -747,6 +755,7 @@ def build_trade_setup(
     macro_context: MacroBenchmarkContext | None = None,
     require_ema200: bool = False,
     maintenance_margin_rate: float | None = None,
+    venue_max_leverage: float | None = None,
     setup_variant: Literal["v3", "v4"] | None = None,
 ) -> TradeSetup:
     """Compute 1 deterministic conditional trade setup (Entry, SL, TP1-3) or honest WAIT."""
@@ -1180,6 +1189,7 @@ def build_trade_setup(
         sl_dist_ratio,
         cost_rate,
         maintenance_margin_rate=maintenance_margin_rate,
+        venue_max_leverage=venue_max_leverage,
     )
     net_rr_blend = (
         round(0.4 * net_rr_tp1 + 0.4 * net_rr_tp2 + 0.2 * net_rr_tp3, 4)

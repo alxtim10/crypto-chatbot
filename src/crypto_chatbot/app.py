@@ -26,12 +26,16 @@ from crypto_chatbot.llm.gemini import (
     GoogleGenAiTransport,
 )
 from crypto_chatbot.market_data.bybit_derivatives import BybitDerivativesProvider
-from crypto_chatbot.market_data.fallback_provider import build_futures_providers
+from crypto_chatbot.market_data.fallback_provider import (
+    FallbackMarketDataProvider,
+    build_futures_providers,
+)
 from crypto_chatbot.market_data.gate_contract_stats import (
     ContractStatsRecorder,
     ContractStatsScheduler,
     GateContractStatsClient,
 )
+from crypto_chatbot.market_data.gate_risk_tiers import GateRiskTiersClient
 from crypto_chatbot.market_data.macro_provider import DxyMarketDataProvider
 from crypto_chatbot.memory.service import MemoryService
 from crypto_chatbot.schemas.market import Timeframe
@@ -91,6 +95,15 @@ def build_telegram_application(
         BybitDerivativesProvider() if "binance" in settings.futures_exchange_chain else None
     )
     dxy_provider = DxyMarketDataProvider()
+    risk_tiers_client = (
+        GateRiskTiersClient(
+            health_cache=(
+                provider.health_cache if isinstance(provider, FallbackMarketDataProvider) else None
+            )
+        )
+        if "gate" in settings.futures_exchange_chain
+        else None
+    )
     analysis_service = AnalysisService(
         provider=provider,
         repository=market_repo,
@@ -102,6 +115,7 @@ def build_telegram_application(
         news_repository=news_repo,
         dxy_provider=dxy_provider,
         contract_stats_repository=contract_stats_repo,
+        risk_tiers_client=risk_tiers_client,
         resample_from=Timeframe(settings.resample_from) if settings.resample_from else None,
         cache_ttl_seconds=45.0,
     )
@@ -162,6 +176,8 @@ def build_telegram_application(
             await contract_stats_scheduler.stop()
         if contract_stats_client is not None:
             await contract_stats_client.close()
+        if risk_tiers_client is not None:
+            await risk_tiers_client.close()
         await provider.close()
         await derivatives_provider.close()
         await dxy_provider.close()
