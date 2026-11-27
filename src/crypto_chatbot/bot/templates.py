@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import re
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Literal
 
@@ -1166,4 +1167,197 @@ def render_smalltalk_reply(subtype: Literal["greeting", "thanks", "ack"]) -> str
         "Halo! Saya asisten riset & edukasi futures kripto. "
         "Tanya konsep trading (mis. 'apa itu RSI 70?'), cek koin (mis. 'analisa BTC 4h'), "
         "atau ketik /help."
+    )
+
+
+_EDU_GLOSSARY: tuple[tuple[re.Pattern[str], str, str], ...] = (
+    (
+        re.compile(r"\brsi\b", re.IGNORECASE),
+        "RSI (Relative Strength Index)",
+        "Mengukur kecepatan momentum harga (skala 0-100). Di atas 70 sering dianggap jenuh beli "
+        "(overbought) dan di bawah 30 jenuh jual (oversold), namun pada tren kuat RSI bisa "
+        "bertahan di area ekstrem cukup lama.",
+    ),
+    (
+        re.compile(r"\bema\b", re.IGNORECASE),
+        "EMA (Exponential Moving Average)",
+        "Rata-rata bergerak dengan bobot lebih besar pada penutupan terbaru. EMA 20 lebih "
+        "responsif terhadap momentum pendek, sedangkan EMA 200 membantu membaca arah tren makro.",
+    ),
+    (
+        re.compile(r"\bmacd\b", re.IGNORECASE),
+        "MACD",
+        "Mengukur selisih dua EMA beserta garis sinyal dan histogramnya untuk membaca perubahan "
+        "momentum serta potensi divergensi.",
+    ),
+    (
+        re.compile(r"\bfunding(?:\s+rate)?\b", re.IGNORECASE),
+        "Funding Rate (Perpetual)",
+        "Biaya periodik (umumnya tiap 8 jam) antar pemegang posisi long dan short agar harga "
+        "kontrak perpetual tetap dekat dengan harga indeks spot.",
+    ),
+    (
+        re.compile(r"\bspot\b", re.IGNORECASE),
+        "Spot vs Perpetual Futures",
+        "Pasar spot memperdagangkan aset dasar secara langsung tanpa leverage, sedangkan perpetual "
+        "futures memperdagangkan kontrak derivatif dengan margin, leverage, dan funding rate.",
+    ),
+    (
+        re.compile(r"\b(?:bos|choch)\b", re.IGNORECASE),
+        "BOS & CHoCH (Market Structure)",
+        "BOS (Break of Structure) menandakan kelanjutan struktur tren saat swing utama tertembus; "
+        "CHoCH (Change of Character) memberi indikasi awal potensi perubahan arah tren.",
+    ),
+    (
+        re.compile(r"\blong\b.*\bshort\b|\bshort\b.*\blong\b", re.IGNORECASE),
+        "Posisi Long vs Short",
+        "Long bertujuan memperoleh selisih saat harga naik, sedangkan Short bertujuan memperoleh "
+        "selisih saat harga turun pada kontrak derivatif/futures.",
+    ),
+    (
+        re.compile(r"\brisk[\s/]*reward\b|\br:r\b", re.IGNORECASE),
+        "Risk / Reward (R:R)",
+        "Perbandingan jarak risiko ke Stop Loss terhadap jarak potensi target Take Profit "
+        "(mis. 1:2 berarti potensi target 2x jarak risiko).",
+    ),
+    (
+        re.compile(r"\ball[\s-]+in\b", re.IGNORECASE),
+        "Risiko All-In",
+        "Menaruh seluruh modal pada satu posisi memperbesar risiko likuidasi atau drawdown tajam. "
+        "Pembatasan ukuran risiko per transaksi membantu ketahanan modal.",
+    ),
+    (
+        re.compile(r"\bleverage\b", re.IGNORECASE),
+        "Leverage",
+        "Pengganda ukuran posisi terhadap margin jaminan. Leverage yang lebih tinggi mempersempit "
+        "jarak ke harga likuidasi.",
+    ),
+    (
+        re.compile(r"\b(?:isolated|cross)\s*margin\b", re.IGNORECASE),
+        "Isolated vs Cross Margin",
+        "Isolated membatasi risiko kerugian pada margin posisi tertentu saja, sedangkan Cross "
+        "menggunakan seluruh saldo margin futures yang tersedia.",
+    ),
+    (
+        re.compile(r"\bfvg\b", re.IGNORECASE),
+        "FVG (Fair Value Gap)",
+        "Celah ketidakseimbangan harga pada rangkaian 3 candle yang sering dipantau sebagai zona "
+        "reaksi pullback.",
+    ),
+    (
+        re.compile(r"\border\s*block\b", re.IGNORECASE),
+        "Order Block",
+        "Area candle berlawanan terakhir sebelum pergerakan impulsif kuat yang kerap dijadikan "
+        "referensi zona minat harga historis.",
+    ),
+    (
+        re.compile(r"\bdxy\b", re.IGNORECASE),
+        "US Dollar Index (DXY)",
+        "Indeks kekuatan dolar AS terhadap sekeranjang mata uang utama. Penguatan DXY sering "
+        "menjadi konteks tekanan bagi aset berisiko seperti kripto.",
+    ),
+    (
+        re.compile(r"\bliquidation\b|\blikuidasi\b", re.IGNORECASE),
+        "Liquidation Price",
+        "Level harga saat margin tidak lagi cukup menahan kerugian posisi sehingga bursa menutup "
+        "posisi secara paksa.",
+    ),
+    (
+        re.compile(r"\bdca\b", re.IGNORECASE),
+        "DCA (Dollar-Cost Averaging)",
+        "Metode masuk bertahap secara berkala dengan nominal terencana untuk meratakan harga "
+        "akuisisi.",
+    ),
+    (
+        re.compile(r"\b(?:fomo|fud)\b", re.IGNORECASE),
+        "FOMO & FUD",
+        "FOMO adalah dorongan masuk terburu-buru karena takut ketinggalan gerak harga; FUD adalah "
+        "narasi ketakutan/ketidakpastian yang memicu keputusan emosional.",
+    ),
+    (
+        re.compile(r"\bpsikologi\b|\bloss\b", re.IGNORECASE),
+        "Psikologi & Kontrol Loss",
+        "Pengendalian emosi saat loss bertumpu pada ukuran risiko terukur, kepatuhan pada Stop "
+        "Loss, dan jeda sejenak untuk menghindari revenge trading.",
+    ),
+    (
+        re.compile(r"\b(?:ath|atl)\b", re.IGNORECASE),
+        "ATH & ATL",
+        "ATH (All-Time High) adalah rekor harga tertinggi sepanjang masa; ATL (All-Time Low) "
+        "adalah rekor harga terendah sepanjang masa.",
+    ),
+    (
+        re.compile(r"\bsupport\b|\bresistance\b", re.IGNORECASE),
+        "Support & Resistance",
+        "Support adalah area minat beli historis yang menahan penurunan; Resistance adalah area "
+        "minat jual historis yang menahan kenaikan.",
+    ),
+    (
+        re.compile(r"\bcandle\b|\b5m\b|\b15m\b", re.IGNORECASE),
+        "Candle & Timeframe",
+        "Setiap candle merangkum harga Open, High, Low, Close pada satu rentang waktu "
+        "(mis. 5m mikro, 15m scalp, 1h intraday, 4h swing).",
+    ),
+)
+
+
+def render_context_fallback(
+    category: str,
+    *,
+    question: str = "",
+    active_symbol: str | None = None,
+) -> str:
+    """Render context-specific Indonesian fallback guidance for each non-analysis category."""
+    if category == "smalltalk":
+        return (
+            "Halo! Lagi santai memantau pasar nih. Kalau mau tanya istilah trading, cek "
+            "kondisi market, atau analisa koin tertentu, langsung ketik saja."
+        )
+    if category == "edu_qa":
+        matches: list[tuple[str, str]] = []
+        for pattern, title, desc in _EDU_GLOSSARY:
+            if pattern.search(question):
+                matches.append((title, desc))
+            if len(matches) >= 2:
+                break
+        if matches:
+            lines = ["<b>Ringkasan Glosarium (Mode Deterministik)</b>"]
+            for title, desc in matches:
+                lines.append(
+                    f"• <b>{html.escape(title, quote=False)}</b>: {html.escape(desc, quote=False)}"
+                )
+            lines.append("")
+            lines.append(
+                "<i>Catatan: Layanan penjelasan AI interaktif sedang sibuk/mencapai batas kuota "
+                "saat ini.</i>"
+            )
+            return "\n".join(lines)
+        return (
+            "Layanan penjelasan AI untuk pertanyaan edukasi sedang sibuk atau mencapai batas "
+            "kuota saat ini. Silakan ulangi beberapa saat lagi atau ketik /help."
+        )
+    if category == "followup_expired":
+        return (
+            "Konteks koin sebelumnya sudah berakhir (lebih dari 15 menit atau topik sudah "
+            "berpindah). Sebutkan kembali nama koin yang ingin dicek (mis. 'analisa BTC 1h') "
+            "untuk data terbaru."
+        )
+    if category == "followup_active" and active_symbol:
+        base = active_symbol.split("/")[0]
+        return (
+            f"Layanan penjelasan lanjutan AI sedang sibuk saat ini. Untuk pembaruan data "
+            f"{base}, ketik 'cek {base}' atau '/analyze {base} detail'."
+        )
+    if category == "out_of_scope_non_crypto":
+        return (
+            "Bot ini khusus untuk riset dan edukasi pasar perpetual futures kripto (/USDT:USDT), "
+            "sehingga tidak melayani topik di luar kripto seperti saham atau pertanyaan umum "
+            "lainnya. Ketik /help untuk melihat daftar fitur."
+        )
+    return (
+        "Pesan belum dapat dipahami. Anda bisa mencoba contoh berikut:\n"
+        "• 'analisa BTC 4h' — analisis teknikal & setup koin\n"
+        "• 'apa itu RSI 70?' — pertanyaan edukasi trading\n"
+        "• 'ada setup apa hari ini?' — pindai peluang futures\n"
+        "Atau ketik /help untuk panduan lengkap."
     )

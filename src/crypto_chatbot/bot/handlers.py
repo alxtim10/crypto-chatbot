@@ -51,6 +51,8 @@ from crypto_chatbot.bot.commands import (
     SmalltalkIntent,
     WhaleIntent,
     _extract_recent_context,
+    _extract_recent_context_with_status,
+    classify_fallback_category,
     parse_analyze_args,
     parse_compare_args,
     parse_watchlist_args,
@@ -59,6 +61,7 @@ from crypto_chatbot.bot.commands import (
 )
 from crypto_chatbot.bot.templates import (
     TELEGRAM_MAX_MESSAGE_LENGTH,
+    render_context_fallback,
     render_forget_message,
     render_help_message,
     render_memory_message,
@@ -960,11 +963,19 @@ class BotService:
                     routing_trace=trace,
                 )
             if isinstance(intent, ChatQaIntent):
+                recent_syms, _, ctx_expired = _extract_recent_context_with_status(
+                    recent,
+                    prefs.default_timeframe,
+                    now=now_utc,
+                    perp_universe=perp_universe,
+                )
                 return await self._execute_chat_qa(
                     user_id=user_id,
                     request_id=request_id,
                     question=intent.question,
                     routing_trace=trace,
+                    active_symbol=recent_syms[0] if recent_syms else None,
+                    context_expired=ctx_expired,
                 )
             return ("Permintaan tidak dapat diproses. Gunakan /help.",)  # pragma: no cover
         except SQLAlchemyError:
@@ -1238,6 +1249,8 @@ class BotService:
         request_id: str,
         question: str,
         routing_trace: RoutingTrace | None = None,
+        active_symbol: str | None = None,
+        context_expired: bool = False,
     ) -> tuple[str, ...]:
         context = await asyncio.to_thread(
             self._memory.build_context_for_llm, user_id, current_question=question
@@ -1291,12 +1304,18 @@ class BotService:
                     "pertanyaan edukasi lain atau gunakan /analyze BTC.",
                 )
 
+            fb_cat = classify_fallback_category(
+                question,
+                has_active_context=active_symbol is not None,
+                context_expired=context_expired,
+            )
+            reason_tag = f"qa_{qa_reason}:{fb_cat}"
             enriched_trace = base_trace.model_copy(
                 update={
                     "fallback_reason": (
-                        f"qa_{qa_reason}"
+                        reason_tag
                         if not base_trace.fallback_reason
-                        else f"{base_trace.fallback_reason}|qa_{qa_reason}"
+                        else f"{base_trace.fallback_reason}|{reason_tag}"
                     ),
                     "guard_violations": qa_outcome.guard_violations,
                 }
@@ -1314,10 +1333,12 @@ class BotService:
                 output_tokens=qa_outcome.output_tokens,
                 latency_ms=qa_outcome.latency_ms,
             )
-            return (
-                "Maaf, layanan diskusi AI sedang mencapai batas kuota atau sibuk saat ini. "
-                "Anda tetap bisa menyebut nama koin (mis. 'analisa BTC') atau /scan.",
+            fallback_msg = render_context_fallback(
+                fb_cat,
+                question=question,
+                active_symbol=active_symbol,
             )
+            return split_telegram_message(fallback_msg, TELEGRAM_MAX_MESSAGE_LENGTH)
         answer = qa_outcome.answer
         self._log_routing_trace(request_id, base_trace)
         await asyncio.to_thread(

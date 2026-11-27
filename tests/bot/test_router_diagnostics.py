@@ -590,7 +590,10 @@ async def test_routing_trace_persisted_without_pii_across_paths(
     rec_cls_fail = repo.interactions[-1]
     assert rec_cls_fail.layer == "layer2_fallback"
     assert rec_cls_fail.intent == "chat_qa"
-    assert rec_cls_fail.fallback_reason == "classifier_invalid_json_or_schema|qa_empty_response"
+    assert (
+        rec_cls_fail.fallback_reason
+        == "classifier_invalid_json_or_schema|qa_empty_response:unknown"
+    )
 
     # PII check: raw user strings & wallet address never appear in any record or routing_trace log
     for rec in repo.interactions:
@@ -1052,3 +1055,65 @@ async def test_pr4_smalltalk_help_zero_token_and_context_decay() -> None:
     )
     syms_broken, _ = _extract_recent_context(broken_by_edu, Timeframe.H4, now=ANCHOR)
     assert syms_broken == []
+
+
+@pytest.mark.asyncio
+async def test_pr5_context_specific_fallbacks() -> None:
+    """PR5: Each intent family returns context-appropriate fallback guidance."""
+    repo = _RecordingMemoryRepo()
+    bot = BotService(
+        access=AccessController((111,), rate_limit_per_minute=100),
+        analysis_service=_DiagnosticAnalysisService(),  # type: ignore[arg-type]
+        narrator=GeminiNarrator(
+            model="gemini-2.5-flash",
+            transport=_ScriptedTransport(fail=True),
+            max_guard_retries=0,
+        ),
+        memory=MemoryService(repo),
+        clock=lambda: ANCHOR,
+    )
+
+    # 1) SMALLTALK fallback when L2 unavailable (never asks to analyze a coin)
+    st_out = "\n".join(await bot.handle_text_message(111, "lagi santai aja nih sambil ngopi"))
+    assert "santai" in st_out.lower()
+    assert "sebut nama koin" not in st_out.lower()
+    assert "anda tetap bisa menyebut nama koin" not in st_out.lower()
+
+    # 2) EDU_QA deterministic glossary summary
+    edu_rsi = "\n".join(await bot.handle_text_message(111, "apa itu RSI 70?"))
+    assert "Ringkasan Glosarium" in edu_rsi
+    assert "Relative Strength Index" in edu_rsi
+
+    edu_smc = "\n".join(await bot.handle_text_message(111, "apa itu BOS/CHoCH?"))
+    assert "BOS &amp; CHoCH" in edu_smc or "BOS & CHoCH" in edu_smc
+
+    edu_fund = "\n".join(await bot.handle_text_message(111, "funding rate dibayar tiap 8h ya?"))
+    assert "Funding Rate" in edu_fund
+
+    # 3) FOLLOWUP with expired context (> 15 min)
+    repo.msgs[111] = [
+        StoredMessage(
+            role="assistant",
+            content="[BTC/USDT:USDT 4h] Harga {F1} di atas EMA 200 ({F6}).",
+            snapshot_id="snap-btc-old",
+            created_at=ANCHOR - timedelta(minutes=25),
+        )
+    ]
+    exp_out = "\n".join(await bot.handle_text_message(111, "kalau 1h?"))
+    assert "berakhir" in exp_out.lower()
+    assert repo.interactions[-1].fallback_reason == "followup_context_expired"
+
+    # 4) OUT_OF_SCOPE non-crypto (never triggers INSUFFICIENT_DATA)
+    repo.msgs[111] = []
+    for oos in ("resep nasi goreng dong", "analisa saham BBCA dong"):
+        oos_out = "\n".join(await bot.handle_text_message(111, oos))
+        assert "perpetual futures kripto" in oos_out.lower()
+        assert "data tidak mencukupi" not in oos_out.lower()
+        assert repo.interactions[-1].fallback_reason == "out_of_scope_non_crypto"
+
+    # 5) UNKNOWN gives concrete examples + /help
+    for unk in ("???", "asdfghjkl"):
+        unk_out = "\n".join(await bot.handle_text_message(111, unk))
+        assert "/help" in unk_out
+        assert "analisa BTC 4h" in unk_out
+        assert "apa itu RSI 70?" in unk_out

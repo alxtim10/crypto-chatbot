@@ -9,6 +9,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
+from crypto_chatbot.bot.templates import render_context_fallback
 from crypto_chatbot.market_data.symbols import (
     AMBIGUOUS_PERP_TICKERS,
     DEFAULT_PERP_UNIVERSE,
@@ -530,6 +531,28 @@ _HELP_INTENT_RE = re.compile(
     r"\btolong\s+jelas(?:in|kan)\s+cara\s+pakai\b)",
     re.IGNORECASE,
 )
+_NON_CRYPTO_OOS_RE = re.compile(
+    r"(?:\bsaham\b|\bihsg\b|\bbbca\b|\btlkm\b|\bbmri\b|\bresep\b|\bmasak\b|"
+    r"\bcuaca\b|\bpresiden\b|\bpolitik\b|\bsepak\s*bola\b)",
+    re.IGNORECASE,
+)
+_FOLLOWUP_CUE_RE = re.compile(
+    r"^(?:terus\??|lanjut\??|detail(?:nya)?(?:\s+dong)?\??|"
+    r"sl\s*nya\b.*|tp\s*nya\b.*|risikonya\b.*|kenapa\s+tadi\b.*|"
+    r"(?:kalau|kalo|coba|yang)\s+(?:15m|1h|4h|1d|scalp|intraday|swing)\b.*|"
+    r"(?:bisa\s+)?dijelaskan\s+lebih\s+singkat\??)$",
+    re.IGNORECASE,
+)
+_SMALLTALK_CHAT_RE = re.compile(
+    r"(?:\bsantai\b|\bngopi\b|\bcapek\b|\bgalau\b|\bistirahat\b|\btidur\b|"
+    r"\bmakan\b|\bsibuk\b|\bpusing\b|\bapa\s+kabar\b|\bwkwk\b|\bhaha\b|\bhehe\b)",
+    re.IGNORECASE,
+)
+_EDU_TERM_HINT_RE = re.compile(
+    r"\b(?:rsi|ema|sma|macd|atr|adx|fvg|order\s*block|bos|choch|funding|dxy|"
+    r"dca|fomo|fud|ath|atl|leverage|margin|liquidation|likuidasi|risk[\s/]*reward)\b",
+    re.IGNORECASE,
+)
 
 
 def _detect_smalltalk_subtype(text: str) -> Literal["greeting", "thanks", "ack"] | None:
@@ -544,6 +567,30 @@ def _detect_smalltalk_subtype(text: str) -> Literal["greeting", "thanks", "ack"]
 
 def _is_help_request(text: str) -> bool:
     return _HELP_INTENT_RE.search(text) is not None
+
+
+def classify_fallback_category(
+    text: str,
+    *,
+    has_active_context: bool,
+    context_expired: bool,
+) -> str:
+    """Classify an unmatched/failed chat turn into a context-specific fallback category."""
+    cleaned = text.strip()
+    if not cleaned:
+        return "unknown"
+    if _NON_CRYPTO_OOS_RE.search(cleaned):
+        return "out_of_scope_non_crypto"
+    if _is_conceptual_question(cleaned) or _EDU_TERM_HINT_RE.search(cleaned):
+        return "edu_qa"
+    if _FOLLOWUP_CUE_RE.match(cleaned) or _CONTEXT_TOPIC_RE.search(cleaned):
+        if has_active_context:
+            return "followup_active"
+        if context_expired:
+            return "followup_expired"
+    if _detect_smalltalk_subtype(cleaned) is not None or _SMALLTALK_CHAT_RE.search(cleaned):
+        return "smalltalk"
+    return "unknown"
 
 
 class CommandParseError(ValueError):
@@ -1103,7 +1150,7 @@ def resolve_followup_intent_with_trace(
             ),
         )
 
-    recent_symbols, recent_tf = _extract_recent_context(
+    recent_symbols, recent_tf, context_expired = _extract_recent_context_with_status(
         recent_messages,
         default_timeframe,
         now=now,
@@ -1131,6 +1178,32 @@ def resolve_followup_intent_with_trace(
                     SmalltalkIntent(subtype=smalltalk_subtype),
                     RoutingTrace(layer="layer1", intent="smalltalk", confidence=1.0),
                 )
+        if _NON_CRYPTO_OOS_RE.search(cleaned):
+            return (
+                RefusalIntent(
+                    message=render_context_fallback("out_of_scope_non_crypto"),
+                    is_hard_refusal=True,
+                ),
+                RoutingTrace(
+                    layer="layer1",
+                    intent="out_of_scope",
+                    confidence=1.0,
+                    fallback_reason="out_of_scope_non_crypto",
+                ),
+            )
+        if context_expired and not recent_symbols and _FOLLOWUP_CUE_RE.match(cleaned):
+            return (
+                RefusalIntent(
+                    message=render_context_fallback("followup_expired"),
+                    is_hard_refusal=True,
+                ),
+                RoutingTrace(
+                    layer="layer1",
+                    intent="followup_expired",
+                    confidence=1.0,
+                    fallback_reason="followup_context_expired",
+                ),
+            )
 
     if not mentioned and _SCREEN_INTENT_RE.search(cleaned):
         has_long = _SCREEN_LONG_HINT_RE.search(cleaned) is not None
