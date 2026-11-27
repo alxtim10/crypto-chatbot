@@ -116,6 +116,7 @@ from crypto_chatbot.storage.repositories import (
     NewsRepository,
     PostgresContractStatsRepository,
     PostgresDerivativesRepository,
+    PostgresGateIngestRepository,
     PostgresMarketRepository,
     PostgresMlExperimentRepository,
     PostgresModelPredictionRepository,
@@ -1604,6 +1605,129 @@ def _run_contract_stats(
         engine.dispose()
 
 
+def _run_ingest_gate_history(
+    *,
+    symbols_raw: str | None,
+    from_ym: str,
+    to_ym: str,
+    types_raw: str,
+    data_dir: Path,
+    validate_contiguity: bool,
+    as_json: bool,
+    database_url: str | None,
+) -> int:
+    from crypto_chatbot.market_data.gate_candles import GateFuturesRestClient
+    from crypto_chatbot.market_data.gate_contract_stats import DEFAULT_CONTRACT_STATS_UNIVERSE
+    from crypto_chatbot.market_data.gate_history_ingest import (
+        VERIFIED_GATEDATA_CANDLESTICK_TYPES,
+        GateHistoryIngestor,
+        validate_dataset_type,
+    )
+
+    symbols = (
+        tuple(item.strip() for item in symbols_raw.split(",") if item.strip())
+        if symbols_raw
+        else DEFAULT_CONTRACT_STATS_UNIVERSE
+    )
+    datasets = tuple(item.strip() for item in types_raw.split(",") if item.strip())
+    if not datasets:
+        print("Error: --types must specify at least one dataset.", file=sys.stderr)
+        return 1
+    try:
+        validated_datasets = tuple(validate_dataset_type(d) for d in datasets)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    resolved_url = database_url or os.environ.get("DATABASE_URL")
+    if not resolved_url:
+        try:
+            settings = load_settings()
+            resolved_url = settings.database_url.get_secret_value()
+        except Exception:
+            resolved_url = None
+    if not resolved_url:
+        print("Error: DATABASE_URL is required for ingest-gate-history.", file=sys.stderr)
+        return 1
+
+    engine = create_db_engine(resolved_url)
+    init_db(engine)
+    market_repo = PostgresMarketRepository(engine)
+    deriv_repo = PostgresDerivativesRepository(engine)
+    ledger_repo = PostgresGateIngestRepository(engine)
+
+    async def _run_async() -> dict[str, Any]:
+        need_multipliers = any(
+            d in VERIFIED_GATEDATA_CANDLESTICK_TYPES and VERIFIED_GATEDATA_CANDLESTICK_TYPES[d]
+            for d in validated_datasets
+        )
+        multipliers = {}
+        if need_multipliers:
+            spec_client = GateFuturesRestClient()
+            try:
+                multipliers = await spec_client.fetch_contracts()
+            finally:
+                await spec_client.close()
+
+        ingestor = GateHistoryIngestor(
+            data_dir=data_dir,
+            market_repository=market_repo,
+            derivatives_repository=deriv_repo,
+            ledger_repository=ledger_repo,
+            multipliers=multipliers,
+        )
+        try:
+            summary = await ingestor.ingest_range(
+                symbols=symbols,
+                from_ym=from_ym,
+                to_ym=to_ym,
+                datasets=validated_datasets,
+                validate_contiguity=validate_contiguity,
+            )
+        finally:
+            await ingestor.close()
+
+        return {
+            "files_processed": summary.files_processed,
+            "downloaded_files": summary.downloaded_files,
+            "skipped_files": summary.skipped_files,
+            "inserted_rows": summary.inserted_rows,
+            "missing_files": summary.missing_files,
+            "results": [
+                {
+                    "dataset": r.dataset,
+                    "contract": r.contract,
+                    "yyyymm": r.yyyymm,
+                    "status": r.status,
+                    "sha256": r.sha256,
+                    "row_count": r.row_count,
+                    "inserted_rows": r.inserted_rows,
+                    "contiguity_ok": r.contiguity_ok,
+                    "local_path": r.local_path,
+                }
+                for r in summary.results
+            ],
+        }
+
+    try:
+        payload = asyncio.run(_run_async())
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        engine.dispose()
+
+    if as_json:
+        print(json.dumps(payload, indent=2))
+    else:
+        print(
+            f"ingest-gate-history: files={payload['files_processed']}, "
+            f"downloaded={payload['downloaded_files']}, skipped={payload['skipped_files']}, "
+            f"inserted={payload['inserted_rows']}, missing={payload['missing_files']}"
+        )
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="crypto-chatbot")
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -2042,6 +2166,56 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Print JSON output.",
     )
 
+    ingest_parser = subcommands.add_parser(
+        "ingest-gate-history",
+        help="Idempotently download & ingest bulk archives from download.gatedata.org.",
+    )
+    ingest_parser.add_argument(
+        "--symbols",
+        default=None,
+        help="Comma-separated symbols (default: liquid perpetual basket).",
+    )
+    ingest_parser.add_argument(
+        "--from",
+        dest="from_month",
+        required=True,
+        help="Start month inclusive (YYYYMM).",
+    )
+    ingest_parser.add_argument(
+        "--to",
+        dest="to_month",
+        required=True,
+        help="End month inclusive (YYYYMM).",
+    )
+    ingest_parser.add_argument(
+        "--types",
+        required=True,
+        help=(
+            "Comma-separated dataset types (candlesticks_1h, trades, mark_prices, funding_applies)."
+        ),
+    )
+    ingest_parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=Path("data/raw/gate"),
+        help="Root directory for compressed archive storage (default: data/raw/gate).",
+    )
+    ingest_parser.add_argument(
+        "--no-contiguity-check",
+        action="store_true",
+        help="Skip contiguity validation on loaded candle series.",
+    )
+    ingest_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Optional PostgreSQL URL override.",
+    )
+    ingest_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print JSON output.",
+    )
+
     args = parser.parse_args(argv)
     if args.command == "check-config":
         return _check_config()
@@ -2165,6 +2339,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             days=args.days,
             limit=args.limit,
             interval_seconds=args.interval_seconds,
+            as_json=args.json,
+            database_url=args.database_url,
+        )
+    if args.command == "ingest-gate-history":
+        return _run_ingest_gate_history(
+            symbols_raw=args.symbols,
+            from_ym=args.from_month,
+            to_ym=args.to_month,
+            types_raw=args.types,
+            data_dir=args.data_dir,
+            validate_contiguity=not args.no_contiguity_check,
             as_json=args.json,
             database_url=args.database_url,
         )

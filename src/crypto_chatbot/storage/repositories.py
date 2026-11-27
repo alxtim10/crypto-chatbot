@@ -48,6 +48,7 @@ from crypto_chatbot.storage.models import (
     ContractStatsRow,
     ConversationRow,
     FundingRateRow,
+    GateIngestLedgerRow,
     LiquidationEventRow,
     LlmInteractionRow,
     MarketCandleRow,
@@ -278,6 +279,32 @@ class ContractStatsRepository(Protocol):
     ) -> tuple[datetime, ...]: ...
 
 
+class GateIngestRepository(Protocol):
+    """Repository protocol for checksum-tracked bulk Gate.io archive ingestion (D-04)."""
+
+    def get_ingested_sha256(
+        self,
+        *,
+        dataset: str,
+        contract: str,
+        yyyymm: str,
+    ) -> str | None: ...
+
+    def record_ingested_file(
+        self,
+        *,
+        dataset: str,
+        contract: str,
+        yyyymm: str,
+        sha256: str,
+        byte_size: int,
+        local_path: str,
+        row_count: int,
+        inserted_rows: int,
+        ingested_at: datetime,
+    ) -> None: ...
+
+
 class SetupLogRepository(Protocol):
     """Repository interface for persistent deterministic trade setups & outcome settlement."""
 
@@ -389,15 +416,19 @@ class PostgresMarketRepository:
             for candle in candles
         ]
 
-        stmt = (
-            insert(MarketCandleRow)
-            .values(rows)
-            .on_conflict_do_nothing(constraint="uq_market_candles_identity")
-            .returning(MarketCandleRow.id)
-        )
+        inserted_total = 0
+        batch_size = 500
         with Session(self._engine) as session, session.begin():
-            inserted_ids = session.scalars(stmt).all()
-            return len(inserted_ids)
+            for idx in range(0, len(rows), batch_size):
+                chunk = rows[idx : idx + batch_size]
+                stmt = (
+                    insert(MarketCandleRow)
+                    .values(chunk)
+                    .on_conflict_do_nothing(constraint="uq_market_candles_identity")
+                    .returning(MarketCandleRow.id)
+                )
+                inserted_total += len(session.scalars(stmt).all())
+        return inserted_total
 
     def load_candles(
         self,
@@ -2121,3 +2152,66 @@ class PostgresContractStatsRepository:
             stmt = stmt.where(ContractStatsRow.observed_time <= _to_utc(end_time))
         with Session(self._engine) as session:
             return tuple(_to_utc(ts) for ts in session.scalars(stmt).all())
+
+
+class PostgresGateIngestRepository:
+    """PostgreSQL checksum ledger repository for idempotent bulk archive ingestion."""
+
+    def __init__(self, engine: Engine) -> None:
+        self._engine = engine
+
+    def get_ingested_sha256(
+        self,
+        *,
+        dataset: str,
+        contract: str,
+        yyyymm: str,
+    ) -> str | None:
+        stmt = select(GateIngestLedgerRow.sha256).where(
+            GateIngestLedgerRow.dataset == dataset,
+            GateIngestLedgerRow.contract == contract,
+            GateIngestLedgerRow.yyyymm == yyyymm,
+        )
+        with Session(self._engine) as session:
+            return session.scalar(stmt)
+
+    def record_ingested_file(
+        self,
+        *,
+        dataset: str,
+        contract: str,
+        yyyymm: str,
+        sha256: str,
+        byte_size: int,
+        local_path: str,
+        row_count: int,
+        inserted_rows: int,
+        ingested_at: datetime,
+    ) -> None:
+        stmt = (
+            insert(GateIngestLedgerRow)
+            .values(
+                dataset=dataset,
+                contract=contract,
+                yyyymm=yyyymm,
+                sha256=sha256,
+                byte_size=byte_size,
+                local_path=local_path,
+                row_count=row_count,
+                inserted_rows=inserted_rows,
+                ingested_at=_to_utc(ingested_at),
+            )
+            .on_conflict_do_update(
+                constraint="uq_gate_ingest_file",
+                set_={
+                    "sha256": sha256,
+                    "byte_size": byte_size,
+                    "local_path": local_path,
+                    "row_count": row_count,
+                    "inserted_rows": inserted_rows,
+                    "ingested_at": _to_utc(ingested_at),
+                },
+            )
+        )
+        with Session(self._engine) as session, session.begin():
+            session.execute(stmt)

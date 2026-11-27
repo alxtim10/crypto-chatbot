@@ -738,3 +738,23 @@ class ContractStatsRow(Base):
     short_users: Mapped[int | None] = mapped_column(Integer, nullable=True)
     quality_flags: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
     raw_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+
+
+class GateIngestLedgerRow(Base):
+    """Idempotent checksum ledger for `download.gatedata.org` bulk archive files (D-04)."""
+
+    __tablename__ = "gate_ingest_ledger"
+    __table_args__ = (
+        UniqueConstraint("dataset", "contract", "yyyymm", name="uq_gate_ingest_file"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    dataset: Mapped[str] = mapped_column(String(64), nullable=False)
+    contract: Mapped[str] = mapped_column(String(64), nullable=False)
+    yyyymm: Mapped[str] = mapped_column(String(6), nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    local_path: Mapped[str] = mapped_column(Text, nullable=False)
+    row_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    inserted_rows: Mapped[int] = mapped_column(Integer, nullable=False)
+    ingested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

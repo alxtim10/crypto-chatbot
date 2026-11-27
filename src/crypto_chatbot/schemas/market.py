@@ -33,6 +33,7 @@ class MarketType(StrEnum):
 
 
 class Timeframe(StrEnum):
+    M1 = "1m"
     M5 = "5m"
     M15 = "15m"
     H1 = "1h"
@@ -107,6 +108,7 @@ def format_trading_style_short(timeframe: Timeframe) -> str:
 
 
 _TIMEFRAME_DURATIONS: dict[Timeframe, timedelta] = {
+    Timeframe.M1: timedelta(minutes=1),
     Timeframe.M5: timedelta(minutes=5),
     Timeframe.M15: timedelta(minutes=15),
     Timeframe.H1: timedelta(hours=1),
