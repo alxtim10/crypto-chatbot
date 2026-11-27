@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Collection, Sequence
+from datetime import datetime, timedelta
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, ValidationError
@@ -500,6 +501,50 @@ _HEADER_BRACKET_RE = re.compile(r"^\[([^\]]+)\s+(15m|1h|4h|1d)\]", re.IGNORECASE
 _HEADER_HTML_RE = re.compile(r"^<b>([^ (]+(?:\s*,\s*[^ (]+)*)\s*\((15m|1h|4h|1d)\)", re.IGNORECASE)
 _HEADER_RE = _HEADER_BRACKET_RE
 
+CONTEXT_TTL = timedelta(minutes=15)
+CONTEXT_MAX_MESSAGES = 8
+
+_SMALLTALK_THANKS_RE = re.compile(
+    r"^(?:(?:oke|ok|okay|sip|siap|paham)[,\s]+)*"
+    r"(?:makasih(?:\s+banyak)?|terima\s*kasih(?:\s+banyak)?|thanks|thank\s+you|thx|tq)"
+    r"(?:\s+(?:ya|yaa|bro|min|bot|bang|gan|kak|banyak))*[!?.~\s]*$",
+    re.IGNORECASE,
+)
+_SMALLTALK_ACK_RE = re.compile(
+    r"^(?:oke|ok|okay|siap|noted|paham|mantap|sip|baik)"
+    r"(?:[\s,!]+(?:oke|ok|okay|siap|noted|paham|mantap|sip|baik|ya|bro|min|bot|bang|gan|kak))*[!?.~\s]*$",
+    re.IGNORECASE,
+)
+_SMALLTALK_LAUGH_RE = re.compile(
+    r"^(?:wkwk+|haha+|hehe+|hihi+)(?:\s+\w+){0,3}[!?.~\s]*$",
+    re.IGNORECASE,
+)
+_SMALLTALK_GREETING_RE = re.compile(
+    r"^(?:(?:selamat\s+)?(?:pagi|siang|sore|malam)|halo|hai|hi|hey|apa\s+kabar)"
+    r"(?:\s+(?:min|bro|bot|bang|gan|semua|kak|mas|mbak))?[!?.~\s]*$",
+    re.IGNORECASE,
+)
+_HELP_INTENT_RE = re.compile(
+    r"(?:\bbisa\s+ngapain\b|\bcara\s+pakai\s+(?:bot|kamu|anda|ini)\b|\bdaftar\s+perintah\b|"
+    r"\bfitur\s+apa\b|\bpanduan\s+bot\b|\bperintah\s+apa\b|\bbantu\s+dong\s+cara\b|"
+    r"\btolong\s+jelas(?:in|kan)\s+cara\s+pakai\b)",
+    re.IGNORECASE,
+)
+
+
+def _detect_smalltalk_subtype(text: str) -> Literal["greeting", "thanks", "ack"] | None:
+    if _SMALLTALK_THANKS_RE.match(text):
+        return "thanks"
+    if _SMALLTALK_GREETING_RE.match(text):
+        return "greeting"
+    if _SMALLTALK_ACK_RE.match(text) or _SMALLTALK_LAUGH_RE.match(text):
+        return "ack"
+    return None
+
+
+def _is_help_request(text: str) -> bool:
+    return _HELP_INTENT_RE.search(text) is not None
+
 
 class CommandParseError(ValueError):
     """Raised when command syntax or arguments are invalid, with actionable guidance."""
@@ -564,6 +609,19 @@ class ChatQaIntent(BaseModel):
     question: str
 
 
+class SmalltalkIntent(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    kind: Literal["smalltalk"] = "smalltalk"
+    subtype: Literal["greeting", "thanks", "ack"] = "greeting"
+
+
+class HelpIntent(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    kind: Literal["help"] = "help"
+
+
 class RefusalIntent(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -580,6 +638,8 @@ FollowupIntent = (
     | ScreenIntent
     | WhaleIntent
     | ChatQaIntent
+    | SmalltalkIntent
+    | HelpIntent
     | RefusalIntent
 )
 
@@ -821,17 +881,30 @@ def _extract_mvp_symbols(
     return ordered
 
 
-def _extract_recent_context(
+def _extract_recent_context_with_status(
     recent_messages: Sequence[StoredMessage],
     default_timeframe: Timeframe,
     *,
+    now: datetime | None = None,
     perp_universe: Collection[str] | None = None,
-) -> tuple[list[str], Timeframe]:
+) -> tuple[list[str], Timeframe, bool]:
     recent_symbols: list[str] = []
     recent_tf = default_timeframe
     tf_found = False
+    context_expired = False
 
-    for msg in reversed(recent_messages):
+    if not recent_messages:
+        return recent_symbols, recent_tf, context_expired
+
+    anchor = now if now is not None else recent_messages[-1].created_at
+    window = recent_messages[-CONTEXT_MAX_MESSAGES:]
+    broke_on_topic_switch = False
+
+    for msg in reversed(window):
+        if (anchor - msg.created_at) > CONTEXT_TTL:
+            context_expired = True
+            break
+
         content_stripped = msg.content.strip()
         header_match = _HEADER_BRACKET_RE.match(content_stripped) or _HEADER_HTML_RE.match(
             content_stripped
@@ -856,6 +929,22 @@ def _extract_recent_context(
                 break
             continue
 
+        # EDU_QA / SMALLTALK / HELP turns break the active analysis chain.
+        if msg.role == "assistant":
+            is_scan_or_screen = content_stripped.startswith(
+                "[SCAN "
+            ) or content_stripped.startswith("[SCREEN ")
+            if msg.snapshot_id is None and not is_scan_or_screen:
+                broke_on_topic_switch = True
+                break
+        elif msg.role == "user" and (
+            _is_conceptual_question(content_stripped)
+            or _detect_smalltalk_subtype(content_stripped) is not None
+            or _is_help_request(content_stripped)
+        ):
+            broke_on_topic_switch = True
+            break
+
         msg_syms = _extract_mvp_symbols(msg.content, perp_universe=perp_universe)
         if msg_syms:
             for sym in msg_syms:
@@ -867,6 +956,31 @@ def _extract_recent_context(
                     recent_tf = extracted_tf
             break
 
+    if not recent_symbols and not broke_on_topic_switch:
+        # Check if prior analysis existed outside TTL or 4-turn window.
+        for msg in recent_messages:
+            if _HEADER_BRACKET_RE.match(msg.content.strip()) or _HEADER_HTML_RE.match(
+                msg.content.strip()
+            ):
+                context_expired = True
+                break
+
+    return recent_symbols, recent_tf, context_expired
+
+
+def _extract_recent_context(
+    recent_messages: Sequence[StoredMessage],
+    default_timeframe: Timeframe,
+    *,
+    now: datetime | None = None,
+    perp_universe: Collection[str] | None = None,
+) -> tuple[list[str], Timeframe]:
+    recent_symbols, recent_tf, _ = _extract_recent_context_with_status(
+        recent_messages,
+        default_timeframe,
+        now=now,
+        perp_universe=perp_universe,
+    )
     return recent_symbols, recent_tf
 
 
@@ -875,6 +989,7 @@ def resolve_followup_intent_with_trace(
     *,
     recent_messages: Sequence[StoredMessage],
     default_timeframe: Timeframe = Timeframe.H4,
+    now: datetime | None = None,
     perp_universe: Collection[str] | None = None,
 ) -> tuple[FollowupIntent, RoutingTrace]:
     """Resolve a bounded natural-language message and return PII-free routing telemetry."""
@@ -991,6 +1106,7 @@ def resolve_followup_intent_with_trace(
     recent_symbols, recent_tf = _extract_recent_context(
         recent_messages,
         default_timeframe,
+        now=now,
         perp_universe=perp_universe,
     )
     explicit_tf = _extract_timeframe_or_style_from_text(cleaned)
@@ -1001,6 +1117,20 @@ def resolve_followup_intent_with_trace(
     is_compare = _COMPARE_WORD_RE.search(cleaned) is not None
     is_pine = _PINE_INTENT_RE.search(cleaned) is not None
     is_detail = _DETAIL_INTENT_RE.search(cleaned) is not None
+
+    if not mentioned:
+        if _is_help_request(cleaned):
+            return (
+                HelpIntent(),
+                RoutingTrace(layer="layer1", intent="help", confidence=1.0),
+            )
+        if not is_conceptual:
+            smalltalk_subtype = _detect_smalltalk_subtype(cleaned)
+            if smalltalk_subtype is not None:
+                return (
+                    SmalltalkIntent(subtype=smalltalk_subtype),
+                    RoutingTrace(layer="layer1", intent="smalltalk", confidence=1.0),
+                )
 
     if not mentioned and _SCREEN_INTENT_RE.search(cleaned):
         has_long = _SCREEN_LONG_HINT_RE.search(cleaned) is not None
@@ -1124,8 +1254,10 @@ def resolve_followup_intent_with_trace(
 
     if (
         recent_symbols
-        and (_CONTEXT_TOPIC_RE.search(cleaned) or is_compare or is_detail)
-        and _CONCEPTUAL_QA_RE.search(cleaned) is None
+        and (
+            _CONTEXT_TOPIC_RE.search(cleaned) or is_compare or is_detail or explicit_tf is not None
+        )
+        and not is_conceptual
     ):
         if is_compare and len(recent_symbols) >= 2:
             syms = tuple(recent_symbols[:2])
@@ -1171,6 +1303,7 @@ def resolve_followup_intent(
     *,
     recent_messages: Sequence[StoredMessage],
     default_timeframe: Timeframe = Timeframe.H4,
+    now: datetime | None = None,
     perp_universe: Collection[str] | None = None,
 ) -> FollowupIntent:
     """Resolve a bounded natural-language message into an explicit backend analysis intent."""
@@ -1178,6 +1311,7 @@ def resolve_followup_intent(
         text,
         recent_messages=recent_messages,
         default_timeframe=default_timeframe,
+        now=now,
         perp_universe=perp_universe,
     )
     return intent

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 from datetime import UTC, datetime, timedelta, timezone
+from typing import Literal
 
 from crypto_chatbot.schemas.analysis import (
     AnalysisSnapshot,
@@ -1150,3 +1151,19 @@ def render_forget_message(result: ForgetResult, *, html_mode: bool = True) -> st
         "Data pasar publik dan snapshot anonim tidak terpengaruh.",
     ]
     return "\n".join(lines)
+
+
+def render_smalltalk_reply(subtype: Literal["greeting", "thanks", "ack"]) -> str:
+    """Render concise deterministic Indonesian reply for greetings, thanks, and acks."""
+    if subtype == "thanks":
+        return (
+            "Sama-sama! Jika butuh cek koin lain, tanya istilah trading, atau pindai setup, "
+            "kabari saja."
+        )
+    if subtype == "ack":
+        return "Siap! Kabari saja kalau ingin cek koin atau diskusi konsep trading."
+    return (
+        "Halo! Saya asisten riset & edukasi futures kripto. "
+        "Tanya konsep trading (mis. 'apa itu RSI 70?'), cek koin (mis. 'analisa BTC 4h'), "
+        "atau ketik /help."
+    )

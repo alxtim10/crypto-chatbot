@@ -355,6 +355,7 @@ def _build_stack(
         analysis_service=analysis_service,
         narrator=narrator,
         memory=memory,
+        clock=lambda: clock_now,
     )
     return _PtbHarness(bot_service), client, transport, repo
 

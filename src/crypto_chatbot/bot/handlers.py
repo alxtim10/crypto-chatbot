@@ -9,6 +9,7 @@ import math
 import time
 import uuid
 from collections.abc import Callable, Collection, Sequence
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 from sqlalchemy.exc import SQLAlchemyError
@@ -42,10 +43,12 @@ from crypto_chatbot.bot.commands import (
     ChatQaIntent,
     CommandParseError,
     CompareIntent,
+    HelpIntent,
     PineIntent,
     RefusalIntent,
     ScanIntent,
     ScreenIntent,
+    SmalltalkIntent,
     WhaleIntent,
     _extract_recent_context,
     parse_analyze_args,
@@ -59,6 +62,7 @@ from crypto_chatbot.bot.templates import (
     render_forget_message,
     render_help_message,
     render_memory_message,
+    render_smalltalk_reply,
     render_start_message,
     render_watchlist_message,
     split_telegram_message,
@@ -108,6 +112,7 @@ class BotService:
         whale_provider: WhaleDataProvider | None = None,
         whale_watchlist: WhaleWatchlistManager | None = None,
         forward_track_provider: Callable[[], Sequence[ForwardProofEvaluation]] | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._access = access
         self._analysis_service = analysis_service
@@ -116,6 +121,7 @@ class BotService:
         self._whale_provider = whale_provider or WhaleDataProvider()
         self._whale_watchlist = whale_watchlist or WhaleWatchlistManager()
         self._forward_track_provider = forward_track_provider
+        self._clock: Callable[[], datetime] = clock or (lambda: datetime.now(UTC))
         self._perp_universe_cache: tuple[float, frozenset[str]] | None = None
 
     _PERP_UNIVERSE_CACHE_TTL_SECONDS = 600.0
@@ -807,10 +813,12 @@ class BotService:
             prefs = await asyncio.to_thread(self._memory.get_preferences, user_id)
             recent = await asyncio.to_thread(self._memory.get_recent_messages, user_id)
             perp_universe = await self._get_perp_universe()
+            now_utc = self._clock()
             intent, trace = resolve_followup_intent_with_trace(
                 text,
                 recent_messages=recent,
                 default_timeframe=prefs.default_timeframe,
+                now=now_utc,
                 perp_universe=perp_universe,
             )
             cls_outcome: IntentClassificationOutcome | None = None
@@ -821,9 +829,33 @@ class BotService:
                     recent_messages=recent,
                     default_timeframe=prefs.default_timeframe,
                     fallback_refusal=intent,
+                    now=now_utc,
                     perp_universe=perp_universe,
                 )
 
+            if isinstance(intent, SmalltalkIntent):
+                self._log_routing_trace(request_id, trace)
+                await asyncio.to_thread(
+                    self._memory.record_routing_trace,
+                    user_id=user_id,
+                    request_id=request_id,
+                    trace=trace,
+                    model_id="deterministic",
+                )
+                reply = render_smalltalk_reply(intent.subtype)
+                await asyncio.to_thread(self._memory.record_user_message, user_id, text)
+                await asyncio.to_thread(self._memory.record_assistant_text, user_id, reply)
+                return (html.escape(reply, quote=False),)
+            if isinstance(intent, HelpIntent):
+                self._log_routing_trace(request_id, trace)
+                await asyncio.to_thread(
+                    self._memory.record_routing_trace,
+                    user_id=user_id,
+                    request_id=request_id,
+                    trace=trace,
+                    model_id="deterministic",
+                )
+                return split_telegram_message(render_help_message(), TELEGRAM_MAX_MESSAGE_LENGTH)
             if isinstance(intent, RefusalIntent):
                 self._log_routing_trace(request_id, trace)
                 await asyncio.to_thread(
@@ -976,6 +1008,7 @@ class BotService:
         recent_messages: Sequence[Any],
         default_timeframe: Timeframe,
         fallback_refusal: RefusalIntent,
+        now: datetime | None = None,
         perp_universe: Collection[str] | None = None,
     ) -> tuple[
         AnalyzeIntent
@@ -993,6 +1026,7 @@ class BotService:
         recent_syms, recent_tf = _extract_recent_context(
             recent_messages,
             default_timeframe,
+            now=now,
             perp_universe=perp_universe,
         )
         cls_outcome = await self._narrator.classify_intent_with_diagnostics(

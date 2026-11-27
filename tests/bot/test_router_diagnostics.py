@@ -16,8 +16,11 @@ from crypto_chatbot.bot.access import AccessController
 from crypto_chatbot.bot.commands import (
     AnalyzeIntent,
     CompareIntent,
+    HelpIntent,
     PineIntent,
     RefusalIntent,
+    SmalltalkIntent,
+    _extract_recent_context,
     resolve_followup_intent_with_trace,
 )
 from crypto_chatbot.bot.handlers import BotService
@@ -539,6 +542,7 @@ async def test_routing_trace_persisted_without_pii_across_paths(
         analysis_service=_DiagnosticAnalysisService(),  # type: ignore[arg-type]
         narrator=narrator,
         memory=memory,
+        clock=lambda: ANCHOR,
     )
 
     # Non-allowlisted user persists nothing
@@ -582,7 +586,7 @@ async def test_routing_trace_persisted_without_pii_across_paths(
     assert rec_qa_ok.validation_passed is True
 
     # 5) Classifier failure + QA failure
-    await bot.handle_text_message(111, "halo bro")
+    await bot.handle_text_message(111, "hmm market gimana ya?")
     rec_cls_fail = repo.interactions[-1]
     assert rec_cls_fail.layer == "layer2_fallback"
     assert rec_cls_fail.intent == "chat_qa"
@@ -629,6 +633,7 @@ async def _run_bot_scenario(
         analysis_service=_DiagnosticAnalysisService(),  # type: ignore[arg-type]
         narrator=narrator,
         memory=memory,
+        clock=lambda: ANCHOR,
     )
 
     totals: Counter[str] = Counter()
@@ -721,7 +726,11 @@ async def test_evaluate_router_casual_id_fixture_diagnostics() -> None:
     for utt in utterances:
         l1_total[utt.expected_intent] += 1
         hist = history if utt.has_history else ()
-        intent, trace = resolve_followup_intent_with_trace(utt.text, recent_messages=hist)
+        intent, trace = resolve_followup_intent_with_trace(
+            utt.text,
+            recent_messages=hist,
+            now=ANCHOR,
+        )
         if isinstance(intent, RefusalIntent):
             if intent.is_hard_refusal:
                 l1_hard_refusal[utt.expected_intent] += 1
@@ -812,7 +821,9 @@ async def test_pr1_symbol_extraction_cues_and_cached_universe() -> None:
         ("OMG 15m dong", "OMG/USDT:USDT"),
     ):
         intent, _ = resolve_followup_intent_with_trace(msg, recent_messages=())
-        assert isinstance(intent, AnalyzeIntent), f"Expected AnalyzeIntent for {msg!r}, got {intent}"
+        assert isinstance(intent, AnalyzeIntent), (
+            f"Expected AnalyzeIntent for {msg!r}, got {intent}"
+        )
         assert intent.symbol == expected_sym
 
     # Colliding words, slang, and non-universe acronyms must NOT extract symbols
@@ -946,3 +957,98 @@ def test_pr2_conceptual_questions_bypass_hard_refusals_while_policy_enforced() -
         assert isinstance(intent, RefusalIntent)
         assert intent.is_hard_refusal is True, f"Expected hard refusal for {hard_q!r}"
         assert trace.fallback_reason == expected_reason
+
+
+@pytest.mark.asyncio
+async def test_pr4_smalltalk_help_zero_token_and_context_decay() -> None:
+    """PR4: Zero-token smalltalk/help detectors and 15m / 4-turn / topic-switch context decay."""
+    history = (
+        StoredMessage(
+            role="user", content="/analyze BTC 4h", created_at=ANCHOR - timedelta(minutes=2)
+        ),
+        StoredMessage(
+            role="assistant",
+            content="[BTC/USDT:USDT 4h] Harga {F1} di atas EMA 200 ({F6}).",
+            snapshot_id="snap-btc-seed",
+            created_at=ANCHOR - timedelta(minutes=1),
+        ),
+    )
+
+    # Zero-token Smalltalk even when history is active ("makasih" must NOT re-trigger BTC analysis)
+    for msg in ("halo", "pagi min", "makasih", "oke noted", "WKWK mantap", "oke paham, makasih ya"):
+        intent, trace = resolve_followup_intent_with_trace(msg, recent_messages=history, now=ANCHOR)
+        assert isinstance(intent, SmalltalkIntent), f"Expected SmalltalkIntent for {msg!r}"
+        assert trace.layer == "layer1"
+        assert trace.intent == "smalltalk"
+
+    # Zero-token Help
+    for msg in (
+        "bisa ngapain aja bot ini?",
+        "daftar perintah apa aja?",
+        "cara pakai bot ini gimana?",
+    ):
+        intent, trace = resolve_followup_intent_with_trace(msg, recent_messages=(), now=ANCHOR)
+        assert isinstance(intent, HelpIntent), f"Expected HelpIntent for {msg!r}"
+        assert trace.layer == "layer1"
+        assert trace.intent == "help"
+
+    # End-to-end BotService executes smalltalk & help with ZERO Gemini calls
+    class _CountingTransport(_ScriptedTransport):
+        def __init__(self) -> None:
+            super().__init__(fail=True)
+            self.call_count = 0
+
+        async def generate_json(self, **kwargs: Any) -> RawGeminiOutput:
+            self.call_count += 1
+            return await super().generate_json(**kwargs)
+
+    transport = _CountingTransport()
+    repo = _RecordingMemoryRepo()
+    repo.msgs[111] = list(history)
+    bot = BotService(
+        access=AccessController((111,)),
+        analysis_service=_DiagnosticAnalysisService(),  # type: ignore[arg-type]
+        narrator=GeminiNarrator(model="gemini-2.5-flash", transport=transport, max_guard_retries=0),
+        memory=MemoryService(repo),
+        clock=lambda: ANCHOR,
+    )
+    thanks_reply = "\n".join(await bot.handle_text_message(111, "makasih"))
+    help_reply = "\n".join(await bot.handle_text_message(111, "daftar perintah apa aja?"))
+    assert transport.call_count == 0
+    assert "sama-sama" in thanks_reply.lower()
+    assert "Panduan Perintah" in help_reply
+
+    # Context decay: TTL 15 min
+    syms_14m, _ = _extract_recent_context(history, Timeframe.H4, now=ANCHOR + timedelta(minutes=13))
+    assert syms_14m == ["BTC/USDT:USDT"]
+    syms_16m, _ = _extract_recent_context(history, Timeframe.H4, now=ANCHOR + timedelta(minutes=16))
+    assert syms_16m == []
+
+    # Context decay: > 4 turns (8 messages) drops older symbol
+    padded_history = (
+        *history,
+        *(
+            StoredMessage(
+                role="user" if i % 2 == 0 else "assistant",
+                content=f"[SCAN 4h] turn {i}",
+                created_at=ANCHOR,
+            )
+            for i in range(8)
+        ),
+    )
+    syms_window, _ = _extract_recent_context(padded_history, Timeframe.H4, now=ANCHOR)
+    assert syms_window == []
+
+    # Chain break: EDU_QA / SMALLTALK breaks active analysis chain
+    broken_by_edu = (
+        *history,
+        StoredMessage(role="user", content="apa itu RSI 70?", created_at=ANCHOR),
+        StoredMessage(
+            role="assistant",
+            content="RSI 70 menandakan momentum beli historis tinggi.",
+            snapshot_id=None,
+            created_at=ANCHOR,
+        ),
+    )
+    syms_broken, _ = _extract_recent_context(broken_by_edu, Timeframe.H4, now=ANCHOR)
+    assert syms_broken == []
