@@ -1,5 +1,12 @@
 """Traceable Phase 11 news ingestion and non-probabilistic sentiment analysis."""
 
+from crypto_chatbot.news.eval_dataset import (
+    EVAL_CSV_COLUMNS,
+    EVAL_LABELS,
+    HeadlineEvalReport,
+    evaluate_labeled_headlines_csv,
+    export_unlabeled_headlines_csv,
+)
 from crypto_chatbot.news.fear_greed import (
     DEFAULT_FNG_API_URL,
     FearGreedClient,
@@ -28,9 +35,12 @@ from crypto_chatbot.news.pipeline import (
 
 __all__ = [
     "DEFAULT_FNG_API_URL",
+    "EVAL_CSV_COLUMNS",
+    "EVAL_LABELS",
     "VERIFIED_PUBLIC_RSS_FEEDS",
     "FearGreedClient",
     "FearGreedSyncResult",
+    "HeadlineEvalReport",
     "NewsSyncResult",
     "PublicRssNewsClient",
     "aggregate_sentiment",
@@ -41,6 +51,8 @@ __all__ = [
     "classify_article_sentiment",
     "compute_content_fingerprint",
     "deduplicate_articles",
+    "evaluate_labeled_headlines_csv",
+    "export_unlabeled_headlines_csv",
     "match_entities",
     "normalize_fear_greed_payload",
     "parse_rss_xml",

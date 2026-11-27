@@ -2071,6 +2071,70 @@ def _run_sync_news(
     return 0
 
 
+def _run_export_sentiment_eval(
+    *,
+    count: int,
+    out_path: Path,
+    as_json: bool,
+) -> int:
+    from crypto_chatbot.news.eval_dataset import export_unlabeled_headlines_csv
+    from crypto_chatbot.news.ingestor import PublicRssNewsClient
+    from crypto_chatbot.news.pipeline import deduplicate_articles
+
+    async def _fetch() -> int:
+        client = PublicRssNewsClient()
+        try:
+            raw_items, _ok = await client.fetch_all()
+            dedup_articles, _dropped = deduplicate_articles(raw_items)
+            return export_unlabeled_headlines_csv(
+                dedup_articles,
+                output_path=out_path,
+                count=count,
+            )
+        finally:
+            await client.close()
+
+    try:
+        exported = asyncio.run(_fetch())
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    payload = {
+        "output_path": str(out_path),
+        "exported_rows": exported,
+        "manual_label_prefilled": False,
+    }
+    if as_json:
+        print(json.dumps(payload, indent=2))
+    else:
+        print(f"export-sentiment-eval: wrote {exported} unlabeled rows -> {out_path}")
+    return 0
+
+
+def _run_evaluate_sentiment_csv(
+    *,
+    input_path: Path,
+    as_json: bool,
+) -> int:
+    from crypto_chatbot.news.eval_dataset import evaluate_labeled_headlines_csv
+
+    try:
+        report = evaluate_labeled_headlines_csv(input_path)
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if as_json:
+        print(report.model_dump_json(indent=2))
+    else:
+        print(
+            f"evaluate-sentiment-csv: labeled={report.labeled_rows}/{report.total_rows}, "
+            f"accuracy={report.accuracy:.4f}, matrix={report.confusion_matrix}"
+        )
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="crypto-chatbot")
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -2653,6 +2717,44 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Print JSON output.",
     )
 
+    export_eval_parser = subcommands.add_parser(
+        "export-sentiment-eval",
+        help="Export recent unlabeled headlines CSV for manual bullish/bearish/neutral labeling.",
+    )
+    export_eval_parser.add_argument(
+        "--count",
+        type=int,
+        default=300,
+        help="Maximum headlines to export (default: 300).",
+    )
+    export_eval_parser.add_argument(
+        "--out",
+        type=Path,
+        default=Path("tests/fixtures/sentiment_eval_unlabeled.csv"),
+        help="Output CSV path (default: tests/fixtures/sentiment_eval_unlabeled.csv).",
+    )
+    export_eval_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print JSON output.",
+    )
+
+    eval_csv_parser = subcommands.add_parser(
+        "evaluate-sentiment-csv",
+        help="Score manually labeled headlines CSV and print lexicon accuracy/confusion matrix.",
+    )
+    eval_csv_parser.add_argument(
+        "--input",
+        type=Path,
+        default=Path("tests/fixtures/sentiment_eval_unlabeled.csv"),
+        help="Input labeled CSV path.",
+    )
+    eval_csv_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print JSON output.",
+    )
+
     args = parser.parse_args(argv)
     if args.command == "check-config":
         return _check_config()
@@ -2815,6 +2917,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             source=args.source,
             as_json=args.json,
             database_url=args.database_url,
+        )
+    if args.command == "export-sentiment-eval":
+        return _run_export_sentiment_eval(
+            count=args.count,
+            out_path=args.out,
+            as_json=args.json,
+        )
+    if args.command == "evaluate-sentiment-csv":
+        return _run_evaluate_sentiment_csv(
+            input_path=args.input,
+            as_json=args.json,
         )
     parser.error(f"unknown command: {args.command}")  # pragma: no cover
 
