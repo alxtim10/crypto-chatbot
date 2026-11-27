@@ -398,7 +398,34 @@ _NON_TICKER_ACRONYMS: frozenset[str] = frozenset(
         "COCOK",
     }
 )
-_NON_USDT_PAIR_RE = re.compile(r"\b([A-Z0-9]{2,12}/(?!USDT\b)[A-Z]{2,10})\b", re.IGNORECASE)
+_NON_USDT_PAIR_RE = re.compile(r"\b([A-Z0-9]{2,12})/(?!USDT\b)([A-Z]{2,10})\b", re.IGNORECASE)
+_KNOWN_NON_USDT_QUOTES: frozenset[str] = frozenset(
+    {
+        "AUD",
+        "BNB",
+        "BRL",
+        "BTC",
+        "BUSD",
+        "DAI",
+        "ETH",
+        "EUR",
+        "FDUSD",
+        "GBP",
+        "IDR",
+        "JPY",
+        "KRW",
+        "NGN",
+        "PLN",
+        "RON",
+        "RUB",
+        "TRY",
+        "TUSD",
+        "UAH",
+        "USD",
+        "USDC",
+        "ZAR",
+    }
+)
 _SPOT_HINT_RE = re.compile(r"\b(?:spot)\b", re.IGNORECASE)
 _COMPARE_WORD_RE = re.compile(
     r"\b(?:bandingkan|dibanding|compare|versus|vs|perbandingan)\b",
@@ -439,11 +466,27 @@ _CONTEXT_TOPIC_RE = re.compile(
     re.IGNORECASE,
 )
 _CONCEPTUAL_QA_RE = re.compile(
-    r"(?:\b(?:apa\s+itu|apa\s+arti|artinya\s+apa|bedanya|perbedaan|"
+    r"(?:\b(?:apa\s+itu|apa\s+arti|apa\s+bedanya|artinya(?:\s+apa)?|perbedaan|bedanya|"
     r"maksudnya|gimana\s+cara|bagaimana\s+cara|cara\s+atur|cara\s+pakai|"
-    r"kenapa\s+(?:tadi|barusan|kok)|tips\s+trading|psikologi\s+trading)\b)",
+    r"cara\s+hitung|cara\s+kerja|kenapa|mengapa|jelaskan|"
+    r"tips\s+trading|psikologi\s+trading)\b|"
+    r"\bfunding(?:\s+rate)?\b.*\b8h\b|\b8h\b.*\bfunding(?:\s+rate)?\b)",
     re.IGNORECASE,
 )
+
+
+def _is_conceptual_question(text: str) -> bool:
+    return _CONCEPTUAL_QA_RE.search(text) is not None
+
+
+def _find_non_usdt_pairs(text: str, universe: frozenset[str]) -> list[str]:
+    matches: list[str] = []
+    for match in _NON_USDT_PAIR_RE.finditer(text):
+        base = match.group(1).upper()
+        quote = match.group(2).upper()
+        if quote in _KNOWN_NON_USDT_QUOTES and _in_perp_universe(base, universe):
+            matches.append(f"{match.group(1)}/{match.group(2)}")
+    return matches
 _ORDER_OR_ADVICE_RE = re.compile(
     r"(?:\bpasang\s+order\b|\bexecute\s+order\b|\border\s+sekarang\b|"
     r"\bbeli\s+sekarang\b|\bjual\s+sekarang\b|\bbelikan\b|\bjualkan\b|"
@@ -864,7 +907,14 @@ def resolve_followup_intent_with_trace(
             ),
         )
 
-    if _ORDER_OR_ADVICE_RE.search(cleaned):
+    universe = (
+        frozenset(s.upper() for s in perp_universe)
+        if perp_universe is not None
+        else DEFAULT_PERP_UNIVERSE
+    )
+    is_conceptual = _is_conceptual_question(cleaned)
+
+    if not is_conceptual and _ORDER_OR_ADVICE_RE.search(cleaned):
         return (
             RefusalIntent(
                 message=(
@@ -881,7 +931,7 @@ def resolve_followup_intent_with_trace(
             ),
         )
 
-    if _SPOT_HINT_RE.search(cleaned):
+    if not is_conceptual and _SPOT_HINT_RE.search(cleaned):
         return (
             RefusalIntent(
                 message=(
@@ -898,7 +948,7 @@ def resolve_followup_intent_with_trace(
             ),
         )
 
-    non_usdt = _NON_USDT_PAIR_RE.findall(cleaned)
+    non_usdt = _find_non_usdt_pairs(cleaned, universe)
     if non_usdt:
         return (
             RefusalIntent(
@@ -916,7 +966,11 @@ def resolve_followup_intent_with_trace(
             ),
         )
 
-    if _BAD_TIMEFRAME_TEXT_RE.search(cleaned) and not _SUPPORTED_TIMEFRAME_TEXT_RE.search(cleaned):
+    if (
+        not is_conceptual
+        and _BAD_TIMEFRAME_TEXT_RE.search(cleaned)
+        and not _SUPPORTED_TIMEFRAME_TEXT_RE.search(cleaned)
+    ):
         return (
             RefusalIntent(
                 message=(

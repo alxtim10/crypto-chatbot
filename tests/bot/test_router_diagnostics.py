@@ -790,6 +790,7 @@ async def test_evaluate_router_casual_id_fixture_diagnostics() -> None:
     assert sum(l1_total.values()) == 100
     assert len(l1_false_pos_symbols) == 0
     assert len(l1_ada_missed) == 0
+    assert l1_hard_refusal["EDU_QA"] == 0
 
 
 @pytest.mark.asyncio
@@ -913,3 +914,32 @@ async def test_pr1_symbol_extraction_cues_and_cached_universe() -> None:
     assert "NEWCOIN/USDT:USDT (4h)" in out
     assert repo.interactions[-1].layer == "layer1"
     assert repo.interactions[-1].detected_symbol == "NEWCOIN/USDT:USDT"
+
+
+def test_pr2_conceptual_questions_bypass_hard_refusals_while_policy_enforced() -> None:
+    """PR2: Conceptual questions must not trigger hard refusals; real policy violations still do."""
+    for edu_q in (
+        "apa bedanya spot sama futures?",
+        "funding rate dibayar tiap 8h ya?",
+        "apa itu BOS/CHoCH?",
+        "bedanya long/short apa?",
+        "cara hitung risk/reward 1:2 gimana?",
+        "kenapa gak boleh all-in?",
+        "jelaskan konsep support/resistance",
+    ):
+        intent, trace = resolve_followup_intent_with_trace(edu_q, recent_messages=())
+        assert isinstance(intent, RefusalIntent)
+        assert intent.is_hard_refusal is False, f"Unexpected hard refusal for {edu_q!r}: {trace}"
+
+    for hard_q, expected_reason in (
+        ("bandingkan dengan BTC/EUR", "non_usdt_pair_unsupported"),
+        ("analisa ETH/USDC 4h", "non_usdt_pair_unsupported"),
+        ("analisis BTC spot 4h", "spot_market_unsupported"),
+        ("analisa BTC 5m", "unsupported_timeframe"),
+        ("pasang order beli sekarang", "order_or_advice_policy"),
+        ("belikan BTC sekarang 100 dolar", "order_or_advice_policy"),
+    ):
+        intent, trace = resolve_followup_intent_with_trace(hard_q, recent_messages=())
+        assert isinstance(intent, RefusalIntent)
+        assert intent.is_hard_refusal is True, f"Expected hard refusal for {hard_q!r}"
+        assert trace.fallback_reason == expected_reason
