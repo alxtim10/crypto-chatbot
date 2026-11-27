@@ -594,7 +594,7 @@ async def test_hybrid_nlp_layer2_handles_lowercase_coin_scan_and_conversational_
         ]
     )
 
-    narrator = GeminiNarrator(model="gemini-2.5-flash", transport=transport)
+    narrator = GeminiNarrator(model="gemini-2.5-flash", transport=transport, max_guard_retries=0)
     memory = MemoryService(_LocalMemoryRepo())
     bot = BotService(
         access=AccessController((111,)),
@@ -640,7 +640,7 @@ async def test_casual_chat_flows_to_conversational_ai_even_when_classifier_fails
             ),
         ]
     )
-    narrator = GeminiNarrator(model="gemini-2.5-flash", transport=transport)
+    narrator = GeminiNarrator(model="gemini-2.5-flash", transport=transport, max_guard_retries=0)
     memory = MemoryService(_LocalMemoryRepo())
     bot = BotService(
         access=AccessController((111,)),

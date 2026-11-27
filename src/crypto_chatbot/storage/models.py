@@ -662,3 +662,27 @@ class TrialRow(Base):
     n_obs: Mapped[int] = mapped_column(Integer, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     git_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+
+class ScreenerUniverseSnapshotRow(Base):
+    """Daily point-in-time screener universe snapshot (`screener_universe_snapshots`, T-30)."""
+
+    __tablename__ = "screener_universe_snapshots"
+    __table_args__ = (
+        UniqueConstraint("snapshot_date_utc", "venue", name="uq_screener_snapshot_day_venue"),
+        Index("ix_screener_snapshot_lookup", "venue", "snapshot_date_utc"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    snapshot_date_utc: Mapped[str] = mapped_column(String(16), nullable=False)
+    venue: Mapped[str] = mapped_column(String(64), nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    min_volume_usd: Mapped[float] = mapped_column(Double, nullable=False)
+    total_pairs_seen: Mapped[int] = mapped_column(Integer, nullable=False)
+    liquid_pairs_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    top_gainers_json: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, nullable=False, default=list
+    )
+    top_losers_json: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, nullable=False, default=list
+    )

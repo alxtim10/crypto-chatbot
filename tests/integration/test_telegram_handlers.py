@@ -323,7 +323,7 @@ async def test_ptb_command_and_followup_handlers_end_to_end(
     register_handlers(app, bot)
 
     handlers = app.handlers[0]
-    assert len(handlers) == 13
+    assert len(handlers) == 15
 
     replies: list[tuple[str, Any]] = []
 
@@ -370,7 +370,7 @@ async def test_ptb_command_and_followup_handlers_end_to_end(
     whale_out = "\n".join(await invoke(7, "/whale BTC", ["BTC"]))
     assert "WHALE PERP TRACKER" in whale_out
 
-    followup_out = "\n".join(await invoke(12, "bandingkan momentumnya dengan ETH"))
+    followup_out = "\n".join(await invoke(14, "bandingkan momentumnya dengan ETH"))
     assert "Perbandingan Deskriptif (BTC/USDT:USDT, ETH/USDT:USDT - 4h)" in followup_out
     assert "BTC/USDT:USDT (4h)" in followup_out
     assert "ETH/USDT:USDT (4h)" in followup_out
@@ -381,7 +381,10 @@ async def test_ptb_command_and_followup_handlers_end_to_end(
     bad_cmd_out = "\n".join(await invoke(2, "/analyze BTC 5m", ["BTC", "5m"]))
     assert "tidak didukung" in bad_cmd_out.lower()
 
-    unknown_out = "\n".join(await invoke(11, "/tidakada"))
+    track_out = "\n".join(await invoke(12, "/track"))
+    assert "Forward Evaluation Ledger" in track_out
+
+    unknown_out = "\n".join(await invoke(13, "/tidakada"))
     assert "tidak dikenali" in unknown_out.lower()
 
     # /screen nan / inf rejected cleanly instead of NaN propagation
@@ -398,7 +401,7 @@ async def test_ptb_command_and_followup_handlers_end_to_end(
         raise ValueError("Ticker screener sementara gagal & timeout")
 
     monkeypatch.setattr(handlers_mod, "screen_momentum_movers", _boom_screener)
-    nl_screen_out = "\n".join(await invoke(12, "tolong screening top gainers"))
+    nl_screen_out = "\n".join(await invoke(14, "tolong screening top gainers"))
     assert "gagal" in nl_screen_out.lower()
     assert "&amp;" in nl_screen_out
 

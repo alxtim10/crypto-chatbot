@@ -8,10 +8,26 @@ from collections.abc import Mapping, Sequence
 
 from pydantic import BaseModel, ConfigDict
 
-from crypto_chatbot.schemas.analysis import AnalysisSnapshot, FactStatus
+from crypto_chatbot.schemas.analysis import AnalysisSnapshot, FactStatus, SetupBias, SetupStatus
 from crypto_chatbot.schemas.llm import LlmAnalysisNarration
 
 logger = logging.getLogger(__name__)
+
+_BULLISH_BIAS_RE = re.compile(r"\b(?:bullish|long)\b", re.IGNORECASE)
+_BEARISH_BIAS_RE = re.compile(r"\b(?:bearish|short)\b", re.IGNORECASE)
+
+
+def check_directional_consistency(
+    text: str,
+    bias: SetupBias | None,
+) -> tuple[str, ...]:
+    """Check whether directional bias words in `text` contradict `bias` (PRD v1.7 §2.3, T-31)."""
+    if bias is SetupBias.SHORT and _BULLISH_BIAS_RE.search(text):
+        return ("directional_inconsistency:contradicts_short",)
+    if bias is SetupBias.LONG and _BEARISH_BIAS_RE.search(text):
+        return ("directional_inconsistency:contradicts_long",)
+    return ()
+
 
 _BRACED_TOKEN_RE = re.compile(r"\{([^}]*)\}")
 _VALID_FACT_BODY_RE = re.compile(r"^F[1-9][0-9]*$")
@@ -262,6 +278,13 @@ def validate_narration(
         for pair in _PAIR_MENTION_RE.findall(text.upper()):
             if pair not in allowed_pairs:
                 reasons.append("unsupported_symbol_mentioned")
+
+    if (
+        snapshot.trade_setup is not None
+        and snapshot.trade_setup.status is SetupStatus.READY
+        and snapshot.trade_setup.bias in (SetupBias.LONG, SetupBias.SHORT)
+    ):
+        reasons.extend(check_directional_consistency(narration.summary, snapshot.trade_setup.bias))
 
     unique_reasons = tuple(dict.fromkeys(reasons))
     return GuardResult(is_valid=not unique_reasons, reasons=unique_reasons)

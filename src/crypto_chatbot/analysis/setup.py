@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import math
+import os
 from collections.abc import Mapping, Sequence
 from datetime import datetime
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
 from crypto_chatbot.analysis.indicators import (
     MIN_HISTORY_EMA_20,
@@ -477,6 +479,34 @@ def _collect_risk_notes(
     return notes
 
 
+DEFAULT_ASSUMED_MMR = 0.01
+
+
+def compute_leverage_ceiling(
+    sl_dist_ratio: float,
+    cost_rate: float,
+    *,
+    maintenance_margin_rate: float | None = None,
+) -> tuple[int, bool]:
+    """Compute theoretical leverage ceiling with maintenance margin rate (PRD v1.7 §5.4).
+
+    Returns `(leverage, mmr_assumed)`. With `maintenance_margin_rate=0.0`, reproduces v1.6.
+    """
+    if sl_dist_ratio <= 0.0:
+        return 1, maintenance_margin_rate is None
+    mmr_assumed = maintenance_margin_rate is None
+    mmr = (
+        DEFAULT_ASSUMED_MMR
+        if maintenance_margin_rate is None
+        else max(0.0, maintenance_margin_rate)
+    )
+    denom = ((sl_dist_ratio + cost_rate) / 0.75) + mmr
+    if denom <= 0.0:
+        return 1, mmr_assumed
+    lev = min(20, max(1, math.floor(1.0 / denom)))
+    return lev, mmr_assumed
+
+
 def _resolve_bias(
     *,
     metrics: TechnicalMetrics,
@@ -484,6 +514,7 @@ def _resolve_bias(
     structure: StructureAnalysis,
     smc: SmcSummary,
     require_ema200: bool = False,
+    variant: str = "v3",
 ) -> tuple[SetupBias, str | None]:
     brk = smc.latest_structure_break.event_type if smc.latest_structure_break else None
     swp = smc.latest_sweep.event_type if smc.latest_sweep else None
@@ -539,7 +570,11 @@ def _resolve_bias(
     elif swp is StructureEventType.LIQUIDITY_SWEEP_BEARISH:
         score -= 1
 
-    if metrics.ema_50 is not None:
+    count_ema50_score = variant != "v4" or regime not in (
+        Regime.TRENDING_UP,
+        Regime.TRENDING_DOWN,
+    )
+    if metrics.ema_50 is not None and count_ema50_score:
         if metrics.last_close > metrics.ema_50:
             score += 1
         elif metrics.last_close < metrics.ema_50:
@@ -711,6 +746,8 @@ def build_trade_setup(
     cost_assumptions: CostAssumptions | None = None,
     macro_context: MacroBenchmarkContext | None = None,
     require_ema200: bool = False,
+    maintenance_margin_rate: float | None = None,
+    setup_variant: Literal["v3", "v4"] | None = None,
 ) -> TradeSetup:
     """Compute 1 deterministic conditional trade setup (Entry, SL, TP1-3) or honest WAIT."""
     htf_sup, htf_res = _extract_sr_levels(structure, smc)
@@ -739,12 +776,14 @@ def build_trade_setup(
             ltf_resistance=ltf_res,
         )
 
+    resolved_variant = (setup_variant or os.getenv("SETUP_VARIANT") or "v3").strip().lower()
     bias, wait_reason = _resolve_bias(
         metrics=metrics,
         regime=regime,
         structure=structure,
         smc=smc,
         require_ema200=require_ema200,
+        variant=resolved_variant,
     )
     if bias is SetupBias.NEUTRAL or wait_reason is not None:
         return _wait_setup(
@@ -1137,8 +1176,15 @@ def build_trade_setup(
     sl_dist_ratio = abs(entry_mid - stop_loss) / entry_mid
     sl_dist_pct = round(sl_dist_ratio * 100.0, 4)
     min_sl_pct_implied = round((exec_costs.round_trip_cost_rate / MAX_EXEC_COST_R) * 100.0, 4)
-    max_theor_lev = (
-        min(20, max(1, int(0.75 / (sl_dist_ratio + cost_rate)))) if sl_dist_ratio > 0 else 1
+    max_theor_lev, mmr_assumed = compute_leverage_ceiling(
+        sl_dist_ratio,
+        cost_rate,
+        maintenance_margin_rate=maintenance_margin_rate,
+    )
+    net_rr_blend = (
+        round(0.4 * net_rr_tp1 + 0.4 * net_rr_tp2 + 0.2 * net_rr_tp3, 4)
+        if net_rr_tp1 is not None and net_rr_tp2 is not None and net_rr_tp3 is not None
+        else None
     )
 
     return TradeSetup(
@@ -1159,6 +1205,7 @@ def build_trade_setup(
         stop_loss_distance_pct=sl_dist_pct,
         min_sl_pct_implied=min_sl_pct_implied,
         max_theoretical_leverage=max_theor_lev,
+        mmr_assumed=mmr_assumed,
         tp1=tp1,
         tp1_label=tp1_label,
         tp2=tp2,
@@ -1171,6 +1218,7 @@ def build_trade_setup(
         net_rr_tp1=net_rr_tp1,
         net_rr_tp2=net_rr_tp2,
         net_rr_tp3=net_rr_tp3,
+        net_rr_blend=net_rr_blend,
         cost_rate_round_trip=cost_rate,
         risk_notes=tuple(dict.fromkeys(risk_notes)),
     )

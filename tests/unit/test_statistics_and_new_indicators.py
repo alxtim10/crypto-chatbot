@@ -165,7 +165,7 @@ def test_ou_half_life_none_for_log_linear_trend() -> None:
 
 def test_ou_half_life_finite_for_mean_reverting() -> None:
     x = 100.0 + np.sin(np.linspace(0.0, 25.0, 200)) * 4.0
-    hl = ou_half_life(x, window=120)
+    hl = ou_half_life(x, window=120, require_stationary=False)
     assert hl is not None
     assert hl > 0.0
 

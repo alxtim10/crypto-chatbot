@@ -533,10 +533,14 @@ def render_deterministic_snapshot(
                     sl_dist_str = format_indonesian_number(setup.stop_loss_distance_pct, 2)
                     lines.append(f"- Jarak Stop Loss: {sl_dist_str}%")
                 if setup.max_theoretical_leverage is not None:
+                    mmr_tag = " [MMR_ASSUMED]" if setup.mmr_assumed else ""
                     lines.append(
-                        f"- Batas leverage teoretis referensi: {setup.max_theoretical_leverage}x "
-                        f"(berdasarkan jarak likuidasi 80% buffer)"
+                        f"- Batas leverage teoretis referensi: {setup.max_theoretical_leverage}x"
+                        f"{mmr_tag} (berdasarkan jarak SL + biaya + MMR)"
                     )
+                if setup.net_rr_blend is not None:
+                    blend_str = format_indonesian_number(setup.net_rr_blend, 2)
+                    lines.append(f"- Net R:R Blend (40/40/20, report-only): 1:{blend_str}")
 
         if snapshot.factors:
             lines.append("")

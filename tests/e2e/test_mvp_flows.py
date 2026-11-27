@@ -301,11 +301,13 @@ class _PtbHarness:
                 "watchlist": 8,
                 "memory": 9,
                 "forget": 10,
+                "screener": 11,
+                "track": 12,
             }
-            idx = cmd_map.get(cmd, 11)
+            idx = cmd_map.get(cmd, 13)
             ctx: Any = SimpleNamespace(args=args)
         else:
-            idx = 12
+            idx = 14
             ctx = SimpleNamespace(args=[])
 
         await self._handlers[idx].callback(update, ctx)

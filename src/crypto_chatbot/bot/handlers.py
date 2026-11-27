@@ -7,7 +7,7 @@ import html
 import logging
 import math
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any, Literal
 
 from sqlalchemy.exc import SQLAlchemyError
@@ -15,6 +15,7 @@ from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
+from crypto_chatbot.analysis.forward_proof import ForwardProofEvaluation
 from crypto_chatbot.analysis.momentum_screener import (
     DEFAULT_MIN_VOLUME_24H_USD,
     render_momentum_screener_report,
@@ -103,6 +104,7 @@ class BotService:
         memory: MemoryService,
         whale_provider: WhaleDataProvider | None = None,
         whale_watchlist: WhaleWatchlistManager | None = None,
+        forward_track_provider: Callable[[], Sequence[ForwardProofEvaluation]] | None = None,
     ) -> None:
         self._access = access
         self._analysis_service = analysis_service
@@ -110,6 +112,46 @@ class BotService:
         self._memory = memory
         self._whale_provider = whale_provider or WhaleDataProvider()
         self._whale_watchlist = whale_watchlist or WhaleWatchlistManager()
+        self._forward_track_provider = forward_track_provider
+
+    async def handle_track(
+        self,
+        user_id: int | None,
+        args: Sequence[str] = (),
+    ) -> tuple[str, ...]:
+        """Render forward-ledger evaluation summary per timeframe (PRD v1.7 §2.1, T-32)."""
+        del args
+        request_id = uuid.uuid4().hex[:12]
+        denied = self._authorize(user_id, request_id, "track")
+        if denied is not None:
+            return denied
+        if self._forward_track_provider is None:
+            return (
+                "<b>Forward Evaluation Ledger (/track)</b>\n"
+                "Belum ada data forward ledger pasca-freeze yang terhubung. "
+                "Jalankan <code>crypto-chatbot freeze-params v3</code> lalu "
+                "<code>settle-setups</code> secara berkala untuk mengumpulkan evaluasi forward.",
+            )
+        evals = self._forward_track_provider()
+        if not evals:
+            return (
+                "<b>Forward Evaluation Ledger (/track)</b>\n"
+                "Belum ada setup settled pasca-freeze yang tercatat.",
+            )
+        lines: list[str] = ["<b>Forward Evaluation Ledger (/track)</b>"]
+        for ev in evals:
+            exp_str = f"{ev.expectancy_r_1x:+.4f}R" if ev.expectancy_r_1x is not None else "N/A"
+            ci_str = (
+                f"[{ev.block_ci_low:+.4f}R, {ev.block_ci_high:+.4f}R]"
+                if ev.block_ci_low is not None and ev.block_ci_high is not None
+                else "N/A"
+            )
+            lines.append(
+                f"• <b>{ev.timeframe.value}</b> | status={ev.status} | "
+                f"settled={ev.eligible_settled_filled} ({ev.duration_days:.1f}d) | "
+                f"E[R]={exp_str} | 95% Block CI={ci_str}"
+            )
+        return split_telegram_message("\n".join(lines), max_length=TELEGRAM_MAX_MESSAGE_LENGTH)
 
     def _authorize(
         self, user_id: int | None, request_id: str, action: str
@@ -1043,6 +1085,10 @@ def register_handlers(
         uid = update.effective_user.id if update.effective_user else None
         await _reply_chunks(update, await bot_service.handle_screen(uid, context.args or []))
 
+    async def track_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        uid = update.effective_user.id if update.effective_user else None
+        await _reply_chunks(update, await bot_service.handle_track(uid, context.args or []))
+
     async def whale_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         uid = update.effective_user.id if update.effective_user else None
         await _reply_chunks(update, await bot_service.handle_whale(uid, context.args or []))
@@ -1107,6 +1153,8 @@ def register_handlers(
     application.add_handler(CommandHandler("watchlist", watchlist_cmd))
     application.add_handler(CommandHandler("memory", memory_cmd))
     application.add_handler(CommandHandler("forget", forget_cmd))
+    application.add_handler(CommandHandler("screener", screen_cmd))
+    application.add_handler(CommandHandler("track", track_cmd))
     application.add_handler(MessageHandler(filters.COMMAND, unknown_cmd))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_msg))
     application.add_error_handler(global_error_handler)

@@ -6,8 +6,9 @@ import asyncio
 import html
 import logging
 from collections.abc import Sequence
+from datetime import UTC
 from enum import StrEnum
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, ConfigDict
 
@@ -566,6 +567,7 @@ def render_momentum_screener_report(
     report: MomentumScreenerReport,
     *,
     html_mode: bool = True,
+    is_validated: bool = False,
 ) -> str:
     """Render Top Gainers/Losers + 15m Momentum screener report in Indonesian."""
 
@@ -583,8 +585,9 @@ def render_momentum_screener_report(
         "short": "Top Losers (SHORT)",
     }[report.side_filter]
 
+    badge = "" if is_validated else " [UNVALIDATED]"
     lines: list[str] = [
-        _b(f"Screener Momentum 15m Futures · {report.venue} ({side_label})"),
+        _b(f"Screener Momentum 15m Futures · {report.venue} ({side_label}){badge}"),
         _e(
             f"Filter Vol 24j >= {min_vol_str} | "
             f"Pasangan Likuid: {report.liquid_pairs_count}/{report.total_pairs_seen} | "
@@ -673,3 +676,63 @@ def render_momentum_screener_report(
     lines.append(_e(report.risk_management_note))
     lines.append(_e(f"Disclaimer: {report.disclaimer}"))
     return "\n".join(lines)
+
+
+class ScreenerUniverseSnapshot(BaseModel):
+    """Daily point-in-time screener universe snapshot record (PRD v1.7 §7.8, T-30)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    snapshot_date_utc: str
+    venue: str
+    captured_at: UtcDatetime
+    min_volume_usd: float
+    total_pairs_seen: int
+    liquid_pairs_count: int
+    top_gainers: tuple[dict[str, Any], ...] = ()
+    top_losers: tuple[dict[str, Any], ...] = ()
+
+
+def capture_daily_universe_snapshot(
+    report: MomentumScreenerReport,
+    *,
+    store: dict[tuple[str, str], ScreenerUniverseSnapshot],
+) -> tuple[ScreenerUniverseSnapshot, bool]:
+    """Capture an idempotent per-UTC-day screener universe snapshot.
+
+    Returns `(snapshot, created)` where `created` is `False` if a snapshot for
+    `(snapshot_date_utc, venue)` already exists.
+    """
+    day_key = report.as_of.astimezone(UTC).strftime("%Y-%m-%d")
+    venue_key = report.venue.upper()
+    composite = (day_key, venue_key)
+    existing = store.get(composite)
+    if existing is not None:
+        return existing, False
+
+    snap = ScreenerUniverseSnapshot(
+        snapshot_date_utc=day_key,
+        venue=venue_key,
+        captured_at=report.as_of,
+        min_volume_usd=report.min_volume_usd,
+        total_pairs_seen=report.total_pairs_seen,
+        liquid_pairs_count=report.liquid_pairs_count,
+        top_gainers=tuple(
+            {
+                "symbol": t.canonical_symbol,
+                "change_24h_pct": t.change_24h_pct,
+                "quote_volume_24h_usd": t.quote_volume_24h_usd,
+            }
+            for t in report.top_gainers
+        ),
+        top_losers=tuple(
+            {
+                "symbol": t.canonical_symbol,
+                "change_24h_pct": t.change_24h_pct,
+                "quote_volume_24h_usd": t.quote_volume_24h_usd,
+            }
+            for t in report.top_losers
+        ),
+    )
+    store[composite] = snap
+    return snap, True

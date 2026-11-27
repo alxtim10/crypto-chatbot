@@ -182,10 +182,12 @@ class TradeSetup(BaseModel):
     net_rr_tp1: FiniteFloat | None = None
     net_rr_tp2: FiniteFloat | None = None
     net_rr_tp3: FiniteFloat | None = None
+    net_rr_blend: FiniteFloat | None = None
     cost_rate_round_trip: FiniteFloat | None = Field(default=None, ge=0)
     min_sl_pct_implied: FiniteFloat | None = Field(default=None, ge=0)
     stop_loss_distance_pct: FiniteFloat | None = Field(default=None, ge=0)
     max_theoretical_leverage: int | None = Field(default=None, ge=1)
+    mmr_assumed: bool = False
     wait_reason: str | None = None
     risk_notes: tuple[str, ...] = ()
 
