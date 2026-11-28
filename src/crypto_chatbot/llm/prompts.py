@@ -6,7 +6,11 @@ import json
 import re
 from collections.abc import Sequence
 
-from crypto_chatbot.bot.templates import format_fact_value
+from crypto_chatbot.bot.templates import (
+    DEALING_ZONE_LABELS,
+    format_enum_label,
+    format_fact_value,
+)
 from crypto_chatbot.schemas.analysis import AnalysisSnapshot
 
 PROMPT_VERSION = "v1.2.0"
@@ -171,6 +175,11 @@ def build_narration_user_payload(
             ),
             "dealing_zone": (
                 snapshot.smc.dealing_zone.value if snapshot.smc.dealing_zone else None
+            ),
+            "dealing_zone_label": (
+                format_enum_label(DEALING_ZONE_LABELS, snapshot.smc.dealing_zone)
+                if snapshot.smc.dealing_zone
+                else None
             ),
             "has_active_bullish_fvg": snapshot.smc.active_bullish_fvg is not None,
             "has_active_bearish_fvg": snapshot.smc.active_bearish_fvg is not None,

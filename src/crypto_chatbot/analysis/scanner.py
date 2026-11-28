@@ -8,13 +8,18 @@ import logging
 from collections import Counter
 from collections.abc import Sequence
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from crypto_chatbot.analysis.service import AnalysisService
-from crypto_chatbot.bot.templates import format_indonesian_number
+from crypto_chatbot.bot.templates import (
+    DEALING_ZONE_LABELS,
+    format_enum_label,
+    format_indonesian_number,
+)
 from crypto_chatbot.market_data.symbols import resolve_default_perp_symbol
 from crypto_chatbot.schemas.analysis import (
     AnalysisSnapshot,
+    DealingZone,
     Regime,
     SetupBias,
     SetupStatus,
@@ -63,6 +68,7 @@ class ScannedSetupItem(BaseModel):
     ltf_confirmation: str | None = None
     wait_reason: str | None = None
     regime: Regime | None = None
+    dealing_zone: DealingZone | None = None
 
 
 class MarketScanReport(BaseModel):
@@ -76,6 +82,7 @@ class MarketScanReport(BaseModel):
     ready_setups: tuple[ScannedSetupItem, ...]
     wait_setups: tuple[ScannedSetupItem, ...]
     failed_symbols: tuple[str, ...]
+    symbol_errors: dict[str, str] = Field(default_factory=dict)
     disclaimer: str
 
 
@@ -118,6 +125,7 @@ async def scan_market_setups(
     ready_items: list[ScannedSetupItem] = []
     wait_items: list[ScannedSetupItem] = []
     failed: list[str] = []
+    symbol_errors: dict[str, str] = {}
 
     async def _scan_one(sym: str) -> None:
         async with sem:
@@ -141,49 +149,53 @@ async def scan_market_setups(
                                 persist=False,
                             )
                         )
+
+                had_valid_snapshot = False
+                last_canonical = sym
+                for snap in snaps:
+                    last_canonical = snap.canonical_symbol
+                    if (
+                        snap.quality_status is QualityStatus.INSUFFICIENT_DATA
+                        or snap.technical is None
+                        or snap.trade_setup is None
+                    ):
+                        continue
+
+                    had_valid_snapshot = True
+                    setup = snap.trade_setup
+                    item = ScannedSetupItem(
+                        symbol=snap.canonical_symbol,
+                        timeframe=snap.timeframe,
+                        venue=snap.venue.upper(),
+                        status=setup.status,
+                        bias=setup.bias,
+                        last_close=snap.technical.last_close,
+                        entry_low=setup.entry_low,
+                        entry_high=setup.entry_high,
+                        stop_loss=setup.stop_loss,
+                        tp1=setup.tp1,
+                        tp2=setup.tp2,
+                        tp3=setup.tp3,
+                        rr_tp2=setup.rr_tp2,
+                        ltf_confirmation=setup.ltf_confirmation,
+                        wait_reason=setup.wait_reason,
+                        regime=snap.regime,
+                        dealing_zone=snap.smc.dealing_zone if snap.smc is not None else None,
+                    )
+                    if setup.status is SetupStatus.READY:
+                        ready_items.append(item)
+                    else:
+                        wait_items.append(item)
+
+                if not had_valid_snapshot:
+                    failed.append(last_canonical)
+                    symbol_errors[last_canonical] = (
+                        "ERROR: data tidak mencukupi (INSUFFICIENT_DATA)"
+                    )
             except Exception as exc:
                 logger.warning("Market scan failed for %s: %s", sym, exc)
                 failed.append(sym)
-                return
-
-            had_valid_snapshot = False
-            last_canonical = sym
-            for snap in snaps:
-                last_canonical = snap.canonical_symbol
-                if (
-                    snap.quality_status is QualityStatus.INSUFFICIENT_DATA
-                    or snap.technical is None
-                    or snap.trade_setup is None
-                ):
-                    continue
-
-                had_valid_snapshot = True
-                setup = snap.trade_setup
-                item = ScannedSetupItem(
-                    symbol=snap.canonical_symbol,
-                    timeframe=snap.timeframe,
-                    venue=snap.venue.upper(),
-                    status=setup.status,
-                    bias=setup.bias,
-                    last_close=snap.technical.last_close,
-                    entry_low=setup.entry_low,
-                    entry_high=setup.entry_high,
-                    stop_loss=setup.stop_loss,
-                    tp1=setup.tp1,
-                    tp2=setup.tp2,
-                    tp3=setup.tp3,
-                    rr_tp2=setup.rr_tp2,
-                    ltf_confirmation=setup.ltf_confirmation,
-                    wait_reason=setup.wait_reason,
-                    regime=snap.regime,
-                )
-                if setup.status is SetupStatus.READY:
-                    ready_items.append(item)
-                else:
-                    wait_items.append(item)
-
-            if not had_valid_snapshot:
-                failed.append(last_canonical)
+                symbol_errors[sym] = f"ERROR: {exc}"
 
     await asyncio.gather(*(_scan_one(sym) for sym in targets))
 
@@ -202,6 +214,7 @@ async def scan_market_setups(
         ready_setups=ready_sorted,
         wait_setups=wait_sorted,
         failed_symbols=tuple(failed),
+        symbol_errors=symbol_errors,
         disclaimer=(
             "Hasil pemindaian merupakan pengukuran deterministik multi-timeframe dan bukan "
             "saran transaksi atau jaminan hasil."
@@ -272,6 +285,9 @@ def render_market_scan_report(report: MarketScanReport, *, html_mode: bool = Tru
                 f"(Harga: {_e(_fmt_price(item.last_close))})"
             )
             lines.append(_e(f"   • Gaya Setup: {style_full}"))
+            if item.dealing_zone is not None:
+                dz_lbl = format_enum_label(DEALING_ZONE_LABELS, item.dealing_zone)
+                lines.append(_e(f"   • Dealing Range: {dz_lbl}"))
             lines.append(_e(f"   • Entry: {e_lo} - {e_hi} | SL: {sl_p}"))
             lines.append(_e(f"   • TP1: {tp1_p} | TP2: {tp2_p} (R:R {rr_str}) | TP3: {tp3_p}"))
             if item.ltf_confirmation:
@@ -308,7 +324,10 @@ def render_market_scan_report(report: MarketScanReport, *, html_mode: bool = Tru
 
     if report.failed_symbols:
         lines.append("")
-        lines.append(_e(f"Tidak cukup data / gagal diakses: {', '.join(report.failed_symbols)}"))
+        err_items = [
+            f"{sym} [{report.symbol_errors.get(sym, 'ERROR')}]" for sym in report.failed_symbols
+        ]
+        lines.append(_e(f"Gagal/ERROR ({len(report.failed_symbols)}): {', '.join(err_items)}"))
 
     lines.append("")
     lines.append(_e(f"Disclaimer: {report.disclaimer}"))

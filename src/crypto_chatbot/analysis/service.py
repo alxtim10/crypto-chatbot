@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import itertools
 import json
+import logging
 import time
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
@@ -105,6 +106,16 @@ from crypto_chatbot.storage.repositories import (
     SetupLogRepository,
     TradingViewRepository,
 )
+
+logger = logging.getLogger(__name__)
+
+MTF_REGIME_LABELS: dict[Regime, str] = {
+    Regime.HIGH_VOLATILITY: "Volatilitas Tinggi",
+    Regime.TRENDING_UP: "Tren Naik",
+    Regime.TRENDING_DOWN: "Tren Turun",
+    Regime.RANGING: "Mendatar (Ranging)",
+    Regime.TRANSITIONAL: "Transisi",
+}
 
 _BLOCKING_BATCH_FLAGS: frozenset[QualityFlag] = frozenset(
     {
@@ -1036,13 +1047,6 @@ def _build_mtf_overview(
     if len(by_tf) < 2:
         return ()
 
-    reg_labels = {
-        Regime.HIGH_VOLATILITY: "Volatilitas Tinggi",
-        Regime.TRENDING_UP: "Tren Naik",
-        Regime.TRENDING_DOWN: "Tren Turun",
-        Regime.RANGING: "Mendatar (Ranging)",
-        Regime.TRANSITIONAL: "Transisi",
-    }
     overviews: list[TimeframeOverview] = []
     for tf in (Timeframe.D1, Timeframe.H4, Timeframe.H1, Timeframe.M15, Timeframe.M5):
         seq = by_tf.get(tf)
@@ -1062,7 +1066,15 @@ def _build_mtf_overview(
                 else ind_tf.metrics.ema_20
             )
             if reg_tf is not None:
-                trend_label = reg_labels[reg_tf]
+                mapped_trend = MTF_REGIME_LABELS.get(reg_tf)
+                if mapped_trend is None:
+                    logger.warning(
+                        "Missing MTF regime label for %s; falling back to value",
+                        reg_tf.value,
+                    )
+                    trend_label = reg_tf.value
+                else:
+                    trend_label = mapped_trend
             elif ref_ema is not None:
                 trend_label = "Tren Naik" if ind_tf.metrics.last_close > ref_ema else "Tren Turun"
 
