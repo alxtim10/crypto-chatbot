@@ -2287,7 +2287,7 @@ def _run_alerts(
 ) -> int:
     from crypto_chatbot.alerts.config import load_screener_config, load_universe
     from crypto_chatbot.alerts.sender import TelegramOutboxSender
-    from crypto_chatbot.alerts.worker import run_alert_cycle, run_alert_digest
+    from crypto_chatbot.alerts.worker import run_alert_cycle, run_alert_digest, run_alert_warmup
     from crypto_chatbot.storage.repositories import PostgresAlertRepository
 
     try:
@@ -2343,6 +2343,48 @@ def _run_alerts(
         return 0
 
     symbols = load_universe(universe_path or screener_cfg.universe_path)
+
+    if action == "warmup":
+
+        async def _do_warmup() -> Any:
+            chain = _resolve_exchange_chain_from_env()
+            provider, deriv_provider = build_futures_providers(
+                chain,
+                cooldown_minutes=_resolve_venue_cooldown_from_env(),
+                gate_direct_candles=_resolve_gate_direct_candles_from_env(),
+            )
+            try:
+                service = AnalysisService(
+                    provider=provider,
+                    repository=market_repo,
+                    resample_from=_resolve_resample_from_env(),
+                )
+                return await run_alert_warmup(
+                    analysis_service=service,
+                    screener_config=screener_cfg,
+                    symbols=symbols,
+                )
+            finally:
+                await provider.close()
+                await deriv_provider.close()
+
+        try:
+            warmup = asyncio.run(_do_warmup())
+        except Exception as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        finally:
+            engine.dispose()
+
+        if as_json:
+            print(warmup.model_dump_json(indent=2))
+        else:
+            tf_list = ",".join(tf.value for tf in warmup.timeframes)
+            print(
+                f"alerts warmup [{tf_list}]: symbols={warmup.symbols_total}, "
+                f"ok={len(warmup.counts_by_symbol)}, errors={len(warmup.failed_symbols)}"
+            )
+        return 0
 
     async def _do_run() -> Any:
         chain = _resolve_exchange_chain_from_env()
@@ -3260,12 +3302,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     alerts_parser = subcommands.add_parser(
         "alerts",
-        help="One-shot hourly setup alert worker (`run`) and daily summary (`digest`).",
+        help="One-shot MTF setup alert worker (`run`), daily summary (`digest`), or `warmup`.",
     )
     alerts_parser.add_argument(
         "action",
-        choices=("run", "digest"),
-        help="Sub-action: 'run' (hourly scan + outbox send) or 'digest' (daily summary).",
+        choices=("run", "digest", "warmup"),
+        help="Sub-action: 'run' (MTF scan + outbox), 'digest' (daily summary), or 'warmup'.",
     )
     alerts_parser.add_argument(
         "--config",

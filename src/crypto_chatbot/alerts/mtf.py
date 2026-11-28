@@ -1,7 +1,8 @@
 """15-minute multi-timeframe top-down alert evaluator (4h/1h bias -> 15m setup -> 5m confirm).
 
-All computations are strictly deterministic on closed candles from a single venue.
-Zero LLM calls are made in this module.
+Consumes the `AnalysisSnapshot` and closed-candle batches built by the exact same
+`AnalysisService.analyze_with_batches` path used by `analyze`. Zero duplicate
+regime/structure/setup calculations and zero LLM calls.
 """
 
 from __future__ import annotations
@@ -14,15 +15,10 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from crypto_chatbot.alerts.config import MtfTimeframesConfig
-from crypto_chatbot.analysis.indicators import MIN_HISTORY_EMA_20, compute_technical_metrics
-from crypto_chatbot.analysis.mtf import evaluate_timeframe_context
-from crypto_chatbot.analysis.regimes import classify_regime
 from crypto_chatbot.analysis.scanner import ScannedSetupItem
-from crypto_chatbot.analysis.setup import build_trade_setup
-from crypto_chatbot.analysis.smc import analyze_smc
-from crypto_chatbot.analysis.structure import analyze_market_structure
 from crypto_chatbot.market_data.base import OhlcvBatch
 from crypto_chatbot.schemas.analysis import (
+    AnalysisSnapshot,
     DealingZone,
     MarketStructure,
     Regime,
@@ -30,10 +26,13 @@ from crypto_chatbot.schemas.analysis import (
     SetupStatus,
     TradeSetup,
 )
-from crypto_chatbot.schemas.market import MarketCandle, QualityFlag, Timeframe
+from crypto_chatbot.schemas.market import MarketCandle, QualityStatus, Timeframe
 from crypto_chatbot.storage.repositories import AlertSymbolState
 
-StageName = Literal["bias", "setup", "confirm", "cost_gate", "error"]
+MTF_ENGINE_VERSION = "mtf-15m-v2"
+MIN_REGIME_BARS = 114  # ATR(14) + ATR percentile(100) required by classify_regime
+
+StageName = Literal["data", "bias", "setup", "confirm", "cost_gate", "error"]
 
 
 class MixedVenueError(ValueError):
@@ -76,17 +75,20 @@ def _filter_closed_candles(
     return [
         c
         for c in candles
-        if c.close_time.astimezone(UTC) <= cutoff_utc
+        if c.is_closed
+        and c.close_time.astimezone(UTC) <= cutoff_utc
         and c.available_time.astimezone(UTC) <= cutoff_utc
     ]
 
 
 class MtfBiasEvaluation(BaseModel):
-    """Result of the HTF (4h + 1h) top-down bias gate."""
+    """Result of the HTF (4h + 1h) top-down bias gate derived from `AnalysisSnapshot`."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     agreed_direction: Literal["long", "short"] | None = None
+    missing_data: bool = False
+    per_tf_bar_counts: dict[str, int] = Field(default_factory=dict)
     per_tf_summary: dict[str, str] = Field(default_factory=dict)
     per_tf_regime: dict[str, Regime | None] = Field(default_factory=dict)
     per_tf_structure: dict[str, MarketStructure | None] = Field(default_factory=dict)
@@ -94,61 +96,75 @@ class MtfBiasEvaluation(BaseModel):
     reason: str
 
 
-def evaluate_htf_bias(
-    candles_by_tf: Mapping[Timeframe, Sequence[MarketCandle]],
+def evaluate_htf_bias_from_snapshot(
+    snapshot: AnalysisSnapshot,
     bias_timeframes: Sequence[Timeframe],
     *,
-    cutoff: datetime,
-    expected_venue: str | None = None,
-    use_available_time: bool = True,
+    batches: Mapping[Timeframe, OhlcvBatch] | None = None,
 ) -> MtfBiasEvaluation:
-    """Require regime + market structure on EVERY bias timeframe to agree on direction.
+    """Read HTF regime + structure directly from `snapshot.mtf_overview` (built by `analyze`).
 
-    Delegates directly to the shared `evaluate_timeframe_context` so 4h/1h regime,
-    structure, and ADX are guaranteed identical to standalone `analyze`.
+    If any bias timeframe lacks sufficient bars to classify regime or structure (`None`),
+    returns `missing_data=True` with explicit bar counts (stage `"data"`), and NEVER emits
+    `"unknown"` in a bias reason.
     """
+    ov_by_tf = {ov.timeframe: ov for ov in snapshot.mtf_overview}
     directions: list[Literal["long", "short"] | None] = []
     summaries: dict[str, str] = {}
     regimes: dict[str, Regime | None] = {}
     structures: dict[str, MarketStructure | None] = {}
     adx_map: dict[str, float | None] = {}
+    bar_counts: dict[str, int] = {}
+    missing_tfs: list[str] = []
 
+    cutoff = snapshot.as_of.astimezone(UTC)
     for tf in bias_timeframes:
-        raw = candles_by_tf.get(tf, ())
-        ctx = evaluate_timeframe_context(
-            raw,
-            timeframe=tf,
-            as_of=cutoff,
-            expected_venue=expected_venue,
-            use_available_time=use_available_time,
-            min_candles=MIN_HISTORY_EMA_20,
-        )
-        if ctx is None:
-            closed_cnt = len(_filter_closed_candles(raw, cutoff))
-            summaries[tf.value] = f"insufficient({closed_cnt})"
-            regimes[tf.value] = None
-            structures[tf.value] = None
-            adx_map[tf.value] = None
+        batch = batches.get(tf) if batches is not None else None
+        bar_cnt = len(_filter_closed_candles(batch.candles, cutoff)) if batch is not None else 0
+        bar_counts[tf.value] = bar_cnt
+
+        ov = ov_by_tf.get(tf)
+        if ov is None or ov.regime is None or ov.market_structure is None:
+            regimes[tf.value] = ov.regime if ov is not None else None
+            structures[tf.value] = ov.market_structure if ov is not None else None
+            adx_map[tf.value] = ov.adx_14 if ov is not None else None
+            missing_tfs.append(f"{tf.value}={bar_cnt} bar")
             directions.append(None)
             continue
 
-        regime_lbl = ctx.regime.value if ctx.regime is not None else "unknown"
-        summaries[tf.value] = f"{regime_lbl}/{ctx.market_structure.value}"
-        regimes[tf.value] = ctx.regime
-        structures[tf.value] = ctx.market_structure
-        adx_map[tf.value] = ctx.adx_14
+        summaries[tf.value] = f"{ov.regime.value}/{ov.market_structure.value}"
+        regimes[tf.value] = ov.regime
+        structures[tf.value] = ov.market_structure
+        adx_map[tf.value] = ov.adx_14
 
-        if ctx.regime is Regime.TRENDING_UP and ctx.market_structure is MarketStructure.BULLISH:
+        if ov.regime is Regime.TRENDING_UP and ov.market_structure is MarketStructure.BULLISH:
             directions.append("long")
-        elif ctx.regime is Regime.TRENDING_DOWN and ctx.market_structure is MarketStructure.BEARISH:
+        elif ov.regime is Regime.TRENDING_DOWN and ov.market_structure is MarketStructure.BEARISH:
             directions.append("short")
         else:
             directions.append(None)
+
+    if missing_tfs:
+        return MtfBiasEvaluation(
+            agreed_direction=None,
+            missing_data=True,
+            per_tf_bar_counts=bar_counts,
+            per_tf_summary=summaries,
+            per_tf_regime=regimes,
+            per_tf_structure=structures,
+            per_tf_adx_14=adx_map,
+            reason=(
+                f"Data HTF belum cukup untuk klasifikasi rezim "
+                f"({', '.join(missing_tfs)}; butuh >={MIN_REGIME_BARS} bar tertutup)"
+            ),
+        )
 
     summary_str = ", ".join(f"{k}={v}" for k, v in summaries.items())
     if directions and all(d == "long" for d in directions):
         return MtfBiasEvaluation(
             agreed_direction="long",
+            missing_data=False,
+            per_tf_bar_counts=bar_counts,
             per_tf_summary=summaries,
             per_tf_regime=regimes,
             per_tf_structure=structures,
@@ -158,6 +174,8 @@ def evaluate_htf_bias(
     if directions and all(d == "short" for d in directions):
         return MtfBiasEvaluation(
             agreed_direction="short",
+            missing_data=False,
+            per_tf_bar_counts=bar_counts,
             per_tf_summary=summaries,
             per_tf_regime=regimes,
             per_tf_structure=structures,
@@ -166,6 +184,8 @@ def evaluate_htf_bias(
         )
     return MtfBiasEvaluation(
         agreed_direction=None,
+        missing_data=False,
+        per_tf_bar_counts=bar_counts,
         per_tf_summary=summaries,
         per_tf_regime=regimes,
         per_tf_structure=structures,
@@ -375,44 +395,50 @@ def _build_armed_from_trade_setup(
 
 def evaluate_symbol_mtf(
     *,
-    canonical_symbol: str,
+    snapshot: AnalysisSnapshot,
     batches: Mapping[Timeframe, OhlcvBatch],
     mtf_config: MtfTimeframesConfig,
     prev_state: AlertSymbolState | None,
     now_utc: datetime,
 ) -> MtfSymbolDecision:
-    """Evaluate one symbol across 4h/1h bias -> 15m setup -> 5m confirmation (closed candles)."""
+    """Evaluate one symbol using the shared `AnalysisSnapshot` from `analyze_with_batches`."""
     # 1. Strict single-venue validation across all timeframes in the bundle.
     venue = assert_single_venue_bundle(batches)
-
+    canonical_symbol = snapshot.canonical_symbol
     setup_tf = mtf_config.setup
     confirm_tf = mtf_config.confirm
+    setup_close_time = snapshot.as_of.astimezone(UTC)
+
     setup_batch = batches.get(setup_tf)
-    if setup_batch is None or not setup_batch.candles:
-        raise ValueError(f"Missing {setup_tf.value} candles for {canonical_symbol}")
-    blocking = {
-        QualityFlag.PROVIDER_ERROR,
-        QualityFlag.INVALID_OHLC,
-        QualityFlag.SYMBOL_MISMATCH,
-    }
-    if set(setup_batch.quality_flags) & blocking:
-        raise ValueError(
-            f"Blocking quality flags on {setup_tf.value}: "
-            f"{[f.value for f in setup_batch.quality_flags]}"
+    setup_bar_cnt = (
+        len(_filter_closed_candles(setup_batch.candles, setup_close_time))
+        if setup_batch is not None
+        else 0
+    )
+    if (
+        snapshot.quality_status is QualityStatus.INSUFFICIENT_DATA
+        or snapshot.technical is None
+        or snapshot.trade_setup is None
+    ):
+        return MtfSymbolDecision(
+            canonical_symbol=canonical_symbol,
+            venue=venue,
+            setup_timeframe=setup_tf,
+            setup_close_time=setup_close_time,
+            outcome="wait",
+            failed_stage="data",
+            failed_reason=(
+                f"Data {setup_tf.value} belum cukup ({setup_bar_cnt} bar tertutup; "
+                f"status={snapshot.quality_status.value})"
+            ),
         )
 
-    setup_closed = _filter_closed_candles(setup_batch.candles, now_utc)
-    if len(setup_closed) < MIN_HISTORY_EMA_20:
-        raise ValueError(
-            f"Insufficient closed {setup_tf.value} candles ({len(setup_closed)}) "
-            f"for {canonical_symbol}"
-        )
-    setup_close_time = setup_closed[-1].close_time.astimezone(UTC)
-
-    candles_by_tf: dict[Timeframe, list[MarketCandle]] = {}
-    for tf in mtf_config.all_timeframes:
-        b = batches.get(tf)
-        candles_by_tf[tf] = _filter_closed_candles(b.candles, setup_close_time) if b else []
+    confirm_batch = batches.get(confirm_tf)
+    confirm_candles = (
+        _filter_closed_candles(confirm_batch.candles, setup_close_time)
+        if confirm_batch is not None
+        else []
+    )
 
     # 2. Check existing ARMED setup first (expiry / 5m confirmation promotion).
     expired_armed: ArmedSetupSnapshot | None = None
@@ -426,13 +452,23 @@ def evaluate_symbol_mtf(
         if now_utc >= prev_state.armed_expires_at.astimezone(UTC):
             expired_armed = armed
         else:
-            # Verify HTF bias still agrees with armed direction.
-            bias_check = evaluate_htf_bias(
-                candles_by_tf,
+            bias_check = evaluate_htf_bias_from_snapshot(
+                snapshot,
                 mtf_config.bias,
-                cutoff=setup_close_time,
-                expected_venue=venue,
+                batches=batches,
             )
+            if bias_check.missing_data:
+                return MtfSymbolDecision(
+                    canonical_symbol=canonical_symbol,
+                    venue=venue,
+                    setup_timeframe=setup_tf,
+                    setup_close_time=setup_close_time,
+                    outcome="armed",
+                    direction=armed.direction,
+                    armed_setup=armed,
+                    failed_stage="data",
+                    failed_reason=bias_check.reason,
+                )
             if bias_check.agreed_direction != armed.direction:
                 return MtfSymbolDecision(
                     canonical_symbol=canonical_symbol,
@@ -446,7 +482,7 @@ def evaluate_symbol_mtf(
                     ),
                 )
             confirmed, invalidated, detail = evaluate_5m_confirmation(
-                candles_by_tf.get(confirm_tf, ()),
+                confirm_candles,
                 direction=armed.direction,
                 entry_low=armed.entry_low,
                 entry_high=armed.entry_high,
@@ -476,7 +512,6 @@ def evaluate_symbol_mtf(
                     item=item,
                     armed_setup=armed,
                 )
-            # Still armed, awaiting 5m confirmation before expiry.
             return MtfSymbolDecision(
                 canonical_symbol=canonical_symbol,
                 venue=venue,
@@ -489,13 +524,23 @@ def evaluate_symbol_mtf(
                 failed_reason=detail,
             )
 
-    # 3. Stage 1 — HTF Bias (4h + 1h regime + structure agreement).
-    bias_eval = evaluate_htf_bias(
-        candles_by_tf,
+    # 3. Stage 1 — HTF Bias from `snapshot.mtf_overview` (identical to `analyze`).
+    bias_eval = evaluate_htf_bias_from_snapshot(
+        snapshot,
         mtf_config.bias,
-        cutoff=setup_close_time,
-        expected_venue=venue,
+        batches=batches,
     )
+    if bias_eval.missing_data:
+        return MtfSymbolDecision(
+            canonical_symbol=canonical_symbol,
+            venue=venue,
+            setup_timeframe=setup_tf,
+            setup_close_time=setup_close_time,
+            outcome="expired" if expired_armed is not None else "wait",
+            expired_armed_setup=expired_armed,
+            failed_stage="data",
+            failed_reason=bias_eval.reason,
+        )
     if bias_eval.agreed_direction is None:
         return MtfSymbolDecision(
             canonical_symbol=canonical_symbol,
@@ -510,23 +555,8 @@ def evaluate_symbol_mtf(
 
     htf_dir = bias_eval.agreed_direction
 
-    # 4. Stage 2 — Setup on 15m (entry zone, SL, TP, cost gate).
-    ind_15m = compute_technical_metrics(setup_closed)
-    regime_15m = classify_regime(ind_15m.metrics) or Regime.TRANSITIONAL
-    struct_15m = analyze_market_structure(setup_closed)
-    smc_15m = analyze_smc(setup_closed, structure=struct_15m)
-    htf_map = {tf: candles_by_tf[tf] for tf in mtf_config.bias if candles_by_tf.get(tf)}
-    trade_setup = build_trade_setup(
-        primary_timeframe=setup_tf,
-        metrics=ind_15m.metrics,
-        regime=regime_15m,
-        structure=struct_15m,
-        smc=smc_15m,
-        htf_candles_by_tf=htf_map,
-        as_of=setup_close_time,
-        use_available_time=True,
-    )
-
+    # 4. Stage 2 — 15m Setup directly from `snapshot.trade_setup` (built by `analyze`).
+    trade_setup = snapshot.trade_setup
     if trade_setup.status is not SetupStatus.READY:
         stage = classify_setup_wait_stage(trade_setup.wait_reason)
         reason = trade_setup.wait_reason or "Setup 15m belum memenuhi syarat entry/SL/TP"
@@ -578,8 +608,8 @@ def evaluate_symbol_mtf(
         venue=venue,
         setup_tf=setup_tf,
         setup_close_time=setup_close_time,
-        last_close=ind_15m.metrics.last_close,
-        dealing_zone=smc_15m.dealing_zone,
+        last_close=snapshot.technical.last_close,
+        dealing_zone=snapshot.smc.dealing_zone if snapshot.smc is not None else None,
         direction=htf_dir,
         trade_setup=trade_setup,
         htf_bias_summary=bias_eval.reason,
@@ -587,7 +617,7 @@ def evaluate_symbol_mtf(
 
     # 5. Stage 3 — Confirmation on the last CLOSED 5m candle.
     confirmed, invalidated, confirm_detail = evaluate_5m_confirmation(
-        candles_by_tf.get(confirm_tf, ()),
+        confirm_candles,
         direction=htf_dir,
         entry_low=armed_snap.entry_low,
         entry_high=armed_snap.entry_high,
@@ -622,7 +652,6 @@ def evaluate_symbol_mtf(
             expired_armed_setup=expired_armed,
         )
 
-    # Without 5m confirmation, store as ARMED (no alert yet).
     return MtfSymbolDecision(
         canonical_symbol=canonical_symbol,
         venue=venue,

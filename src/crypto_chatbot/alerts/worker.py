@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import html
+import json
 import logging
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
@@ -13,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from crypto_chatbot.alerts.config import WIB, ScreenerConfig, load_universe
 from crypto_chatbot.alerts.mtf import (
+    MTF_ENGINE_VERSION,
     ArmedSetupSnapshot,
     MtfSymbolDecision,
     build_armed_setup_dict,
@@ -46,9 +48,24 @@ logger = logging.getLogger(__name__)
 ALERT_ADVISORY_LOCK_KEY = 710_202_601
 
 
-def compute_active_params_sha256() -> str:
-    """Compute canonical SHA-256 of the active deterministic setup parameters (`v3`)."""
-    return compute_params_sha256(DEFAULT_VARIANT_PARAMS["v3"])
+def compute_active_params_sha256(
+    *,
+    screener_config: ScreenerConfig | None = None,
+    universe: Sequence[str] | None = None,
+) -> str:
+    """Compute canonical SHA-256 of active setup params + MTF engine version + config + universe."""
+    payload: dict[str, Any] = {
+        "setup_params_sha256": compute_params_sha256(DEFAULT_VARIANT_PARAMS["v3"]),
+        "mtf_engine_version": MTF_ENGINE_VERSION,
+        "screener_config": (
+            screener_config.model_dump(mode="json") if screener_config is not None else None
+        ),
+        "universe": list(universe) if universe is not None else None,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(
+        "utf-8"
+    )
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _fmt_price(value: float | None) -> str:
@@ -389,12 +406,6 @@ async def _run_mtf_alert_cycle(
             skipped_reason="already_processed",
         )
 
-    tf_limits: dict[Timeframe, int] = {}
-    for btf in mtf_cfg.bias:
-        tf_limits[btf] = DEFAULT_CANDLE_LIMIT
-    tf_limits[setup_tf] = DEFAULT_CANDLE_LIMIT
-    tf_limits[mtf_cfg.confirm] = 60
-
     decisions: list[MtfSymbolDecision] = []
     failed_symbols: list[str] = []
     symbol_errors: dict[str, str] = {}
@@ -402,15 +413,17 @@ async def _run_mtf_alert_cycle(
 
     for sym in targets:
         try:
-            batches, _venue = await analysis_service.fetch_mtf_candle_bundle(
+            snapshot, batches = await analysis_service.analyze_with_batches(
                 sym,
-                tf_limits,
-                as_of=started_at,
-                incremental=True,
+                setup_tf,
+                limit=DEFAULT_CANDLE_LIMIT,
+                include_mtf=True,
+                include_derivatives=False,
+                persist=False,
             )
             prev = alert_repo.get_symbol_state(sym, setup_tf)
             decision = evaluate_symbol_mtf(
-                canonical_symbol=sym,
+                snapshot=snapshot,
                 batches=batches,
                 mtf_config=mtf_cfg,
                 prev_state=prev,
@@ -752,17 +765,20 @@ async def run_alert_cycle(
 ) -> AlertCycleSummary:
     """Execute one idempotent, advisory-locked alert worker cycle (MTF 15m or legacy single-TF)."""
     now_fn = clock or (lambda: datetime.now(UTC))
-    params_sha = compute_active_params_sha256()
-
-    if not alert_repo.try_acquire_advisory_lock(lock_key):
-        logger.info("Alert run skipped: advisory lock %s is already held", lock_key)
-        return AlertCycleSummary(locked_out=True, params_sha256=params_sha)
-
     targets = (
         tuple(symbols)
         if symbols is not None and len(symbols) > 0
         else load_universe(screener_config.universe_path)
     )
+    params_sha = compute_active_params_sha256(
+        screener_config=screener_config,
+        universe=targets,
+    )
+
+    if not alert_repo.try_acquire_advisory_lock(lock_key):
+        logger.info("Alert run skipped: advisory lock %s is already held", lock_key)
+        return AlertCycleSummary(locked_out=True, params_sha256=params_sha)
+
     results: list[TimeframeCycleResult] = []
     try:
         if screener_config.is_mtf_mode:
@@ -1102,6 +1118,7 @@ async def run_alert_digest(
 
     if stage_counts:
         stage_labels = {
+            "data": "Data Kurang (Bar)",
             "bias": "Bias HTF (4h/1h)",
             "setup": "Setup 15m",
             "confirm": "Konfirmasi 5m",
@@ -1167,4 +1184,60 @@ async def run_alert_digest(
         sent=delivered,
         telegram_message_id=msg_id,
         message_text=text,
+    )
+
+
+class AlertWarmupSummary(BaseModel):
+    """Summary returned by `alerts warmup` (idempotent `market_candles` prefill)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    symbols_total: int
+    timeframes: tuple[Timeframe, ...]
+    counts_by_symbol: dict[str, dict[str, int]] = Field(default_factory=dict)
+    failed_symbols: tuple[str, ...] = ()
+    symbol_errors: dict[str, str] = Field(default_factory=dict)
+
+
+async def run_alert_warmup(
+    *,
+    analysis_service: AnalysisService,
+    screener_config: ScreenerConfig,
+    symbols: Sequence[str] | None = None,
+    limit: int = DEFAULT_CANDLE_LIMIT,
+) -> AlertWarmupSummary:
+    """Idempotently prefill `market_candles` for universe x MTF timeframes from one venue."""
+    targets = (
+        tuple(symbols)
+        if symbols is not None and len(symbols) > 0
+        else load_universe(screener_config.universe_path)
+    )
+    tfs = (
+        screener_config.mtf_timeframes.all_timeframes
+        if screener_config.mtf_timeframes is not None
+        else screener_config.timeframes
+    )
+    counts_by_symbol: dict[str, dict[str, int]] = {}
+    failed_symbols: list[str] = []
+    symbol_errors: dict[str, str] = {}
+
+    for sym in targets:
+        try:
+            counts_by_symbol[sym] = await analysis_service.warmup_candles(
+                sym,
+                tfs,
+                limit=limit,
+            )
+        except Exception as exc:
+            err_msg = f"{type(exc).__name__}: {exc}"
+            logger.warning("Alert warmup failed for %s: %s", sym, err_msg)
+            failed_symbols.append(sym)
+            symbol_errors[sym] = err_msg
+
+    return AlertWarmupSummary(
+        symbols_total=len(targets),
+        timeframes=tfs,
+        counts_by_symbol=counts_by_symbol,
+        failed_symbols=tuple(failed_symbols),
+        symbol_errors=symbol_errors,
     )
