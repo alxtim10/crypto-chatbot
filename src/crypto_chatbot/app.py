@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Sequence
 from typing import Any
 
 from telegram.ext import Application, ApplicationBuilder
 
+from crypto_chatbot.alerts.config import load_screener_config
+from crypto_chatbot.alerts.deadman import AlertDeadManMonitor
+from crypto_chatbot.alerts.sender import TelegramOutboxSender
 from crypto_chatbot.analysis.service import AnalysisService
 from crypto_chatbot.analysis.whale_tracker import WhaleWatchlistManager
 from crypto_chatbot.bot.access import AccessController
@@ -42,6 +46,7 @@ from crypto_chatbot.memory.service import MemoryService
 from crypto_chatbot.schemas.market import Timeframe
 from crypto_chatbot.storage.database import create_db_engine, init_db
 from crypto_chatbot.storage.repositories import (
+    PostgresAlertRepository,
     PostgresContractStatsRepository,
     PostgresDerivativesRepository,
     PostgresFearGreedRepository,
@@ -89,6 +94,7 @@ def build_telegram_application(
     memory_repo = PostgresUserMemoryRepository(engine)
     contract_stats_repo = PostgresContractStatsRepository(engine)
     fear_greed_repo = PostgresFearGreedRepository(engine)
+    alert_repo = PostgresAlertRepository(engine)
     provider, derivatives_provider = build_futures_providers(
         settings.futures_exchange_chain,
         cooldown_minutes=settings.venue_cooldown_min,
@@ -153,6 +159,8 @@ def build_telegram_application(
         narrator=narrator,
         memory=memory_service,
         whale_watchlist=whale_watchlist,
+        alert_repository=alert_repo,
+        setup_repository=setup_repo,
     )
 
     contract_stats_scheduler: ContractStatsScheduler | None = None
@@ -177,15 +185,43 @@ def build_telegram_application(
             repository=market_repo,
         )
 
+    deadman_monitor: AlertDeadManMonitor | None = None
+    deadman_sender: TelegramOutboxSender | None = None
+    resolved_chat_id = settings.alert_chat_id
+    if resolved_chat_id is None:
+        raw_env_chat = os.environ.get("CHAT_ID", "").strip()
+        if raw_env_chat:
+            try:
+                resolved_chat_id = int(raw_env_chat)
+            except ValueError:
+                resolved_chat_id = None
+    if resolved_chat_id is not None:
+        screener_cfg = load_screener_config(settings.screener_config_path)
+        deadman_sender = TelegramOutboxSender(
+            bot_token=settings.telegram_bot_token.get_secret_value(),
+        )
+        deadman_monitor = AlertDeadManMonitor(
+            alert_repo=alert_repo,
+            sender=deadman_sender,
+            chat_id=resolved_chat_id,
+            max_silence_hours=screener_cfg.dead_man_hours,
+        )
+
     async def on_startup(app: Application[Any, Any, Any, Any, Any, Any]) -> None:
         del app
         if contract_stats_scheduler is not None:
             contract_stats_scheduler.start()
         if ws_candles_runner is not None:
             ws_candles_runner.start()
+        if deadman_monitor is not None:
+            deadman_monitor.start()
 
     async def on_shutdown(app: Application[Any, Any, Any, Any, Any, Any]) -> None:
         del app
+        if deadman_monitor is not None:
+            await deadman_monitor.stop()
+        if deadman_sender is not None:
+            await deadman_sender.close()
         if ws_candles_runner is not None:
             await ws_candles_runner.stop()
         if contract_stats_scheduler is not None:

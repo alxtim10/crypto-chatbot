@@ -571,10 +571,46 @@ def _run_analyze(
     return 0
 
 
+def _resolve_alert_bot_token() -> str | None:
+    env_tok = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    if env_tok:
+        return env_tok
+    try:
+        return load_settings().telegram_bot_token.get_secret_value().strip() or None
+    except Exception:
+        return None
+
+
+def _resolve_alert_chat_id(explicit_chat_id: int | None = None) -> int | None:
+    if explicit_chat_id is not None:
+        return explicit_chat_id
+    for env_key in ("ALERT_CHAT_ID", "CHAT_ID"):
+        raw = os.environ.get(env_key, "").strip()
+        if raw:
+            try:
+                return int(raw)
+            except ValueError:
+                pass
+    try:
+        settings = load_settings()
+        if settings.alert_chat_id is not None:
+            return settings.alert_chat_id
+        if settings.allowed_telegram_user_ids:
+            return settings.allowed_telegram_user_ids[0]
+    except Exception:
+        return None
+    return None
+
+
 def _run_settle_setups(max_bars: int = 24) -> int:
-    database_url = os.environ.get("DATABASE_URL", "").strip()
-    if not database_url:
-        print("Error: DATABASE_URL environment variable is required", file=sys.stderr)
+    from crypto_chatbot.alerts.sender import TelegramOutboxSender
+    from crypto_chatbot.alerts.worker import render_settlement_reply
+    from crypto_chatbot.storage.repositories import PostgresAlertRepository
+
+    try:
+        database_url = _resolve_database_url(None)
+    except ConfigError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
         return 1
     try:
         engine = create_db_engine(database_url)
@@ -583,10 +619,12 @@ def _run_settle_setups(max_bars: int = 24) -> int:
         return 1
 
     updated = 0
+    replies_to_send: list[tuple[int, int, str]] = []
     try:
         init_db(engine)
         market_repo = PostgresMarketRepository(engine)
         setup_repo = PostgresSetupLogRepository(engine)
+        alert_repo = PostgresAlertRepository(engine)
         pending = setup_repo.list_pending_setups(limit=200)
         for rec in pending:
             if rec.market_type in (MarketType.SPOT.value, MarketType.PERPETUAL.value):
@@ -615,10 +653,52 @@ def _run_settle_setups(max_bars: int = 24) -> int:
                     realized_r=realized_r,
                 )
                 updated += 1
+                chat_id = rec.telegram_chat_id
+                msg_id = rec.telegram_message_id
+                if chat_id is None or msg_id is None:
+                    linked = alert_repo.get_alert_by_snapshot_id(rec.snapshot_id)
+                    if linked is not None:
+                        chat_id = chat_id or linked.chat_id
+                        msg_id = msg_id or linked.telegram_message_id
+                if chat_id is not None and msg_id is not None:
+                    reply_html = render_settlement_reply(
+                        rec,
+                        outcome_status=outcome_status,
+                        realized_r=realized_r,
+                        settled_at=settled_at,
+                    )
+                    replies_to_send.append((chat_id, msg_id, reply_html))
     finally:
         engine.dispose()
 
-    print(f"Settle setups completed: checked={len(pending)}, updated={updated}")
+    replied = 0
+    bot_token = _resolve_alert_bot_token()
+    if replies_to_send and bot_token:
+
+        async def _send_replies() -> int:
+            sender = TelegramOutboxSender(bot_token=bot_token)
+            sent_cnt = 0
+            try:
+                for target_chat, reply_to_id, text_html in replies_to_send:
+                    try:
+                        await sender.send_message(
+                            chat_id=target_chat,
+                            text=text_html,
+                            parse_mode="HTML",
+                            reply_to_message_id=reply_to_id,
+                        )
+                        sent_cnt += 1
+                    except Exception as exc:
+                        logging.getLogger(__name__).warning(
+                            "Failed to send settlement thread reply: %s", exc
+                        )
+            finally:
+                await sender.close()
+            return sent_cnt
+
+        replied = asyncio.run(_send_replies())
+
+    print(f"Settle setups completed: checked={len(pending)}, updated={updated}, replied={replied}")
     return 0
 
 
@@ -1412,7 +1492,9 @@ def _run_scan(
         if symbols_raw and symbols_raw.strip():
             targets = [part.strip() for part in symbols_raw.split(",") if part.strip()]
         else:
-            targets = list(DEFAULT_SCAN_BASKET)
+            from crypto_chatbot.alerts.config import load_universe
+
+            targets = list(load_universe(fallback=DEFAULT_SCAN_BASKET))
         report = asyncio.run(
             _run_scan_live(
                 symbols=targets,
@@ -1559,6 +1641,7 @@ def _run_contract_stats(
     as_json: bool,
     database_url: str | None,
 ) -> int:
+    from crypto_chatbot.alerts.config import load_universe
     from crypto_chatbot.analysis.scanner import DEFAULT_SCAN_BASKET
     from crypto_chatbot.market_data.gate_contract_stats import (
         ContractStatsRecorder,
@@ -1584,7 +1667,7 @@ def _run_contract_stats(
     symbols = (
         tuple(item.strip() for item in symbols_raw.split(",") if item.strip())
         if symbols_raw
-        else DEFAULT_SCAN_BASKET
+        else load_universe(fallback=DEFAULT_SCAN_BASKET)
     )
 
     engine = create_db_engine(resolved_url)
@@ -2132,6 +2215,150 @@ def _run_evaluate_sentiment_csv(
             f"evaluate-sentiment-csv: labeled={report.labeled_rows}/{report.total_rows}, "
             f"accuracy={report.accuracy:.4f}, matrix={report.confusion_matrix}"
         )
+    return 0
+
+
+def _run_alerts(
+    *,
+    action: str,
+    config_path: Path | None,
+    universe_path: Path | None,
+    chat_id: int | None,
+    database_url: str | None,
+    dry_run: bool,
+    as_json: bool,
+) -> int:
+    from crypto_chatbot.alerts.config import load_screener_config, load_universe
+    from crypto_chatbot.alerts.sender import TelegramOutboxSender
+    from crypto_chatbot.alerts.worker import run_alert_cycle, run_alert_digest
+    from crypto_chatbot.storage.repositories import PostgresAlertRepository
+
+    try:
+        db_url = _resolve_database_url(database_url)
+    except ConfigError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    screener_cfg = load_screener_config(config_path)
+    resolved_chat_id = _resolve_alert_chat_id(chat_id)
+    bot_token = _resolve_alert_bot_token()
+
+    engine = create_db_engine(db_url)
+    init_db(engine)
+    alert_repo = PostgresAlertRepository(engine)
+    setup_repo = PostgresSetupLogRepository(engine)
+    market_repo = PostgresMarketRepository(engine)
+
+    if action == "digest":
+
+        async def _do_digest() -> Any:
+            sender = (
+                TelegramOutboxSender(bot_token=bot_token)
+                if (not dry_run and bot_token and resolved_chat_id is not None)
+                else None
+            )
+            try:
+                return await run_alert_digest(
+                    alert_repo=alert_repo,
+                    sender=sender,
+                    chat_id=resolved_chat_id,
+                    dry_run=dry_run,
+                )
+            finally:
+                if sender is not None:
+                    await sender.close()
+
+        try:
+            digest = asyncio.run(_do_digest())
+        except Exception as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        finally:
+            engine.dispose()
+
+        if as_json:
+            print(digest.model_dump_json(indent=2))
+        else:
+            print(
+                f"alerts digest: recent_24h={digest.recent_alerts_24h}, "
+                f"held={digest.held_alerts_included}, sent={digest.sent}"
+            )
+        return 0
+
+    symbols = load_universe(universe_path or screener_cfg.universe_path)
+
+    async def _do_run() -> Any:
+        chain = _resolve_exchange_chain_from_env()
+        provider, deriv_provider = build_futures_providers(
+            chain,
+            cooldown_minutes=_resolve_venue_cooldown_from_env(),
+            gate_direct_candles=_resolve_gate_direct_candles_from_env(),
+        )
+        bybit_provider = BybitDerivativesProvider() if "binance" in chain else None
+        dxy_provider = DxyMarketDataProvider()
+        risk_tiers_client = GateRiskTiersClient() if "gate" in chain else None
+        sender = (
+            TelegramOutboxSender(bot_token=bot_token)
+            if (not dry_run and bot_token and resolved_chat_id is not None)
+            else None
+        )
+        try:
+            service = AnalysisService(
+                provider=provider,
+                repository=market_repo,
+                derivatives_provider=deriv_provider,
+                bybit_provider=bybit_provider,
+                setup_repository=setup_repo,
+                dxy_provider=dxy_provider,
+                risk_tiers_client=risk_tiers_client,
+                resample_from=_resolve_resample_from_env(),
+            )
+            return await run_alert_cycle(
+                analysis_service=service,
+                alert_repo=alert_repo,
+                setup_repo=setup_repo,
+                sender=sender,
+                screener_config=screener_cfg,
+                symbols=symbols,
+                chat_id=resolved_chat_id,
+                dry_run=dry_run,
+            )
+        finally:
+            if sender is not None:
+                await sender.close()
+            await provider.close()
+            await deriv_provider.close()
+            await dxy_provider.close()
+            if risk_tiers_client is not None:
+                await risk_tiers_client.close()
+            if bybit_provider is not None:
+                await bybit_provider.close()
+
+    try:
+        summary = asyncio.run(_do_run())
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        engine.dispose()
+
+    if as_json:
+        print(summary.model_dump_json(indent=2))
+    else:
+        if summary.locked_out:
+            print("alerts run: skipped (advisory lock busy)")
+        else:
+            for r in summary.results:
+                if r.skipped_reason:
+                    print(
+                        f"alerts run [{r.timeframe.value}] {r.run_id}: skipped ({r.skipped_reason})"
+                    )
+                else:
+                    print(
+                        f"alerts run [{r.timeframe.value}] {r.run_id}: scanned={r.scanned_count}, "
+                        f"ready={r.ready_count}, sent={r.sent_alerts}, "
+                        f"held={r.held_digest_alerts}, errors={len(r.failed_symbols)}"
+                    )
     return 0
 
 
@@ -2755,6 +2982,49 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Print JSON output.",
     )
 
+    alerts_parser = subcommands.add_parser(
+        "alerts",
+        help="One-shot hourly setup alert worker (`run`) and daily summary (`digest`).",
+    )
+    alerts_parser.add_argument(
+        "action",
+        choices=("run", "digest"),
+        help="Sub-action: 'run' (hourly scan + outbox send) or 'digest' (daily summary).",
+    )
+    alerts_parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="Path to screener YAML config (default: config/screener.yaml).",
+    )
+    alerts_parser.add_argument(
+        "--universe",
+        type=Path,
+        default=None,
+        help="Path to universe text file (default: config/universe.txt).",
+    )
+    alerts_parser.add_argument(
+        "--chat-id",
+        type=int,
+        default=None,
+        help="Override target Telegram CHAT_ID.",
+    )
+    alerts_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Optional PostgreSQL URL override.",
+    )
+    alerts_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Write outbox/digest without sending Telegram API requests.",
+    )
+    alerts_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print JSON output.",
+    )
+
     args = parser.parse_args(argv)
     if args.command == "check-config":
         return _check_config()
@@ -2927,6 +3197,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "evaluate-sentiment-csv":
         return _run_evaluate_sentiment_csv(
             input_path=args.input,
+            as_json=args.json,
+        )
+    if args.command == "alerts":
+        return _run_alerts(
+            action=args.action,
+            config_path=args.config,
+            universe_path=args.universe,
+            chat_id=args.chat_id,
+            database_url=args.database_url,
+            dry_run=args.dry_run,
             as_json=args.json,
         )
     parser.error(f"unknown command: {args.command}")  # pragma: no cover

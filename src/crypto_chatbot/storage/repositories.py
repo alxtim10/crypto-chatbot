@@ -7,8 +7,9 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import Engine, delete, select, update
+from sqlalchemy import Engine, delete, select, text, update
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.engine import Connection
 from sqlalchemy.orm import Session
 
 from crypto_chatbot.schemas.analysis import AnalysisSnapshot, TradeSetup
@@ -46,6 +47,9 @@ from crypto_chatbot.schemas.tradingview import (
 )
 from crypto_chatbot.schemas.whale import NetworkType, WhaleWatchlistEntry
 from crypto_chatbot.storage.models import (
+    AlertRow,
+    AlertRunRow,
+    AlertSymbolStateRow,
     AnalysisSnapshotRow,
     ContractStatsRow,
     ConversationRow,
@@ -179,6 +183,71 @@ class TradeSetupRecord(BaseModel):
     outcome_status: str = "pending"
     settled_at: UtcDatetime | None = None
     realized_r: float | None = None
+    params_sha256: str | None = None
+    user_action: str | None = None
+    user_action_at: UtcDatetime | None = None
+    telegram_chat_id: int | None = None
+    telegram_message_id: int | None = None
+
+
+class AlertRunRecord(BaseModel):
+    """Persisted record of one hourly alert worker run (`alert_runs`)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    run_id: str
+    timeframe: Timeframe
+    candle_close_time: UtcDatetime
+    started_at: UtcDatetime
+    finished_at: UtcDatetime | None = None
+    status: str = "running"
+    scanned_count: int = 0
+    ready_count: int = 0
+    alerted_count: int = 0
+    held_digest_count: int = 0
+    failed_symbols: tuple[str, ...] = ()
+    symbol_errors: dict[str, str] = Field(default_factory=dict)
+
+
+class AlertRecord(BaseModel):
+    """Outbox alert record persisted before Telegram delivery (`alerts`)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    alert_id: str
+    run_id: str
+    snapshot_id: str
+    params_sha256: str | None = None
+    canonical_symbol: str
+    timeframe: Timeframe
+    direction: str
+    venue: str
+    chat_id: int | None = None
+    status: str = "pending"
+    hold_reason: str | None = None
+    message_text: str
+    reply_markup_json: dict[str, Any] = Field(default_factory=dict)
+    telegram_message_id: int | None = None
+    send_attempts: int = 0
+    last_error: str | None = None
+    created_at: UtcDatetime
+    sent_at: UtcDatetime | None = None
+
+
+class AlertSymbolState(BaseModel):
+    """Per-(symbol, timeframe) state-change, cooldown, and mute tracker."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    canonical_symbol: str
+    timeframe: Timeframe
+    last_status: str
+    last_bias: str | None = None
+    last_run_id: str | None = None
+    last_alert_time_long: UtcDatetime | None = None
+    last_alert_time_short: UtcDatetime | None = None
+    muted_until: UtcDatetime | None = None
+    updated_at: UtcDatetime
 
 
 class MarketRepository(Protocol):
@@ -330,6 +399,8 @@ class SetupLogRepository(Protocol):
         self,
         snapshot: AnalysisSnapshot,
         setup: TradeSetup,
+        *,
+        params_sha256: str | None = None,
     ) -> bool: ...
 
     def get_setup(self, snapshot_id: str) -> TradeSetupRecord | None: ...
@@ -352,6 +423,77 @@ class SetupLogRepository(Protocol):
         settled_at: datetime | None,
         realized_r: float | None,
     ) -> bool: ...
+
+
+@runtime_checkable
+class AlertRepository(Protocol):
+    """Repository protocol for alert runs, outbox alerts, symbol states, and advisory locks."""
+
+    def try_acquire_advisory_lock(self, lock_key: int) -> bool: ...
+
+    def release_advisory_lock(self, lock_key: int) -> None: ...
+
+    def has_completed_run(self, run_id: str) -> bool: ...
+
+    def record_run_start(self, run: AlertRunRecord) -> bool: ...
+
+    def record_run_finish(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        finished_at: datetime,
+        scanned_count: int,
+        ready_count: int,
+        alerted_count: int,
+        held_digest_count: int,
+        failed_symbols: Sequence[str],
+        symbol_errors: dict[str, str],
+    ) -> None: ...
+
+    def get_latest_completed_run(self) -> AlertRunRecord | None: ...
+
+    def get_symbol_state(
+        self, canonical_symbol: str, timeframe: Timeframe
+    ) -> AlertSymbolState | None: ...
+
+    def upsert_symbol_state(self, state: AlertSymbolState) -> None: ...
+
+    def mute_symbol(
+        self,
+        canonical_symbol: str,
+        timeframe: Timeframe,
+        muted_until: datetime,
+        *,
+        now: datetime,
+    ) -> None: ...
+
+    def create_alert(self, alert: AlertRecord) -> bool: ...
+
+    def list_pending_alerts(self, *, limit: int = 50) -> tuple[AlertRecord, ...]: ...
+
+    def list_held_digest_alerts(
+        self, *, since: datetime | None = None
+    ) -> tuple[AlertRecord, ...]: ...
+
+    def list_recent_alerts(self, *, since: datetime) -> tuple[AlertRecord, ...]: ...
+
+    def mark_alert_sent(
+        self,
+        alert_id: str,
+        *,
+        telegram_message_id: int,
+        sent_at: datetime,
+        attempts: int,
+    ) -> None: ...
+
+    def mark_alert_failed(self, alert_id: str, *, error: str, attempts: int) -> None: ...
+
+    def mark_alerts_digest_sent(self, alert_ids: Sequence[str], *, sent_at: datetime) -> int: ...
+
+    def get_alert_by_id(self, alert_id: str) -> AlertRecord | None: ...
+
+    def get_alert_by_snapshot_id(self, snapshot_id: str) -> AlertRecord | None: ...
 
 
 class UserMemoryRepository(Protocol):
@@ -1295,6 +1437,11 @@ def _row_to_setup_record(row: TradeSetupRow) -> TradeSetupRecord:
         outcome_status=row.outcome_status,
         settled_at=_to_utc(row.settled_at) if row.settled_at else None,
         realized_r=row.realized_r,
+        params_sha256=getattr(row, "params_sha256", None),
+        user_action=getattr(row, "user_action", None),
+        user_action_at=(_to_utc(row.user_action_at) if row.user_action_at is not None else None),
+        telegram_chat_id=getattr(row, "telegram_chat_id", None),
+        telegram_message_id=getattr(row, "telegram_message_id", None),
     )
 
 
@@ -1308,6 +1455,8 @@ class PostgresSetupLogRepository:
         self,
         snapshot: AnalysisSnapshot,
         setup: TradeSetup,
+        *,
+        params_sha256: str | None = None,
     ) -> bool:
         if snapshot.technical is None:
             return False
@@ -1337,6 +1486,7 @@ class PostgresSetupLogRepository:
             "outcome_status": "skipped_wait" if setup.status.value == "wait" else "pending",
             "settled_at": None,
             "realized_r": None,
+            "params_sha256": params_sha256,
         }
         stmt = (
             insert(TradeSetupRow)
@@ -1346,6 +1496,44 @@ class PostgresSetupLogRepository:
         )
         with Session(self._engine) as session, session.begin():
             return bool(session.scalars(stmt).all())
+
+    def record_user_action(
+        self,
+        snapshot_id: str,
+        *,
+        action: Literal["ambil", "skip"],
+        acted_at: datetime | None = None,
+    ) -> bool:
+        stmt = (
+            update(TradeSetupRow)
+            .where(TradeSetupRow.snapshot_id == snapshot_id)
+            .values(
+                user_action=action,
+                user_action_at=_to_utc(acted_at or datetime.now(UTC)),
+            )
+        )
+        with Session(self._engine) as session, session.begin():
+            result = session.execute(stmt)
+            return _safe_rowcount(result) > 0
+
+    def link_telegram_message(
+        self,
+        snapshot_id: str,
+        *,
+        chat_id: int,
+        message_id: int,
+    ) -> bool:
+        stmt = (
+            update(TradeSetupRow)
+            .where(TradeSetupRow.snapshot_id == snapshot_id)
+            .values(
+                telegram_chat_id=chat_id,
+                telegram_message_id=message_id,
+            )
+        )
+        with Session(self._engine) as session, session.begin():
+            result = session.execute(stmt)
+            return _safe_rowcount(result) > 0
 
     def get_setup(self, snapshot_id: str) -> TradeSetupRecord | None:
         stmt = select(TradeSetupRow).where(TradeSetupRow.snapshot_id == snapshot_id)
@@ -2451,3 +2639,361 @@ class PostgresFearGreedRepository:
             )
             for row in db_rows
         )
+
+
+def _row_to_alert_run(row: AlertRunRow) -> AlertRunRecord:
+    return AlertRunRecord(
+        run_id=row.run_id,
+        timeframe=Timeframe(row.timeframe),
+        candle_close_time=_to_utc(row.candle_close_time),
+        started_at=_to_utc(row.started_at),
+        finished_at=_to_utc(row.finished_at) if row.finished_at else None,
+        status=row.status,
+        scanned_count=row.scanned_count,
+        ready_count=row.ready_count,
+        alerted_count=row.alerted_count,
+        held_digest_count=row.held_digest_count,
+        failed_symbols=tuple(row.failed_symbols or ()),
+        symbol_errors=dict(row.symbol_errors or {}),
+    )
+
+
+def _row_to_alert(row: AlertRow) -> AlertRecord:
+    return AlertRecord(
+        alert_id=row.alert_id,
+        run_id=row.run_id,
+        snapshot_id=row.snapshot_id,
+        params_sha256=row.params_sha256,
+        canonical_symbol=row.canonical_symbol,
+        timeframe=Timeframe(row.timeframe),
+        direction=row.direction,
+        venue=row.venue,
+        chat_id=row.chat_id,
+        status=row.status,
+        hold_reason=row.hold_reason,
+        message_text=row.message_text,
+        reply_markup_json=dict(row.reply_markup_json or {}),
+        telegram_message_id=row.telegram_message_id,
+        send_attempts=row.send_attempts,
+        last_error=row.last_error,
+        created_at=_to_utc(row.created_at),
+        sent_at=_to_utc(row.sent_at) if row.sent_at else None,
+    )
+
+
+def _row_to_alert_symbol_state(row: AlertSymbolStateRow) -> AlertSymbolState:
+    return AlertSymbolState(
+        canonical_symbol=row.canonical_symbol,
+        timeframe=Timeframe(row.timeframe),
+        last_status=row.last_status,
+        last_bias=row.last_bias,
+        last_run_id=row.last_run_id,
+        last_alert_time_long=_to_utc(row.last_alert_time_long)
+        if row.last_alert_time_long
+        else None,
+        last_alert_time_short=(
+            _to_utc(row.last_alert_time_short) if row.last_alert_time_short else None
+        ),
+        muted_until=_to_utc(row.muted_until) if row.muted_until else None,
+        updated_at=_to_utc(row.updated_at),
+    )
+
+
+class PostgresAlertRepository:
+    """PostgreSQL implementation of `AlertRepository` with session advisory locks."""
+
+    def __init__(self, engine: Engine) -> None:
+        self._engine = engine
+        self._lock_connections: dict[int, Connection] = {}
+
+    def try_acquire_advisory_lock(self, lock_key: int) -> bool:
+        if lock_key in self._lock_connections:
+            return True
+        conn = self._engine.connect()
+        try:
+            acquired = bool(
+                conn.execute(
+                    text("SELECT pg_try_advisory_lock(:lock_key)"),
+                    {"lock_key": lock_key},
+                ).scalar()
+            )
+            conn.commit()
+        except Exception:
+            conn.close()
+            raise
+        if not acquired:
+            conn.close()
+            return False
+        self._lock_connections[lock_key] = conn
+        return True
+
+    def release_advisory_lock(self, lock_key: int) -> None:
+        conn = self._lock_connections.pop(lock_key, None)
+        if conn is None:
+            return
+        try:
+            conn.execute(
+                text("SELECT pg_advisory_unlock(:lock_key)"),
+                {"lock_key": lock_key},
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def has_completed_run(self, run_id: str) -> bool:
+        stmt = select(AlertRunRow.id).where(
+            AlertRunRow.run_id == run_id,
+            AlertRunRow.status == "completed",
+        )
+        with Session(self._engine) as session:
+            return session.scalar(stmt) is not None
+
+    def record_run_start(self, run: AlertRunRecord) -> bool:
+        stmt = (
+            insert(AlertRunRow)
+            .values(
+                run_id=run.run_id,
+                timeframe=run.timeframe.value,
+                candle_close_time=_to_utc(run.candle_close_time),
+                started_at=_to_utc(run.started_at),
+                finished_at=None,
+                status="running",
+                scanned_count=run.scanned_count,
+                ready_count=run.ready_count,
+                alerted_count=run.alerted_count,
+                held_digest_count=run.held_digest_count,
+                failed_symbols=list(run.failed_symbols),
+                symbol_errors=dict(run.symbol_errors),
+            )
+            .on_conflict_do_nothing(constraint="uq_alert_runs_run_id")
+            .returning(AlertRunRow.id)
+        )
+        with Session(self._engine) as session, session.begin():
+            return bool(session.scalars(stmt).all())
+
+    def record_run_finish(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        finished_at: datetime,
+        scanned_count: int,
+        ready_count: int,
+        alerted_count: int,
+        held_digest_count: int,
+        failed_symbols: Sequence[str],
+        symbol_errors: dict[str, str],
+    ) -> None:
+        stmt = (
+            update(AlertRunRow)
+            .where(AlertRunRow.run_id == run_id)
+            .values(
+                status=status,
+                finished_at=_to_utc(finished_at),
+                scanned_count=scanned_count,
+                ready_count=ready_count,
+                alerted_count=alerted_count,
+                held_digest_count=held_digest_count,
+                failed_symbols=list(failed_symbols),
+                symbol_errors=dict(symbol_errors),
+            )
+        )
+        with Session(self._engine) as session, session.begin():
+            session.execute(stmt)
+
+    def get_latest_completed_run(self) -> AlertRunRecord | None:
+        stmt = (
+            select(AlertRunRow)
+            .where(AlertRunRow.status == "completed")
+            .order_by(AlertRunRow.finished_at.desc(), AlertRunRow.id.desc())
+            .limit(1)
+        )
+        with Session(self._engine) as session:
+            row = session.scalar(stmt)
+        return _row_to_alert_run(row) if row is not None else None
+
+    def get_symbol_state(
+        self, canonical_symbol: str, timeframe: Timeframe
+    ) -> AlertSymbolState | None:
+        stmt = select(AlertSymbolStateRow).where(
+            AlertSymbolStateRow.canonical_symbol == canonical_symbol,
+            AlertSymbolStateRow.timeframe == timeframe.value,
+        )
+        with Session(self._engine) as session:
+            row = session.scalar(stmt)
+        return _row_to_alert_symbol_state(row) if row is not None else None
+
+    def upsert_symbol_state(self, state: AlertSymbolState) -> None:
+        values = {
+            "canonical_symbol": state.canonical_symbol,
+            "timeframe": state.timeframe.value,
+            "last_status": state.last_status,
+            "last_bias": state.last_bias,
+            "last_run_id": state.last_run_id,
+            "last_alert_time_long": (
+                _to_utc(state.last_alert_time_long) if state.last_alert_time_long else None
+            ),
+            "last_alert_time_short": (
+                _to_utc(state.last_alert_time_short) if state.last_alert_time_short else None
+            ),
+            "muted_until": _to_utc(state.muted_until) if state.muted_until else None,
+            "updated_at": _to_utc(state.updated_at),
+        }
+        stmt = (
+            insert(AlertSymbolStateRow)
+            .values(**values)
+            .on_conflict_do_update(
+                constraint="uq_alert_symbol_state_key",
+                set_={
+                    k: v for k, v in values.items() if k not in {"canonical_symbol", "timeframe"}
+                },
+            )
+        )
+        with Session(self._engine) as session, session.begin():
+            session.execute(stmt)
+
+    def mute_symbol(
+        self,
+        canonical_symbol: str,
+        timeframe: Timeframe,
+        muted_until: datetime,
+        *,
+        now: datetime,
+    ) -> None:
+        existing = self.get_symbol_state(canonical_symbol, timeframe)
+        state = AlertSymbolState(
+            canonical_symbol=canonical_symbol,
+            timeframe=timeframe,
+            last_status=existing.last_status if existing else "wait",
+            last_bias=existing.last_bias if existing else None,
+            last_run_id=existing.last_run_id if existing else None,
+            last_alert_time_long=existing.last_alert_time_long if existing else None,
+            last_alert_time_short=existing.last_alert_time_short if existing else None,
+            muted_until=_to_utc(muted_until),
+            updated_at=_to_utc(now),
+        )
+        self.upsert_symbol_state(state)
+
+    def create_alert(self, alert: AlertRecord) -> bool:
+        stmt = (
+            insert(AlertRow)
+            .values(
+                alert_id=alert.alert_id,
+                run_id=alert.run_id,
+                snapshot_id=alert.snapshot_id,
+                params_sha256=alert.params_sha256,
+                canonical_symbol=alert.canonical_symbol,
+                timeframe=alert.timeframe.value,
+                direction=alert.direction,
+                venue=alert.venue,
+                chat_id=alert.chat_id,
+                status=alert.status,
+                hold_reason=alert.hold_reason,
+                message_text=alert.message_text,
+                reply_markup_json=dict(alert.reply_markup_json),
+                telegram_message_id=alert.telegram_message_id,
+                send_attempts=alert.send_attempts,
+                last_error=alert.last_error,
+                created_at=_to_utc(alert.created_at),
+                sent_at=_to_utc(alert.sent_at) if alert.sent_at else None,
+            )
+            .on_conflict_do_nothing(constraint="uq_alerts_alert_id")
+            .returning(AlertRow.id)
+        )
+        with Session(self._engine) as session, session.begin():
+            return bool(session.scalars(stmt).all())
+
+    def list_pending_alerts(self, *, limit: int = 50) -> tuple[AlertRecord, ...]:
+        stmt = (
+            select(AlertRow)
+            .where(AlertRow.status == "pending")
+            .order_by(AlertRow.created_at.asc(), AlertRow.id.asc())
+            .limit(max(1, limit))
+        )
+        with Session(self._engine) as session:
+            rows = list(session.scalars(stmt))
+        return tuple(_row_to_alert(r) for r in rows)
+
+    def list_held_digest_alerts(self, *, since: datetime | None = None) -> tuple[AlertRecord, ...]:
+        stmt = select(AlertRow).where(AlertRow.status == "held_digest")
+        if since is not None:
+            stmt = stmt.where(AlertRow.created_at >= _to_utc(since))
+        stmt = stmt.order_by(AlertRow.created_at.asc(), AlertRow.id.asc())
+        with Session(self._engine) as session:
+            rows = list(session.scalars(stmt))
+        return tuple(_row_to_alert(r) for r in rows)
+
+    def list_recent_alerts(self, *, since: datetime) -> tuple[AlertRecord, ...]:
+        stmt = (
+            select(AlertRow)
+            .where(AlertRow.created_at >= _to_utc(since))
+            .order_by(AlertRow.created_at.desc(), AlertRow.id.desc())
+        )
+        with Session(self._engine) as session:
+            rows = list(session.scalars(stmt))
+        return tuple(_row_to_alert(r) for r in rows)
+
+    def mark_alert_sent(
+        self,
+        alert_id: str,
+        *,
+        telegram_message_id: int,
+        sent_at: datetime,
+        attempts: int,
+    ) -> None:
+        stmt = (
+            update(AlertRow)
+            .where(AlertRow.alert_id == alert_id)
+            .values(
+                status="sent",
+                telegram_message_id=telegram_message_id,
+                sent_at=_to_utc(sent_at),
+                send_attempts=attempts,
+                last_error=None,
+            )
+        )
+        with Session(self._engine) as session, session.begin():
+            session.execute(stmt)
+
+    def mark_alert_failed(self, alert_id: str, *, error: str, attempts: int) -> None:
+        stmt = (
+            update(AlertRow)
+            .where(AlertRow.alert_id == alert_id)
+            .values(
+                status="failed",
+                last_error=error[:500],
+                send_attempts=attempts,
+            )
+        )
+        with Session(self._engine) as session, session.begin():
+            session.execute(stmt)
+
+    def mark_alerts_digest_sent(self, alert_ids: Sequence[str], *, sent_at: datetime) -> int:
+        ids = list(alert_ids)
+        if not ids:
+            return 0
+        stmt = (
+            update(AlertRow)
+            .where(AlertRow.alert_id.in_(ids))
+            .values(status="digest_sent", sent_at=_to_utc(sent_at))
+        )
+        with Session(self._engine) as session, session.begin():
+            result = session.execute(stmt)
+            return _safe_rowcount(result)
+
+    def get_alert_by_id(self, alert_id: str) -> AlertRecord | None:
+        stmt = select(AlertRow).where(AlertRow.alert_id == alert_id)
+        with Session(self._engine) as session:
+            row = session.scalar(stmt)
+        return _row_to_alert(row) if row is not None else None
+
+    def get_alert_by_snapshot_id(self, snapshot_id: str) -> AlertRecord | None:
+        stmt = (
+            select(AlertRow)
+            .where(AlertRow.snapshot_id == snapshot_id)
+            .order_by(AlertRow.created_at.desc(), AlertRow.id.desc())
+            .limit(1)
+        )
+        with Session(self._engine) as session:
+            row = session.scalar(stmt)
+        return _row_to_alert(row) if row is not None else None

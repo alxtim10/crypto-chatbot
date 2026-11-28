@@ -33,6 +33,24 @@ def init_db(engine: Engine) -> None:
         conn.execute(
             text("ALTER TABLE trade_setups ADD COLUMN IF NOT EXISTS market_type VARCHAR(16);")
         )
+        conn.execute(
+            text("ALTER TABLE trade_setups ADD COLUMN IF NOT EXISTS params_sha256 VARCHAR(64);")
+        )
+        conn.execute(
+            text("ALTER TABLE trade_setups ADD COLUMN IF NOT EXISTS user_action VARCHAR(16);")
+        )
+        conn.execute(
+            text(
+                "ALTER TABLE trade_setups "
+                "ADD COLUMN IF NOT EXISTS user_action_at TIMESTAMP WITH TIME ZONE;"
+            )
+        )
+        conn.execute(
+            text("ALTER TABLE trade_setups ADD COLUMN IF NOT EXISTS telegram_chat_id BIGINT;")
+        )
+        conn.execute(
+            text("ALTER TABLE trade_setups ADD COLUMN IF NOT EXISTS telegram_message_id BIGINT;")
+        )
         conn.execute(text("ALTER TABLE llm_interactions ALTER COLUMN snapshot_id DROP NOT NULL;"))
         conn.execute(
             text("ALTER TABLE llm_interactions ADD COLUMN IF NOT EXISTS layer VARCHAR(32);")

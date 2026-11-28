@@ -79,6 +79,9 @@ class Settings(BaseSettings):
         default=("1m", "5m", "15m", "1h"),
         validate_default=True,
     )
+    alert_chat_id: int | None = Field(default=None)
+    screener_config_path: str = Field(default="config/screener.yaml")
+    universe_path: str = Field(default="config/universe.txt")
 
     @field_validator("futures_exchange", mode="before")
     @classmethod
