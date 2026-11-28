@@ -72,6 +72,9 @@ def normalize_gate_funding_rate_payload(
         if not math.isfinite(rate):
             continue
         rate_8h = rate * scale_8h
+        # Backfilled historical rows use settlement time (with BACKFILL flag) for causal
+        # backtest/ML lookup; live fetches keep available_time = fetch time (>= observed_time).
+        available_time = observed_time if backfill else max(observed_time, received_utc)
         by_time[observed_time] = FundingRateObservation(
             provider=provider,
             venue=venue,
@@ -81,7 +84,7 @@ def normalize_gate_funding_rate_payload(
             observed_time=observed_time,
             next_funding_time=None,
             received_time=received_utc,
-            available_time=observed_time,
+            available_time=available_time,
             funding_rate=rate,
             funding_interval_hours=funding_interval_hours,
             rate_per_8h=rate_8h,

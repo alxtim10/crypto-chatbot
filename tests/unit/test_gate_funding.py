@@ -154,6 +154,7 @@ def test_point_in_time_funding_lookup_is_strictly_causal() -> None:
         symbol=symbol,
         provider_symbol="GATE:BTCUSDT.P",
         received_time=t0 + timedelta(days=10),
+        backfill=True,
     )
     as_of = t0 + timedelta(hours=8 * 5)  # cutoff after 6th point (idx 0..5)
 
@@ -291,3 +292,38 @@ def test_cli_sync_gate_funding_dispatch(
     out = json.loads(capsys.readouterr().out)
     assert out["days"] == 90
     assert out["inserted"]["BTC/USDT:USDT"] == 1
+
+
+def test_gate_funding_backfill_vs_live_available_time() -> None:
+    from crypto_chatbot.market_data.gate_funding import normalize_gate_funding_rate_payload
+    from crypto_chatbot.market_data.symbols import resolve_default_perp_symbol
+    from crypto_chatbot.schemas.market import QualityFlag
+
+    sym = resolve_default_perp_symbol("BTC")
+    settle_t = datetime(2026, 11, 27, 8, 0, tzinfo=UTC)
+    fetch_t = settle_t + timedelta(minutes=17)
+    raw = [{"t": int(settle_t.timestamp()), "r": "0.0001"}]
+
+    bf = normalize_gate_funding_rate_payload(
+        raw,
+        symbol=sym,
+        provider_symbol="GATE:BTCUSDT.P",
+        received_time=fetch_t,
+        as_of=fetch_t,
+        backfill=True,
+    )
+    assert len(bf) == 1
+    assert bf[0].available_time == settle_t
+    assert QualityFlag.BACKFILL in bf[0].quality_flags
+
+    live = normalize_gate_funding_rate_payload(
+        raw,
+        symbol=sym,
+        provider_symbol="GATE:BTCUSDT.P",
+        received_time=fetch_t,
+        as_of=fetch_t,
+        backfill=False,
+    )
+    assert len(live) == 1
+    assert live[0].available_time == fetch_t
+    assert QualityFlag.BACKFILL not in live[0].quality_flags

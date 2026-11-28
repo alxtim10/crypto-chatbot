@@ -90,3 +90,18 @@ Configured in `config/screener.yaml` (all timeframes fetched incrementally from 
    - **Shadow Expiry (`shadow_expired`)**: If an `ARMED` setup expires without 5m confirmation, it is persisted to `trade_setups` with `user_action = 'shadow_expired'` (and `telegram_message_id = NULL`, not alerted). `settle-setups` settles both confirmed alerts and `shadow_expired` entries so confirmed vs unconfirmed forward performance can be compared directly.
 5. **Cooldown Precedence**: Per-`(symbol, direction)` cooldown resolves in order `cooldown_hours[<timeframe>]` > legacy `cooldown_minutes` (if specified) > `default_cooldown_hours` (`2h`).
 6. **Dead-Man Monitor**: `run-bot` sends a `🔧` alert if no `alerts run` completes within `dead_man_hours` (default `1h` for the 15m cadence).
+
+
+### Point-in-Time `available_time` Semantics for Backfills vs Live Fetches
+
+To keep historical datasets usable in backtests/ML without lookahead while preserving strict live arrival timestamps:
+
+- **`sync-fear-greed` (Alternative.me `/fng/`)**:
+  - Backfill (`limit=0` or `limit > 1`): `available_time = observed_time + 00:00` (assumption: Alternative.me publishes its daily index at `00:00 UTC` on the value date) with `is_backfilled = True`.
+  - Live fetch (`limit=1`, `backfill=False`): `available_time = max(observed_time, received_time)` (actual fetch time) with `is_backfilled = False`.
+- **`contract-stats` (Gate.io `/futures/usdt/contract_stats`)**:
+  - Backfill (`backfill=True`): `available_time = observed_time + interval` (bucket close time, e.g. `+5m` or `+1h`) with `QualityFlag.BACKFILL`.
+  - Live poll (`backfill=False`): `available_time = max(observed_time + interval, received_time)` (actual fetch time) with no `BACKFILL` flag.
+- **`sync-gate-funding` (Gate.io `/futures/usdt/funding_rate`)**:
+  - Backfill (`backfill=True`): `available_time = observed_time` (exact 8h settlement timestamp) with `QualityFlag.BACKFILL`.
+  - Live fetch (`backfill=False`): `available_time = max(observed_time, received_time)` (actual fetch time) with no `BACKFILL` flag.

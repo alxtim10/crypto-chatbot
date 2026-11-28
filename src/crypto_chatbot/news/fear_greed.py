@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -13,6 +13,12 @@ from crypto_chatbot.schemas.news import FearGreedObservation
 from crypto_chatbot.storage.repositories import FearGreedRepository
 
 DEFAULT_FNG_API_URL = "https://api.alternative.me/fng/"
+
+# Assumption for backfilled historical rows: Alternative.me publishes its daily
+# Fear & Greed update at 00:00 UTC (the value's UTC midnight timestamp).
+# Backfilled rows set available_time = observed_time + FNG_DAILY_PUBLICATION_OFFSET
+# and is_backfilled = True; live fetches (backfill=False) keep available_time = fetch time.
+FNG_DAILY_PUBLICATION_OFFSET = timedelta(0)
 
 
 class _RetryableFngHttpError(RuntimeError):
@@ -56,11 +62,16 @@ def normalize_fear_greed_payload(
         if val_int < 0 or val_int > 100:
             continue
         normalized = round((val_int - 50.0) / 50.0, 4)
+        available_time = (
+            observed_time + FNG_DAILY_PUBLICATION_OFFSET
+            if backfill
+            else max(observed_time, received_utc)
+        )
         by_time[observed_time] = FearGreedObservation(
             source=source,
             observed_time=observed_time,
             received_time=received_utc,
-            available_time=observed_time,
+            available_time=available_time,
             value=val_int,
             classification=str(raw_cls).strip(),
             normalized_score=normalized,
