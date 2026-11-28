@@ -9,14 +9,22 @@ import math
 import time
 import uuid
 from collections.abc import Callable, Collection, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 from sqlalchemy.exc import SQLAlchemyError
-from telegram import Update
+from telegram import Message, Update
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
+from crypto_chatbot.alerts.config import load_universe
 from crypto_chatbot.analysis.forward_proof import ForwardProofEvaluation
 from crypto_chatbot.analysis.momentum_screener import (
     DEFAULT_MIN_VOLUME_24H_USD,
@@ -62,6 +70,7 @@ from crypto_chatbot.bot.commands import (
 from crypto_chatbot.bot.templates import (
     TELEGRAM_MAX_MESSAGE_LENGTH,
     render_context_fallback,
+    render_deterministic_snapshot,
     render_forget_message,
     render_help_message,
     render_memory_message,
@@ -89,6 +98,7 @@ from crypto_chatbot.schemas.market import (
     resolve_primary_timeframe,
 )
 from crypto_chatbot.schemas.whale import NetworkType
+from crypto_chatbot.storage.repositories import AlertRepository, SetupLogRepository
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +125,8 @@ class BotService:
         whale_provider: WhaleDataProvider | None = None,
         whale_watchlist: WhaleWatchlistManager | None = None,
         forward_track_provider: Callable[[], Sequence[ForwardProofEvaluation]] | None = None,
+        alert_repository: AlertRepository | None = None,
+        setup_repository: SetupLogRepository | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._access = access
@@ -124,6 +136,8 @@ class BotService:
         self._whale_provider = whale_provider or WhaleDataProvider()
         self._whale_watchlist = whale_watchlist or WhaleWatchlistManager()
         self._forward_track_provider = forward_track_provider
+        self._alert_repository = alert_repository
+        self._setup_repository = setup_repository
         self._clock: Callable[[], datetime] = clock or (lambda: datetime.now(UTC))
         self._perp_universe_cache: tuple[float, frozenset[str]] | None = None
 
@@ -535,7 +549,9 @@ class BotService:
         if explicit_symbols:
             targets = list(dict.fromkeys(explicit_symbols))
         else:
-            targets = list(dict.fromkeys((*watchlist, *DEFAULT_SCAN_BASKET)))[:10]
+            targets = list(
+                dict.fromkeys((*watchlist, *load_universe(fallback=DEFAULT_SCAN_BASKET)))
+            )
 
         report = await scan_market_setups(
             self._analysis_service,
@@ -771,6 +787,122 @@ class BotService:
         except SQLAlchemyError:
             logger.exception("request_id=%s user_id=%s action=forget db_error", request_id, user_id)
             return ("Gagal menghapus memori di database. Coba beberapa saat lagi.",)
+
+    async def handle_alert_callback(
+        self,
+        user_id: int | None,
+        callback_data: str,
+    ) -> tuple[str, tuple[str, ...]]:
+        """Handle inline button callbacks (`al:<action>:<alert_id>`) from hourly alert messages."""
+        request_id = f"req-{uuid.uuid4().hex[:12]}"
+        denied = self._authorize(user_id, request_id, "alert_callback")
+        if denied is not None or user_id is None:
+            return ("Akses dibatasi.", denied or _deny_chunks("not_allowlisted"))
+
+        parts = callback_data.strip().split(":", 2)
+        if len(parts) != 3 or parts[0] != "al":
+            return ("Format tombol tidak valid.", ())
+        action, alert_id = parts[1], parts[2]
+        if self._alert_repository is None:
+            return ("Alert repository belum aktif.", ())
+
+        alert = self._alert_repository.get_alert_by_id(alert_id)
+        if alert is None:
+            return ("Alert tidak ditemukan.", ("Alert sudah tidak tersedia di database.",))
+
+        now_utc = self._clock().astimezone(UTC)
+
+        if action == "tk":
+            if self._setup_repository is not None and hasattr(
+                self._setup_repository, "record_user_action"
+            ):
+                self._setup_repository.record_user_action(
+                    alert.snapshot_id,
+                    action="ambil",
+                    acted_at=now_utc,
+                )
+            tf_str = html.escape(alert.timeframe.value)
+            dir_str = html.escape(alert.direction.upper())
+            return (
+                "Dicatat: AMBIL",
+                (
+                    f"✅ Dicatat <b>AMBIL</b> untuk {html.escape(alert.canonical_symbol)} "
+                    f"({tf_str} · {dir_str}).\n"
+                    f"<i>Ledger: {html.escape(alert.snapshot_id)}</i>",
+                ),
+            )
+
+        if action == "sk":
+            if self._setup_repository is not None and hasattr(
+                self._setup_repository, "record_user_action"
+            ):
+                self._setup_repository.record_user_action(
+                    alert.snapshot_id,
+                    action="skip",
+                    acted_at=now_utc,
+                )
+            tf_str = html.escape(alert.timeframe.value)
+            dir_str = html.escape(alert.direction.upper())
+            return (
+                "Dicatat: SKIP",
+                (
+                    f"⏭️ Dicatat <b>SKIP</b> untuk {html.escape(alert.canonical_symbol)} "
+                    f"({tf_str} · {dir_str}).\n"
+                    f"<i>Ledger: {html.escape(alert.snapshot_id)}</i>",
+                ),
+            )
+
+        if action == "mt":
+            muted_until = now_utc + timedelta(hours=24)
+            self._alert_repository.mute_symbol(
+                alert.canonical_symbol,
+                alert.timeframe,
+                muted_until,
+                now=now_utc,
+            )
+            return (
+                "Muted 24 jam",
+                (
+                    f"🔇 Alert <b>{html.escape(alert.canonical_symbol)}</b> "
+                    f"({html.escape(alert.timeframe.value)}) di-mute selama 24 jam.",
+                ),
+            )
+
+        if action == "dt":
+            snap = await self._analysis_service.analyze(
+                alert.canonical_symbol,
+                alert.timeframe,
+                include_mtf=True,
+                include_derivatives=True,
+                persist=False,
+            )
+            rendered = render_deterministic_snapshot(snap, html_mode=True)
+            return ("Detail dikirim", split_telegram_message(rendered, TELEGRAM_MAX_MESSAGE_LENGTH))
+
+        if action == "ex":
+            snap = await self._analysis_service.analyze(
+                alert.canonical_symbol,
+                alert.timeframe,
+                include_mtf=True,
+                include_derivatives=True,
+                persist=False,
+            )
+            ctx = f"Jelaskan alert setup {alert.canonical_symbol} {alert.timeframe.value}"
+            outcome = await self._narrator.narrate_snapshot(
+                snap,
+                user_id=user_id,
+                user_context=ctx,
+            )
+            rendered = render_analysis_response(
+                outcome.response,
+                html_mode=True,
+            )
+            return (
+                "Penjelasan dikirim",
+                split_telegram_message(rendered, TELEGRAM_MAX_MESSAGE_LENGTH),
+            )
+
+        return ("Aksi tidak dikenal.", ())
 
     async def handle_unknown_command(
         self,
@@ -1599,6 +1731,22 @@ def register_handlers(
             except Exception as err:
                 logger.error("Failed to deliver error response to user: %s", err)
 
+    async def alert_callback_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        del context
+        query = update.callback_query
+        if query is None:
+            return
+        uid = update.effective_user.id if update.effective_user else None
+        toast, chunks = await bot_service.handle_alert_callback(uid, query.data or "")
+        await query.answer(text=toast)
+        if chunks and isinstance(query.message, Message):
+            for chunk in chunks:
+                await query.message.reply_text(
+                    chunk,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+
     application.add_handler(CommandHandler("start", start_cmd))
     application.add_handler(CommandHandler("help", help_cmd))
     application.add_handler(CommandHandler("analyze", analyze_cmd))
@@ -1614,4 +1762,5 @@ def register_handlers(
     application.add_handler(CommandHandler("track", track_cmd))
     application.add_handler(MessageHandler(filters.COMMAND, unknown_cmd))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_msg))
+    application.add_handler(CallbackQueryHandler(alert_callback_cmd, pattern=r"^al:"))
     application.add_error_handler(global_error_handler)

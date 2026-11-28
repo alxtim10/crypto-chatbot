@@ -7,9 +7,11 @@ import html
 import logging
 from collections import Counter
 from collections.abc import Sequence
+from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from crypto_chatbot.alerts.config import load_universe
 from crypto_chatbot.analysis.service import AnalysisService
 from crypto_chatbot.bot.templates import (
     DEALING_ZONE_LABELS,
@@ -69,6 +71,8 @@ class ScannedSetupItem(BaseModel):
     wait_reason: str | None = None
     regime: Regime | None = None
     dealing_zone: DealingZone | None = None
+    snapshot_id: str | None = None
+    as_of: datetime | None = None
 
 
 class MarketScanReport(BaseModel):
@@ -106,6 +110,7 @@ async def scan_market_setups(
     timeframe: Timeframe = Timeframe.H4,
     timeframes: Sequence[Timeframe] | None = None,
     max_concurrency: int = 3,
+    snapshots_out: list[AnalysisSnapshot] | None = None,
 ) -> MarketScanReport:
     """Concurrently scan perpetual futures coins and surface deterministic READY setups."""
     normalized: list[str] = []
@@ -116,7 +121,7 @@ async def scan_market_setups(
             continue
         if canon not in normalized:
             normalized.append(canon)
-    targets = tuple(normalized) if normalized else DEFAULT_SCAN_BASKET
+    targets = tuple(normalized) if normalized else load_universe(fallback=DEFAULT_SCAN_BASKET)
     scan_tfs: tuple[Timeframe, ...] = (
         tuple(dict.fromkeys(timeframes)) if timeframes else (timeframe,)
     )
@@ -162,6 +167,8 @@ async def scan_market_setups(
                         continue
 
                     had_valid_snapshot = True
+                    if snapshots_out is not None:
+                        snapshots_out.append(snap)
                     setup = snap.trade_setup
                     item = ScannedSetupItem(
                         symbol=snap.canonical_symbol,
@@ -181,6 +188,8 @@ async def scan_market_setups(
                         wait_reason=setup.wait_reason,
                         regime=snap.regime,
                         dealing_zone=snap.smc.dealing_zone if snap.smc is not None else None,
+                        snapshot_id=snap.snapshot_id,
+                        as_of=snap.as_of,
                     )
                     if setup.status is SetupStatus.READY:
                         ready_items.append(item)

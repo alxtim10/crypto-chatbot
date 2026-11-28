@@ -434,6 +434,10 @@ class TradeSetupRow(Base):
     settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     realized_r: Mapped[float | None] = mapped_column(Double, nullable=True)
     params_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    user_action: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    user_action_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    telegram_chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    telegram_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     forward_only_guards_fired: Mapped[list[str]] = mapped_column(
         JSONB, nullable=False, default=list
     )
@@ -806,3 +810,95 @@ class NewsVoteSnapshotRow(Base):
     comments_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     attribution_text: Mapped[str] = mapped_column(Text, nullable=False)
     raw_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+
+
+class AlertRunRow(Base):
+    """Idempotent execution ledger for hourly alert worker runs (`alert_runs`)."""
+
+    __tablename__ = "alert_runs"
+    __table_args__ = (
+        UniqueConstraint("run_id", name="uq_alert_runs_run_id"),
+        Index("ix_alert_runs_status_finished", "status", "finished_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    timeframe: Mapped[str] = mapped_column(String(16), nullable=False)
+    candle_close_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="running")
+    scanned_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    ready_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    armed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    expired_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    alerted_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    held_digest_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    failed_symbols: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    symbol_errors: Mapped[dict[str, str]] = mapped_column(JSONB, nullable=False, default=dict)
+    stage_failures: Mapped[dict[str, dict[str, str]]] = mapped_column(
+        JSONB, nullable=False, default=dict
+    )
+
+
+class AlertRow(Base):
+    """Transactional outbox for Telegram setup alerts and daily digest (`alerts`)."""
+
+    __tablename__ = "alerts"
+    __table_args__ = (
+        UniqueConstraint("alert_id", name="uq_alerts_alert_id"),
+        Index("ix_alerts_status_created", "status", "created_at"),
+        Index("ix_alerts_snapshot_id", "snapshot_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    alert_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    run_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    snapshot_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    params_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    canonical_symbol: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    timeframe: Mapped[str] = mapped_column(String(16), nullable=False)
+    direction: Mapped[str] = mapped_column(String(16), nullable=False)
+    venue: Mapped[str] = mapped_column(String(32), nullable=False)
+    chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    hold_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    message_text: Mapped[str] = mapped_column(Text, nullable=False)
+    reply_markup_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    telegram_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
+    send_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class AlertSymbolStateRow(Base):
+    """Per-(symbol, timeframe) state-change, cooldown, and mute tracker (`alert_symbol_states`)."""
+
+    __tablename__ = "alert_symbol_states"
+    __table_args__ = (
+        UniqueConstraint("canonical_symbol", "timeframe", name="uq_alert_symbol_state_key"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    canonical_symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    timeframe: Mapped[str] = mapped_column(String(16), nullable=False)
+    last_status: Mapped[str] = mapped_column(String(16), nullable=False)
+    last_bias: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    last_run_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    last_alert_time_long: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_alert_time_short: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    muted_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    armed_direction: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    armed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    armed_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    armed_setup_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    last_stage_failed: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    last_stage_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

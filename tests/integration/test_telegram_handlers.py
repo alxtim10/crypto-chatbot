@@ -323,7 +323,7 @@ async def test_ptb_command_and_followup_handlers_end_to_end(
     register_handlers(app, bot)
 
     handlers = app.handlers[0]
-    assert len(handlers) == 15
+    assert len(handlers) == 16
 
     replies: list[tuple[str, Any]] = []
 
