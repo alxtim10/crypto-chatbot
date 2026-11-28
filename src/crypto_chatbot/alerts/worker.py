@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import html
-import json
 import logging
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
@@ -14,7 +13,6 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from crypto_chatbot.alerts.config import WIB, ScreenerConfig, load_universe
 from crypto_chatbot.alerts.mtf import (
-    MTF_ENGINE_VERSION,
     ArmedSetupSnapshot,
     MtfSymbolDecision,
     build_armed_setup_dict,
@@ -22,7 +20,10 @@ from crypto_chatbot.alerts.mtf import (
     make_mtf_run_id,
 )
 from crypto_chatbot.alerts.sender import TelegramOutboxSender, TelegramSendError
-from crypto_chatbot.analysis.forward_proof import DEFAULT_VARIANT_PARAMS, compute_params_sha256
+from crypto_chatbot.analysis.forward_proof import (
+    MTF_ENGINE_VERSION,
+    compute_runtime_params_bundle,
+)
 from crypto_chatbot.analysis.scanner import ScannedSetupItem, scan_market_setups
 from crypto_chatbot.analysis.service import AnalysisService
 from crypto_chatbot.bot.templates import (
@@ -53,19 +54,14 @@ def compute_active_params_sha256(
     screener_config: ScreenerConfig | None = None,
     universe: Sequence[str] | None = None,
 ) -> str:
-    """Compute canonical SHA-256 of active setup params + MTF engine version + config + universe."""
-    payload: dict[str, Any] = {
-        "setup_params_sha256": compute_params_sha256(DEFAULT_VARIANT_PARAMS["v3"]),
-        "mtf_engine_version": MTF_ENGINE_VERSION,
-        "screener_config": (
-            screener_config.model_dump(mode="json") if screener_config is not None else None
-        ),
-        "universe": list(universe) if universe is not None else None,
-    }
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(
-        "utf-8"
+    """Compute canonical SHA-256 via the shared `compute_runtime_params_bundle` function."""
+    digest, _ = compute_runtime_params_bundle(
+        variant="v3",
+        screener_config=screener_config,
+        universe=universe,
+        mtf_engine_version=MTF_ENGINE_VERSION,
     )
-    return hashlib.sha256(encoded).hexdigest()
+    return digest
 
 
 def _fmt_price(value: float | None) -> str:

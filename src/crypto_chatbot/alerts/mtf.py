@@ -15,6 +15,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from crypto_chatbot.alerts.config import MtfTimeframesConfig
+from crypto_chatbot.analysis.forward_proof import MTF_ENGINE_VERSION as MTF_ENGINE_VERSION
 from crypto_chatbot.analysis.scanner import ScannedSetupItem
 from crypto_chatbot.market_data.base import OhlcvBatch
 from crypto_chatbot.schemas.analysis import (
@@ -29,7 +30,6 @@ from crypto_chatbot.schemas.analysis import (
 from crypto_chatbot.schemas.market import MarketCandle, QualityStatus, Timeframe
 from crypto_chatbot.storage.repositories import AlertSymbolState
 
-MTF_ENGINE_VERSION = "mtf-15m-v2"
 MIN_REGIME_BARS = 114  # ATR(14) + ATR percentile(100) required by classify_regime
 
 StageName = Literal["data", "bias", "setup", "confirm", "cost_gate", "error"]
