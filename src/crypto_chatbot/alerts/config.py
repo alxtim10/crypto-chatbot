@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from crypto_chatbot.market_data.symbols import SymbolError, resolve_default_perp_symbol
 from crypto_chatbot.schemas.market import Timeframe
@@ -110,20 +110,102 @@ class QuietHoursWib(BaseModel):
         return now_mins >= start_mins or now_mins < end_mins
 
 
-class ScreenerConfig(BaseModel):
-    """Typed configuration loaded from `config/screener.yaml`."""
+class MtfTimeframesConfig(BaseModel):
+    """Multi-timeframe top-down alert configuration (bias -> setup -> confirm)."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    timeframes: tuple[Timeframe, ...] = (Timeframe.H1,)
+    bias: tuple[Timeframe, ...] = (Timeframe.H4, Timeframe.H1)
+    setup: Timeframe = Timeframe.M15
+    confirm: Timeframe = Timeframe.M5
+
+    @field_validator("bias", mode="before")
+    @classmethod
+    def _parse_bias(cls, value: object) -> tuple[Timeframe, ...]:
+        if isinstance(value, str):
+            raw = [p.strip().lower() for p in value.split(",") if p.strip()]
+        elif isinstance(value, (list, tuple)):
+            raw = [
+                item.value if isinstance(item, Timeframe) else str(item).strip().lower()
+                for item in value
+                if str(item).strip()
+            ]
+        else:
+            raise ValueError("timeframes.bias must be a list of timeframes")
+        if not raw:
+            return (Timeframe.H4, Timeframe.H1)
+        return tuple(dict.fromkeys(Timeframe(item) for item in raw))
+
+    @field_validator("setup", "confirm", mode="before")
+    @classmethod
+    def _parse_single_tf(cls, value: object) -> Timeframe:
+        if isinstance(value, Timeframe):
+            return value
+        return Timeframe(str(value).strip().lower())
+
+    @property
+    def all_timeframes(self) -> tuple[Timeframe, ...]:
+        return tuple(dict.fromkeys((*self.bias, self.setup, self.confirm)))
+
+
+class ScreenerConfig(BaseModel):
+    """Typed configuration loaded from `config/screener.yaml` (supports MTF & legacy schemas)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    cadence_minutes: int = Field(default=15, ge=1)
+    timeframes: tuple[Timeframe, ...] = (Timeframe.M15,)
+    mtf_timeframes: MtfTimeframesConfig | None = None
+    cooldown_minutes: float | None = Field(default=None, ge=0.0)
     cooldown_hours: dict[str, float] = Field(
-        default_factory=lambda: {"1h": 6.0, "4h": 12.0, "1d": 24.0}
+        default_factory=lambda: {"15m": 2.0, "1h": 6.0, "4h": 12.0, "1d": 24.0}
     )
-    default_cooldown_hours: float = Field(default=6.0, ge=0.0)
+    default_cooldown_hours: float = Field(default=2.0, ge=0.0)
     max_alerts_per_run: int = Field(default=4, ge=1)
+    setup_expiry_minutes: int = Field(default=90, ge=5)
     quiet_hours_wib: QuietHoursWib = Field(default_factory=QuietHoursWib)
-    dead_man_hours: float = Field(default=2.0, gt=0.0)
+    dead_man_hours: float = Field(default=1.0, gt=0.0)
     universe_path: str = "config/universe.txt"
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_schema_aliases(cls, data: object) -> object:
+        if not isinstance(data, dict):
+            return data
+        normalized = dict(data)
+
+        # Alias: universe_file -> universe_path
+        if "universe_file" in normalized and "universe_path" not in normalized:
+            normalized["universe_path"] = normalized.pop("universe_file")
+        elif "universe_file" in normalized:
+            normalized.pop("universe_file")
+
+        # Parse quiet_hours_wib when provided as a compact string ("23:00-06:00" or "off")
+        qh = normalized.get("quiet_hours_wib")
+        if isinstance(qh, str):
+            raw_qh = qh.strip()
+            if raw_qh.lower() in {"off", "none", "false", "0", ""}:
+                normalized["quiet_hours_wib"] = {
+                    "enabled": False,
+                    "start": "23:00",
+                    "end": "06:00",
+                }
+            elif "-" in raw_qh:
+                start_s, _, end_s = raw_qh.partition("-")
+                normalized["quiet_hours_wib"] = {
+                    "enabled": True,
+                    "start": start_s.strip(),
+                    "end": end_s.strip(),
+                }
+
+        # Parse MTF timeframes mapping: {bias: [4h, 1h], setup: 15m, confirm: 5m}
+        raw_tfs = normalized.get("timeframes")
+        if isinstance(raw_tfs, dict):
+            mtf_cfg = MtfTimeframesConfig.model_validate(raw_tfs)
+            normalized["mtf_timeframes"] = mtf_cfg
+            normalized["timeframes"] = (mtf_cfg.setup,)
+
+        return normalized
 
     @field_validator("timeframes", mode="before")
     @classmethod
@@ -137,14 +219,21 @@ class ScreenerConfig(BaseModel):
                 if str(item).strip()
             ]
         else:
-            raise ValueError("timeframes must be a list of timeframe strings")
+            raise ValueError("timeframes must be a list of timeframe strings or an MTF mapping")
         if not raw_items:
             return (Timeframe.H1,)
         return tuple(dict.fromkeys(Timeframe(item) for item in raw_items))
 
+    @property
+    def is_mtf_mode(self) -> bool:
+        return self.mtf_timeframes is not None
+
     def cooldown_for(self, timeframe: Timeframe) -> timedelta:
-        hours = self.cooldown_hours.get(timeframe.value, self.default_cooldown_hours)
-        return timedelta(hours=max(0.0, float(hours)))
+        if timeframe.value in self.cooldown_hours:
+            return timedelta(hours=max(0.0, float(self.cooldown_hours[timeframe.value])))
+        if self.cooldown_minutes is not None:
+            return timedelta(minutes=max(0.0, float(self.cooldown_minutes)))
+        return timedelta(hours=max(0.0, float(self.default_cooldown_hours)))
 
 
 def _parse_scalar(raw: str) -> Any:

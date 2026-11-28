@@ -203,10 +203,13 @@ class AlertRunRecord(BaseModel):
     status: str = "running"
     scanned_count: int = 0
     ready_count: int = 0
+    armed_count: int = 0
+    expired_count: int = 0
     alerted_count: int = 0
     held_digest_count: int = 0
     failed_symbols: tuple[str, ...] = ()
     symbol_errors: dict[str, str] = Field(default_factory=dict)
+    stage_failures: dict[str, dict[str, str]] = Field(default_factory=dict)
 
 
 class AlertRecord(BaseModel):
@@ -235,7 +238,7 @@ class AlertRecord(BaseModel):
 
 
 class AlertSymbolState(BaseModel):
-    """Per-(symbol, timeframe) state-change, cooldown, and mute tracker."""
+    """Per-(symbol, timeframe) state-change, armed-setup, cooldown, and mute tracker."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -247,6 +250,12 @@ class AlertSymbolState(BaseModel):
     last_alert_time_long: UtcDatetime | None = None
     last_alert_time_short: UtcDatetime | None = None
     muted_until: UtcDatetime | None = None
+    armed_direction: str | None = None
+    armed_at: UtcDatetime | None = None
+    armed_expires_at: UtcDatetime | None = None
+    armed_setup_json: dict[str, Any] | None = None
+    last_stage_failed: str | None = None
+    last_stage_reason: str | None = None
     updated_at: UtcDatetime
 
 
@@ -449,9 +458,14 @@ class AlertRepository(Protocol):
         held_digest_count: int,
         failed_symbols: Sequence[str],
         symbol_errors: dict[str, str],
+        armed_count: int = 0,
+        expired_count: int = 0,
+        stage_failures: dict[str, dict[str, str]] | None = None,
     ) -> None: ...
 
     def get_latest_completed_run(self) -> AlertRunRecord | None: ...
+
+    def list_recent_runs(self, *, since: datetime) -> tuple[AlertRunRecord, ...]: ...
 
     def get_symbol_state(
         self, canonical_symbol: str, timeframe: Timeframe
@@ -2651,10 +2665,13 @@ def _row_to_alert_run(row: AlertRunRow) -> AlertRunRecord:
         status=row.status,
         scanned_count=row.scanned_count,
         ready_count=row.ready_count,
+        armed_count=row.armed_count,
+        expired_count=row.expired_count,
         alerted_count=row.alerted_count,
         held_digest_count=row.held_digest_count,
         failed_symbols=tuple(row.failed_symbols or ()),
         symbol_errors=dict(row.symbol_errors or {}),
+        stage_failures={k: dict(v) for k, v in (row.stage_failures or {}).items()},
     )
 
 
@@ -2695,6 +2712,12 @@ def _row_to_alert_symbol_state(row: AlertSymbolStateRow) -> AlertSymbolState:
             _to_utc(row.last_alert_time_short) if row.last_alert_time_short else None
         ),
         muted_until=_to_utc(row.muted_until) if row.muted_until else None,
+        armed_direction=row.armed_direction,
+        armed_at=_to_utc(row.armed_at) if row.armed_at else None,
+        armed_expires_at=_to_utc(row.armed_expires_at) if row.armed_expires_at else None,
+        armed_setup_json=dict(row.armed_setup_json) if row.armed_setup_json else None,
+        last_stage_failed=row.last_stage_failed,
+        last_stage_reason=row.last_stage_reason,
         updated_at=_to_utc(row.updated_at),
     )
 
@@ -2760,10 +2783,13 @@ class PostgresAlertRepository:
                 status="running",
                 scanned_count=run.scanned_count,
                 ready_count=run.ready_count,
+                armed_count=run.armed_count,
+                expired_count=run.expired_count,
                 alerted_count=run.alerted_count,
                 held_digest_count=run.held_digest_count,
                 failed_symbols=list(run.failed_symbols),
                 symbol_errors=dict(run.symbol_errors),
+                stage_failures={k: dict(v) for k, v in run.stage_failures.items()},
             )
             .on_conflict_do_nothing(constraint="uq_alert_runs_run_id")
             .returning(AlertRunRow.id)
@@ -2783,6 +2809,9 @@ class PostgresAlertRepository:
         held_digest_count: int,
         failed_symbols: Sequence[str],
         symbol_errors: dict[str, str],
+        armed_count: int = 0,
+        expired_count: int = 0,
+        stage_failures: dict[str, dict[str, str]] | None = None,
     ) -> None:
         stmt = (
             update(AlertRunRow)
@@ -2792,10 +2821,13 @@ class PostgresAlertRepository:
                 finished_at=_to_utc(finished_at),
                 scanned_count=scanned_count,
                 ready_count=ready_count,
+                armed_count=armed_count,
+                expired_count=expired_count,
                 alerted_count=alerted_count,
                 held_digest_count=held_digest_count,
                 failed_symbols=list(failed_symbols),
                 symbol_errors=dict(symbol_errors),
+                stage_failures={k: dict(v) for k, v in (stage_failures or {}).items()},
             )
         )
         with Session(self._engine) as session, session.begin():
@@ -2811,6 +2843,16 @@ class PostgresAlertRepository:
         with Session(self._engine) as session:
             row = session.scalar(stmt)
         return _row_to_alert_run(row) if row is not None else None
+
+    def list_recent_runs(self, *, since: datetime) -> tuple[AlertRunRecord, ...]:
+        stmt = (
+            select(AlertRunRow)
+            .where(AlertRunRow.started_at >= _to_utc(since))
+            .order_by(AlertRunRow.started_at.desc(), AlertRunRow.id.desc())
+        )
+        with Session(self._engine) as session:
+            rows = list(session.scalars(stmt))
+        return tuple(_row_to_alert_run(r) for r in rows)
 
     def get_symbol_state(
         self, canonical_symbol: str, timeframe: Timeframe
@@ -2837,6 +2879,14 @@ class PostgresAlertRepository:
                 _to_utc(state.last_alert_time_short) if state.last_alert_time_short else None
             ),
             "muted_until": _to_utc(state.muted_until) if state.muted_until else None,
+            "armed_direction": state.armed_direction,
+            "armed_at": _to_utc(state.armed_at) if state.armed_at else None,
+            "armed_expires_at": (
+                _to_utc(state.armed_expires_at) if state.armed_expires_at else None
+            ),
+            "armed_setup_json": dict(state.armed_setup_json) if state.armed_setup_json else None,
+            "last_stage_failed": state.last_stage_failed,
+            "last_stage_reason": state.last_stage_reason,
             "updated_at": _to_utc(state.updated_at),
         }
         stmt = (
@@ -2870,6 +2920,12 @@ class PostgresAlertRepository:
             last_alert_time_long=existing.last_alert_time_long if existing else None,
             last_alert_time_short=existing.last_alert_time_short if existing else None,
             muted_until=_to_utc(muted_until),
+            armed_direction=existing.armed_direction if existing else None,
+            armed_at=existing.armed_at if existing else None,
+            armed_expires_at=existing.armed_expires_at if existing else None,
+            armed_setup_json=existing.armed_setup_json if existing else None,
+            last_stage_failed=existing.last_stage_failed if existing else None,
+            last_stage_reason=existing.last_stage_reason if existing else None,
             updated_at=_to_utc(now),
         )
         self.upsert_symbol_state(state)

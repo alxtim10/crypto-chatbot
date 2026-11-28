@@ -51,6 +51,54 @@ def init_db(engine: Engine) -> None:
         conn.execute(
             text("ALTER TABLE trade_setups ADD COLUMN IF NOT EXISTS telegram_message_id BIGINT;")
         )
+        conn.execute(
+            text(
+                "ALTER TABLE alert_runs "
+                "ADD COLUMN IF NOT EXISTS armed_count INTEGER NOT NULL DEFAULT 0;"
+            )
+        )
+        conn.execute(
+            text(
+                "ALTER TABLE alert_runs "
+                "ADD COLUMN IF NOT EXISTS expired_count INTEGER NOT NULL DEFAULT 0;"
+            )
+        )
+        conn.execute(
+            text(
+                "ALTER TABLE alert_runs "
+                "ADD COLUMN IF NOT EXISTS stage_failures JSONB NOT NULL DEFAULT '{}'::jsonb;"
+            )
+        )
+        conn.execute(
+            text(
+                "ALTER TABLE alert_symbol_states "
+                "ADD COLUMN IF NOT EXISTS armed_direction VARCHAR(16);"
+            )
+        )
+        conn.execute(
+            text(
+                "ALTER TABLE alert_symbol_states "
+                "ADD COLUMN IF NOT EXISTS armed_at TIMESTAMP WITH TIME ZONE;"
+            )
+        )
+        conn.execute(
+            text(
+                "ALTER TABLE alert_symbol_states "
+                "ADD COLUMN IF NOT EXISTS armed_expires_at TIMESTAMP WITH TIME ZONE;"
+            )
+        )
+        conn.execute(
+            text("ALTER TABLE alert_symbol_states ADD COLUMN IF NOT EXISTS armed_setup_json JSONB;")
+        )
+        conn.execute(
+            text(
+                "ALTER TABLE alert_symbol_states "
+                "ADD COLUMN IF NOT EXISTS last_stage_failed VARCHAR(32);"
+            )
+        )
+        conn.execute(
+            text("ALTER TABLE alert_symbol_states ADD COLUMN IF NOT EXISTS last_stage_reason TEXT;")
+        )
         conn.execute(text("ALTER TABLE llm_interactions ALTER COLUMN snapshot_id DROP NOT NULL;"))
         conn.execute(
             text("ALTER TABLE llm_interactions ADD COLUMN IF NOT EXISTS layer VARCHAR(32);")

@@ -3,6 +3,7 @@
 from crypto_chatbot.alerts.config import (
     DEFAULT_SCREENER_CONFIG_PATH,
     DEFAULT_UNIVERSE_PATH,
+    MtfTimeframesConfig,
     QuietHoursWib,
     ScreenerConfig,
     load_screener_config,
@@ -15,6 +16,7 @@ __all__ = [
     "DEFAULT_SCREENER_CONFIG_PATH",
     "DEFAULT_UNIVERSE_PATH",
     "AlertDeadManMonitor",
+    "MtfTimeframesConfig",
     "QuietHoursWib",
     "ScreenerConfig",
     "TelegramOutboxSender",

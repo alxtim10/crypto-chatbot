@@ -2356,8 +2356,9 @@ def _run_alerts(
                 else:
                     print(
                         f"alerts run [{r.timeframe.value}] {r.run_id}: scanned={r.scanned_count}, "
-                        f"ready={r.ready_count}, sent={r.sent_alerts}, "
-                        f"held={r.held_digest_alerts}, errors={len(r.failed_symbols)}"
+                        f"ready={r.ready_count}, armed={r.armed_count}, expired={r.expired_count}, "
+                        f"sent={r.sent_alerts}, held={r.held_digest_alerts}, "
+                        f"errors={len(r.failed_symbols)}"
                     )
     return 0
 

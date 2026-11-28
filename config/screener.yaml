@@ -5,6 +5,12 @@ timeframes:
   setup: 15m
   confirm: 5m
 cooldown_minutes: 120
+cooldown_hours:
+  15m: 2
+  1h: 6
+  4h: 12
+  1d: 24
 max_alerts_per_run: 3
 setup_expiry_minutes: 90
+dead_man_hours: 1
 quiet_hours_wib: "23:00-06:00"

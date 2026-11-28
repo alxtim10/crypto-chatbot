@@ -94,6 +94,9 @@ class _InMemoryAlertRepo:
         held_digest_count: int,
         failed_symbols: Sequence[str],
         symbol_errors: dict[str, str],
+        armed_count: int = 0,
+        expired_count: int = 0,
+        stage_failures: dict[str, dict[str, str]] | None = None,
     ) -> None:
         prev = self.runs[run_id]
         self.runs[run_id] = prev.model_copy(
@@ -102,10 +105,13 @@ class _InMemoryAlertRepo:
                 "finished_at": finished_at,
                 "scanned_count": scanned_count,
                 "ready_count": ready_count,
+                "armed_count": armed_count,
+                "expired_count": expired_count,
                 "alerted_count": alerted_count,
                 "held_digest_count": held_digest_count,
                 "failed_symbols": tuple(failed_symbols),
                 "symbol_errors": dict(symbol_errors),
+                "stage_failures": {k: dict(v) for k, v in (stage_failures or {}).items()},
             }
         )
 
@@ -116,6 +122,9 @@ class _InMemoryAlertRepo:
         if not completed:
             return None
         return max(completed, key=lambda r: r.finished_at or datetime.min.replace(tzinfo=UTC))
+
+    def list_recent_runs(self, *, since: datetime) -> tuple[AlertRunRecord, ...]:
+        return tuple(r for r in self.runs.values() if r.started_at >= since)
 
     def get_symbol_state(
         self, canonical_symbol: str, timeframe: Timeframe
@@ -414,10 +423,13 @@ def test_universe_and_screener_yaml_loading(monkeypatch: pytest.MonkeyPatch) -> 
     assert "INIT/USDT:USDT" in universe
 
     cfg = load_screener_config()
-    assert cfg.timeframes == (Timeframe.H1,)
+    assert cfg.is_mtf_mode is True
+    assert cfg.timeframes == (Timeframe.M15,)
+    assert cfg.cooldown_for(Timeframe.M15) == timedelta(hours=2)
     assert cfg.cooldown_for(Timeframe.H1) == timedelta(hours=6)
-    assert cfg.max_alerts_per_run == 4
-    assert cfg.dead_man_hours == 2.0
+    assert cfg.max_alerts_per_run == 3
+    assert cfg.setup_expiry_minutes == 90
+    assert cfg.dead_man_hours == 1.0
 
     # Quiet hours WIB wrap (23:00 - 06:00 WIB)
     qh = QuietHoursWib(enabled=True, start="23:00", end="06:00")

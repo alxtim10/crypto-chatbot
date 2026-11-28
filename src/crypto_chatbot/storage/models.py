@@ -830,10 +830,15 @@ class AlertRunRow(Base):
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="running")
     scanned_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     ready_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    armed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    expired_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     alerted_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     held_digest_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     failed_symbols: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
     symbol_errors: Mapped[dict[str, str]] = mapped_column(JSONB, nullable=False, default=dict)
+    stage_failures: Mapped[dict[str, dict[str, str]]] = mapped_column(
+        JSONB, nullable=False, default=dict
+    )
 
 
 class AlertRow(Base):
@@ -888,4 +893,12 @@ class AlertSymbolStateRow(Base):
         DateTime(timezone=True), nullable=True
     )
     muted_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    armed_direction: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    armed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    armed_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    armed_setup_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    last_stage_failed: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    last_stage_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

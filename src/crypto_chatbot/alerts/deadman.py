@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 
 class AlertDeadManMonitor:
-    """Periodic check that sends a 🔧 warning if no successful `alerts run` occurred in 2h."""
+    """Periodic check that sends a 🔧 warning if no successful `alerts run` occurred recently."""
 
     def __init__(
         self,
@@ -23,8 +23,8 @@ class AlertDeadManMonitor:
         alert_repo: AlertRepository,
         sender: TelegramOutboxSender,
         chat_id: int,
-        max_silence_hours: float = 2.0,
-        check_interval_seconds: float = 900.0,
+        max_silence_hours: float = 1.0,
+        check_interval_seconds: float = 600.0,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._alert_repo = alert_repo
@@ -59,7 +59,7 @@ class AlertDeadManMonitor:
             return False
 
         msg = (
-            "🔧 <b>Dead-Man Alert: Hourly Worker Tidak Aktif</b>\n"
+            "🔧 <b>Dead-Man Alert: Alert Worker Tidak Aktif</b>\n"
             f"Tidak ada eksekusi sukses <code>alerts run</code> dalam "
             f"{self._max_silence.total_seconds() / 3600.0:.1f} jam terakhir ({detail}).\n"
             "Periksa systemd timer / log VPS."
