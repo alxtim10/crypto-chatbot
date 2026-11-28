@@ -11,6 +11,8 @@ Related documents:
 - `docs/decisions/0007-shadow-inference-and-release.md`: accepted Phase 13 shadow inference, parity, monitoring, abstention, and rollback rules (binding).
 - `docs/decisions/0008-production-hardening.md`: production hardening decisions (superseded by ADR 0009 for personal-only scope).
 - `docs/decisions/0009-personal-mode-simplification.md`: accepted personal-only scope, single-owner allowlist, and overhead pruning (binding).
+- `docs/decisions/0013-perpetual-futures-primary-and-macro-benchmarks.md`: accepted perpetual futures primary venue and macro benchmark rules (binding).
+- `docs/decisions/0014-scalp-v1-strategy.md`: accepted pivot of active alert strategy to `scalp_v1` (`docs/SCALP-SPEC-v1.md`, binding).
 - `AGENTS.md`: always-on agent rules and project commands.
 - `.agents/skills/crypto-research-engineer/SKILL.md`: engineering rules.
 - `.agents/skills/socratic-tutor/SKILL.md`: opt-in tutoring mode.
@@ -36,6 +38,7 @@ Update this table in the completion report of every phase. Status values: `Not s
 | 12 | Offline ML | Done |
 | 13 | Shadow inference and optional release | Done |
 | 14 | Production hardening | Done (simplified to personal-only scope per ADR 0009; public-launch hardening deferred) |
+| 15 | `scalp_v1` strategy migration (SC-01..SC-14) | Done (ADR 0014; offline/code complete, live 12m Gate 1m bulk backtest & shadow rollout pending owner execution) |
 
 ## 1. Product definition
 

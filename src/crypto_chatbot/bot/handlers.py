@@ -812,21 +812,23 @@ class BotService:
 
         now_utc = self._clock().astimezone(UTC)
 
-        if action == "tk":
+        if action in {"tk", "ps"}:
+            recorded_action = "pasang" if action == "ps" else "ambil"
             if self._setup_repository is not None and hasattr(
                 self._setup_repository, "record_user_action"
             ):
                 self._setup_repository.record_user_action(
                     alert.snapshot_id,
-                    action="ambil",
+                    action=recorded_action,
                     acted_at=now_utc,
                 )
             tf_str = html.escape(alert.timeframe.value)
             dir_str = html.escape(alert.direction.upper())
+            lbl = recorded_action.upper()
             return (
-                "Dicatat: AMBIL",
+                f"Dicatat: {lbl}",
                 (
-                    f"✅ Dicatat <b>AMBIL</b> untuk {html.escape(alert.canonical_symbol)} "
+                    f"✅ Dicatat <b>{lbl}</b> untuk {html.escape(alert.canonical_symbol)} "
                     f"({tf_str} · {dir_str}).\n"
                     f"<i>Ledger: {html.escape(alert.snapshot_id)}</i>",
                 ),
@@ -852,8 +854,9 @@ class BotService:
                 ),
             )
 
-        if action == "mt":
-            muted_until = now_utc + timedelta(hours=24)
+        if action in {"mt", "m1"}:
+            mute_hours = 1 if action == "m1" else 24
+            muted_until = now_utc + timedelta(hours=mute_hours)
             self._alert_repository.mute_symbol(
                 alert.canonical_symbol,
                 alert.timeframe,

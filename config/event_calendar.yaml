@@ -1,0 +1,12 @@
+# Scheduled high-impact macro events (UTC) — SCALP-SPEC-v1 §6
+# Default blocking window: -15 min before to +30 min after event_time_utc.
+# Update monthly with CPI, FOMC, NFP, PPI, and major crypto-specific catalysts.
+events:
+  - name: "US NFP (Dec 2026)"
+    event_time_utc: "2026-12-04T13:30:00Z"
+  - name: "US CPI (Dec 2026)"
+    event_time_utc: "2026-12-10T13:30:00Z"
+  - name: "FOMC Rate Decision (Dec 2026)"
+    event_time_utc: "2026-12-16T19:00:00Z"
+    pre_minutes: 15
+    post_minutes: 45

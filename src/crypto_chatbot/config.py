@@ -82,6 +82,8 @@ class Settings(BaseSettings):
     alert_chat_id: int | None = Field(default=None)
     screener_config_path: str = Field(default="config/screener.yaml")
     universe_path: str = Field(default="config/universe.txt")
+    scalp_equity_usd: float | None = Field(default=None, gt=0.0)
+    scalp_risk_per_trade_pct: float | None = Field(default=None, gt=0.0, le=5.0)
 
     @field_validator("futures_exchange", mode="before")
     @classmethod

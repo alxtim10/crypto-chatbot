@@ -74,14 +74,36 @@ def compute_runtime_params_bundle(
     - normalized `universe.txt` symbol list (`universe_sha256`)
     """
     key = variant.strip().lower()
+    if key == "scalp_v1" or (
+        screener_config is not None and getattr(screener_config, "is_scalp_mode", False)
+    ):
+        from crypto_chatbot.scalp.config import DEFAULT_SCALP_UNIVERSE, ScalpConfig
+        from crypto_chatbot.scalp.freeze import SCALP_ENGINE_VERSION, compute_scalp_params_bundle
+
+        scalp_cfg = getattr(screener_config, "scalp", None) if screener_config is not None else None
+        if not isinstance(scalp_cfg, ScalpConfig):
+            scalp_cfg = ScalpConfig()
+        resolved_u = tuple(universe) if universe is not None else DEFAULT_SCALP_UNIVERSE
+        digest, scalp_comp = compute_scalp_params_bundle(
+            scalp_config=scalp_cfg,
+            universe=resolved_u,
+            engine_version=SCALP_ENGINE_VERSION,
+        )
+        return digest, {
+            "setup_params": scalp_comp["spec_params"],
+            "setup_params_sha256": scalp_comp["spec_params_sha256"],
+            "mtf_engine_version": scalp_comp["engine_version"],
+            "screener_config_sha256": scalp_comp["cost_config_sha256"],
+            "universe_sha256": scalp_comp["universe_sha256"],
+        }
+
     if params_override is not None:
         setup_params = dict(params_override)
     elif key in DEFAULT_VARIANT_PARAMS:
         setup_params = dict(DEFAULT_VARIANT_PARAMS[key])
     else:
-        raise ValueError(
-            f"Unknown variant {variant!r}; expected one of {sorted(DEFAULT_VARIANT_PARAMS)}"
-        )
+        allowed = sorted((*DEFAULT_VARIANT_PARAMS, "scalp_v1"))
+        raise ValueError(f"Unknown variant {variant!r}; expected one of {allowed}")
 
     setup_sha = compute_params_sha256(setup_params)
     screener_sha: str | None = None

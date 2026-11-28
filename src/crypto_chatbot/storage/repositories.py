@@ -66,6 +66,8 @@ from crypto_chatbot.storage.models import (
     NewsVoteSnapshotRow,
     OpenInterestRow,
     OrderBookSnapshotRow,
+    ScalpDecisionRow,
+    ScalpUniverseSnapshotRow,
     SentimentObservationRow,
     TradeSetupRow,
     TradingViewPacketRow,
@@ -184,6 +186,11 @@ class TradeSetupRecord(BaseModel):
     settled_at: UtcDatetime | None = None
     realized_r: float | None = None
     params_sha256: str | None = None
+    strategy: str = "swing_mtf"
+    mode: str | None = None
+    cost_bps: float | None = None
+    cost_pct_r: float | None = None
+    features_json: dict[str, Any] | None = None
     user_action: str | None = None
     user_action_at: UtcDatetime | None = None
     telegram_chat_id: int | None = None
@@ -196,6 +203,7 @@ class AlertRunRecord(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     run_id: str
+    strategy: str = "swing_mtf"
     timeframe: Timeframe
     candle_close_time: UtcDatetime
     started_at: UtcDatetime
@@ -219,6 +227,7 @@ class AlertRecord(BaseModel):
 
     alert_id: str
     run_id: str
+    strategy: str = "swing_mtf"
     snapshot_id: str
     params_sha256: str | None = None
     canonical_symbol: str
@@ -244,6 +253,7 @@ class AlertSymbolState(BaseModel):
 
     canonical_symbol: str
     timeframe: Timeframe
+    strategy: str = "swing_mtf"
     last_status: str
     last_bias: str | None = None
     last_run_id: str | None = None
@@ -1426,6 +1436,7 @@ class PostgresDerivativesRepository:
 
 
 def _row_to_setup_record(row: TradeSetupRow) -> TradeSetupRecord:
+    raw_features = getattr(row, "features_json", None)
     return TradeSetupRecord(
         snapshot_id=row.snapshot_id,
         venue=row.venue,
@@ -1452,6 +1463,11 @@ def _row_to_setup_record(row: TradeSetupRow) -> TradeSetupRecord:
         settled_at=_to_utc(row.settled_at) if row.settled_at else None,
         realized_r=row.realized_r,
         params_sha256=getattr(row, "params_sha256", None),
+        strategy=getattr(row, "strategy", "swing_mtf") or "swing_mtf",
+        mode=getattr(row, "mode", None),
+        cost_bps=getattr(row, "cost_bps", None),
+        cost_pct_r=getattr(row, "cost_pct_r", None),
+        features_json=dict(raw_features) if isinstance(raw_features, dict) else None,
         user_action=getattr(row, "user_action", None),
         user_action_at=(_to_utc(row.user_action_at) if row.user_action_at is not None else None),
         telegram_chat_id=getattr(row, "telegram_chat_id", None),
@@ -1471,6 +1487,12 @@ class PostgresSetupLogRepository:
         setup: TradeSetup,
         *,
         params_sha256: str | None = None,
+        strategy: str = "swing_mtf",
+        mode: str | None = None,
+        cost_bps: float | None = None,
+        cost_pct_r: float | None = None,
+        features_json: dict[str, Any] | None = None,
+        user_action: str | None = None,
     ) -> bool:
         if snapshot.technical is None:
             return False
@@ -1501,6 +1523,12 @@ class PostgresSetupLogRepository:
             "settled_at": None,
             "realized_r": None,
             "params_sha256": params_sha256,
+            "strategy": strategy,
+            "mode": mode,
+            "cost_bps": cost_bps,
+            "cost_pct_r": cost_pct_r,
+            "features_json": dict(features_json) if features_json is not None else None,
+            "user_action": user_action,
         }
         stmt = (
             insert(TradeSetupRow)
@@ -1515,7 +1543,7 @@ class PostgresSetupLogRepository:
         self,
         snapshot_id: str,
         *,
-        action: Literal["ambil", "skip"],
+        action: Literal["ambil", "pasang", "skip", "shadow", "shadow_expired"],
         acted_at: datetime | None = None,
     ) -> bool:
         stmt = (
@@ -1555,15 +1583,20 @@ class PostgresSetupLogRepository:
             row = session.scalar(stmt)
         return _row_to_setup_record(row) if row is not None else None
 
-    def list_pending_setups(self, *, limit: int = 100) -> tuple[TradeSetupRecord, ...]:
+    def list_pending_setups(
+        self,
+        *,
+        limit: int = 100,
+        strategy: str | None = None,
+    ) -> tuple[TradeSetupRecord, ...]:
         if limit < 1:
             raise ValueError("limit must be >= 1")
-        stmt = (
-            select(TradeSetupRow)
-            .where(TradeSetupRow.outcome_status.in_(("pending", "entry_triggered")))
-            .order_by(TradeSetupRow.as_of.asc())
-            .limit(limit)
+        stmt = select(TradeSetupRow).where(
+            TradeSetupRow.outcome_status.in_(("pending", "entry_triggered"))
         )
+        if strategy is not None:
+            stmt = stmt.where(TradeSetupRow.strategy == strategy)
+        stmt = stmt.order_by(TradeSetupRow.as_of.asc()).limit(limit)
         with Session(self._engine) as session:
             rows = list(session.scalars(stmt))
         return tuple(_row_to_setup_record(row) for row in rows)
@@ -1573,6 +1606,7 @@ class PostgresSetupLogRepository:
         *,
         canonical_symbol: str | None = None,
         timeframe: Timeframe | None = None,
+        strategy: str | None = None,
         limit: int = 20,
     ) -> tuple[TradeSetupRecord, ...]:
         if limit < 1:
@@ -1582,6 +1616,8 @@ class PostgresSetupLogRepository:
             stmt = stmt.where(TradeSetupRow.canonical_symbol == canonical_symbol)
         if timeframe is not None:
             stmt = stmt.where(TradeSetupRow.timeframe == timeframe.value)
+        if strategy is not None:
+            stmt = stmt.where(TradeSetupRow.strategy == strategy)
         stmt = stmt.order_by(TradeSetupRow.as_of.desc(), TradeSetupRow.id.desc()).limit(limit)
         with Session(self._engine) as session:
             rows = list(session.scalars(stmt))
@@ -2691,6 +2727,7 @@ class PostgresFearGreedRepository:
 def _row_to_alert_run(row: AlertRunRow) -> AlertRunRecord:
     return AlertRunRecord(
         run_id=row.run_id,
+        strategy=getattr(row, "strategy", "swing_mtf") or "swing_mtf",
         timeframe=Timeframe(row.timeframe),
         candle_close_time=_to_utc(row.candle_close_time),
         started_at=_to_utc(row.started_at),
@@ -2712,6 +2749,7 @@ def _row_to_alert(row: AlertRow) -> AlertRecord:
     return AlertRecord(
         alert_id=row.alert_id,
         run_id=row.run_id,
+        strategy=getattr(row, "strategy", "swing_mtf") or "swing_mtf",
         snapshot_id=row.snapshot_id,
         params_sha256=row.params_sha256,
         canonical_symbol=row.canonical_symbol,
@@ -2735,6 +2773,7 @@ def _row_to_alert_symbol_state(row: AlertSymbolStateRow) -> AlertSymbolState:
     return AlertSymbolState(
         canonical_symbol=row.canonical_symbol,
         timeframe=Timeframe(row.timeframe),
+        strategy=getattr(row, "strategy", "swing_mtf") or "swing_mtf",
         last_status=row.last_status,
         last_bias=row.last_bias,
         last_run_id=row.last_run_id,
@@ -2809,6 +2848,7 @@ class PostgresAlertRepository:
             insert(AlertRunRow)
             .values(
                 run_id=run.run_id,
+                strategy=run.strategy,
                 timeframe=run.timeframe.value,
                 candle_close_time=_to_utc(run.candle_close_time),
                 started_at=_to_utc(run.started_at),
@@ -2969,6 +3009,7 @@ class PostgresAlertRepository:
             .values(
                 alert_id=alert.alert_id,
                 run_id=alert.run_id,
+                strategy=alert.strategy,
                 snapshot_id=alert.snapshot_id,
                 params_sha256=alert.params_sha256,
                 canonical_symbol=alert.canonical_symbol,
@@ -3086,3 +3127,169 @@ class PostgresAlertRepository:
         with Session(self._engine) as session:
             row = session.scalar(stmt)
         return _row_to_alert(row) if row is not None else None
+
+
+class ScalpDecisionRecord(BaseModel):
+    """Persisted point-in-time decision & feature snapshot (`scalp_decisions`, SC-07)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    decision_id: str
+    run_id: str
+    strategy: str = "scalp_v1"
+    venue: str
+    canonical_symbol: str
+    decision_time: UtcDatetime
+    mode: str
+    decision_status: Literal["READY", "WAIT", "NO_TRADE"]
+    direction: Literal["long", "short"] | None = None
+    reason_codes: tuple[str, ...] = ()
+    mode_inputs_json: dict[str, Any] = Field(default_factory=dict)
+    features_json: dict[str, Any] = Field(default_factory=dict)
+    cost_breakdown_json: dict[str, Any] | None = None
+    setup_json: dict[str, Any] | None = None
+    params_sha256: str | None = None
+    created_at: UtcDatetime
+
+
+class ScalpUniverseSnapshotRecord(BaseModel):
+    """Weekly point-in-time scalp universe eligibility snapshot (`scalp_universe_snapshots`)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    strategy: str = "scalp_v1"
+    snapshot_week_utc: str
+    venue: str
+    captured_at: UtcDatetime
+    eligible_symbols: tuple[str, ...] = ()
+    evaluations_json: tuple[dict[str, Any], ...] = ()
+    rules_json: dict[str, Any] = Field(default_factory=dict)
+
+
+class PostgresScalpDecisionRepository:
+    """PostgreSQL persistence for point-in-time `scalp_decisions` rows (SC-07)."""
+
+    def __init__(self, engine: Engine) -> None:
+        self._engine = engine
+
+    def save_decision(self, decision: ScalpDecisionRecord) -> bool:
+        stmt = (
+            insert(ScalpDecisionRow)
+            .values(
+                decision_id=decision.decision_id,
+                run_id=decision.run_id,
+                strategy=decision.strategy,
+                venue=decision.venue,
+                canonical_symbol=decision.canonical_symbol,
+                decision_time=_to_utc(decision.decision_time),
+                mode=decision.mode,
+                decision_status=decision.decision_status,
+                direction=decision.direction,
+                reason_codes=list(decision.reason_codes),
+                mode_inputs_json=dict(decision.mode_inputs_json),
+                features_json=dict(decision.features_json),
+                cost_breakdown_json=(
+                    dict(decision.cost_breakdown_json)
+                    if decision.cost_breakdown_json is not None
+                    else None
+                ),
+                setup_json=(dict(decision.setup_json) if decision.setup_json is not None else None),
+                params_sha256=decision.params_sha256,
+                created_at=_to_utc(decision.created_at),
+            )
+            .on_conflict_do_nothing(constraint="uq_scalp_decisions_decision_id")
+            .returning(ScalpDecisionRow.id)
+        )
+        with Session(self._engine) as session, session.begin():
+            return bool(session.scalars(stmt).all())
+
+    def list_decisions(
+        self,
+        *,
+        strategy: str = "scalp_v1",
+        since: datetime | None = None,
+        canonical_symbol: str | None = None,
+        limit: int = 500,
+    ) -> tuple[ScalpDecisionRecord, ...]:
+        stmt = select(ScalpDecisionRow).where(ScalpDecisionRow.strategy == strategy)
+        if since is not None:
+            stmt = stmt.where(ScalpDecisionRow.decision_time >= _to_utc(since))
+        if canonical_symbol is not None:
+            stmt = stmt.where(ScalpDecisionRow.canonical_symbol == canonical_symbol)
+        stmt = stmt.order_by(
+            ScalpDecisionRow.decision_time.desc(), ScalpDecisionRow.id.desc()
+        ).limit(max(1, limit))
+        with Session(self._engine) as session:
+            rows = list(session.scalars(stmt))
+        return tuple(
+            ScalpDecisionRecord(
+                decision_id=r.decision_id,
+                run_id=r.run_id,
+                strategy=r.strategy,
+                venue=r.venue,
+                canonical_symbol=r.canonical_symbol,
+                decision_time=_to_utc(r.decision_time),
+                mode=r.mode,
+                decision_status=r.decision_status,  # type: ignore[arg-type]
+                direction=r.direction,  # type: ignore[arg-type]
+                reason_codes=tuple(r.reason_codes or ()),
+                mode_inputs_json=dict(r.mode_inputs_json or {}),
+                features_json=dict(r.features_json or {}),
+                cost_breakdown_json=(
+                    dict(r.cost_breakdown_json) if r.cost_breakdown_json is not None else None
+                ),
+                setup_json=dict(r.setup_json) if r.setup_json is not None else None,
+                params_sha256=r.params_sha256,
+                created_at=_to_utc(r.created_at),
+            )
+            for r in rows
+        )
+
+
+class PostgresScalpUniverseRepository:
+    """PostgreSQL persistence for weekly PIT `scalp_universe_snapshots` (SC-03)."""
+
+    def __init__(self, engine: Engine) -> None:
+        self._engine = engine
+
+    def save_snapshot(self, snap: ScalpUniverseSnapshotRecord) -> bool:
+        stmt = (
+            insert(ScalpUniverseSnapshotRow)
+            .values(
+                strategy=snap.strategy,
+                snapshot_week_utc=snap.snapshot_week_utc,
+                venue=snap.venue,
+                captured_at=_to_utc(snap.captured_at),
+                eligible_symbols=list(snap.eligible_symbols),
+                evaluations_json=[dict(e) for e in snap.evaluations_json],
+                rules_json=dict(snap.rules_json),
+            )
+            .on_conflict_do_nothing(constraint="uq_scalp_universe_snapshot_week")
+            .returning(ScalpUniverseSnapshotRow.id)
+        )
+        with Session(self._engine) as session, session.begin():
+            return bool(session.scalars(stmt).all())
+
+    def get_latest_snapshot(
+        self, *, strategy: str = "scalp_v1", venue: str | None = None
+    ) -> ScalpUniverseSnapshotRecord | None:
+        stmt = select(ScalpUniverseSnapshotRow).where(ScalpUniverseSnapshotRow.strategy == strategy)
+        if venue is not None:
+            stmt = stmt.where(ScalpUniverseSnapshotRow.venue == venue)
+        stmt = stmt.order_by(
+            ScalpUniverseSnapshotRow.captured_at.desc(),
+            ScalpUniverseSnapshotRow.id.desc(),
+        ).limit(1)
+        with Session(self._engine) as session:
+            row = session.scalar(stmt)
+        if row is None:
+            return None
+        return ScalpUniverseSnapshotRecord(
+            strategy=row.strategy,
+            snapshot_week_utc=row.snapshot_week_utc,
+            venue=row.venue,
+            captured_at=_to_utc(row.captured_at),
+            eligible_symbols=tuple(row.eligible_symbols or ()),
+            evaluations_json=tuple(dict(e) for e in (row.evaluations_json or ())),
+            rules_json=dict(row.rules_json or {}),
+        )

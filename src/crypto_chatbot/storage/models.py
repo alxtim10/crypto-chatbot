@@ -434,7 +434,12 @@ class TradeSetupRow(Base):
     settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     realized_r: Mapped[float | None] = mapped_column(Double, nullable=True)
     params_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    user_action: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    strategy: Mapped[str] = mapped_column(String(32), nullable=False, default="swing_mtf")
+    mode: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    cost_bps: Mapped[float | None] = mapped_column(Double, nullable=True)
+    cost_pct_r: Mapped[float | None] = mapped_column(Double, nullable=True)
+    features_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    user_action: Mapped[str | None] = mapped_column(String(32), nullable=True)
     user_action_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     telegram_chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     telegram_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
@@ -823,6 +828,7 @@ class AlertRunRow(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     run_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    strategy: Mapped[str] = mapped_column(String(32), nullable=False, default="swing_mtf")
     timeframe: Mapped[str] = mapped_column(String(16), nullable=False)
     candle_close_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -854,6 +860,7 @@ class AlertRow(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     alert_id: Mapped[str] = mapped_column(String(64), nullable=False)
     run_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    strategy: Mapped[str] = mapped_column(String(32), nullable=False, default="swing_mtf")
     snapshot_id: Mapped[str] = mapped_column(String(64), nullable=False)
     params_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     canonical_symbol: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
@@ -883,6 +890,7 @@ class AlertSymbolStateRow(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     canonical_symbol: Mapped[str] = mapped_column(String(64), nullable=False)
     timeframe: Mapped[str] = mapped_column(String(16), nullable=False)
+    strategy: Mapped[str] = mapped_column(String(32), nullable=False, default="swing_mtf")
     last_status: Mapped[str] = mapped_column(String(16), nullable=False)
     last_bias: Mapped[str | None] = mapped_column(String(16), nullable=True)
     last_run_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
@@ -902,3 +910,58 @@ class AlertSymbolStateRow(Base):
     last_stage_failed: Mapped[str | None] = mapped_column(String(32), nullable=True)
     last_stage_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ScalpDecisionRow(Base):
+    """Point-in-time decision & feature log for `scalp_v1` (SC-07, READY / WAIT / NO_TRADE)."""
+
+    __tablename__ = "scalp_decisions"
+    __table_args__ = (
+        UniqueConstraint("decision_id", name="uq_scalp_decisions_decision_id"),
+        Index("ix_scalp_decisions_lookup", "strategy", "canonical_symbol", "decision_time"),
+        Index("ix_scalp_decisions_run_id", "run_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    decision_id: Mapped[str] = mapped_column(String(96), nullable=False)
+    run_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    strategy: Mapped[str] = mapped_column(String(32), nullable=False, default="scalp_v1")
+    venue: Mapped[str] = mapped_column(String(32), nullable=False)
+    canonical_symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    decision_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    mode: Mapped[str] = mapped_column(String(32), nullable=False)
+    decision_status: Mapped[str] = mapped_column(String(16), nullable=False)
+    direction: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    reason_codes: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    mode_inputs_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    features_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    cost_breakdown_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    setup_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    params_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ScalpUniverseSnapshotRow(Base):
+    """Weekly point-in-time universe eligibility snapshot for `scalp_v1` (SC-03)."""
+
+    __tablename__ = "scalp_universe_snapshots"
+    __table_args__ = (
+        UniqueConstraint(
+            "strategy",
+            "snapshot_week_utc",
+            "venue",
+            name="uq_scalp_universe_snapshot_week",
+        ),
+        Index("ix_scalp_universe_lookup", "strategy", "captured_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    strategy: Mapped[str] = mapped_column(String(32), nullable=False, default="scalp_v1")
+    snapshot_week_utc: Mapped[str] = mapped_column(String(16), nullable=False)
+    venue: Mapped[str] = mapped_column(String(32), nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    eligible_symbols: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    evaluations_json: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, nullable=False, default=list
+    )
+    rules_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)

@@ -423,13 +423,15 @@ def test_universe_and_screener_yaml_loading(monkeypatch: pytest.MonkeyPatch) -> 
     assert "INIT/USDT:USDT" in universe
 
     cfg = load_screener_config()
-    assert cfg.is_mtf_mode is True
+    assert cfg.is_scalp_mode is True
+    assert cfg.is_mtf_mode is False
     assert cfg.timeframes == (Timeframe.M15,)
     assert cfg.cooldown_for(Timeframe.M15) == timedelta(hours=2)
     assert cfg.cooldown_for(Timeframe.H1) == timedelta(hours=6)
     assert cfg.max_alerts_per_run == 3
     assert cfg.setup_expiry_minutes == 90
     assert cfg.dead_man_hours == 1.0
+    assert cfg.effective_dead_man_minutes == 15.0
 
     # Quiet hours WIB wrap (23:00 - 06:00 WIB)
     qh = QuietHoursWib(enabled=True, start="23:00", end="06:00")

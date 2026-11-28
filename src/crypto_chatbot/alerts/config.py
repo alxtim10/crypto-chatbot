@@ -6,11 +6,12 @@ import os
 from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from crypto_chatbot.market_data.symbols import SymbolError, resolve_default_perp_symbol
+from crypto_chatbot.scalp.config import ScalpConfig
 from crypto_chatbot.schemas.market import Timeframe
 
 WIB = timezone(timedelta(hours=7))
@@ -149,10 +150,11 @@ class MtfTimeframesConfig(BaseModel):
 
 
 class ScreenerConfig(BaseModel):
-    """Typed configuration loaded from `config/screener.yaml` (supports MTF & legacy schemas)."""
+    """Typed configuration loaded from `config/screener.yaml` (supports scalp_v1, MTF & legacy)."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
+    strategy: Literal["scalp_v1", "swing_mtf"] = "swing_mtf"
     cadence_minutes: int = Field(default=15, ge=1)
     timeframes: tuple[Timeframe, ...] = (Timeframe.M15,)
     mtf_timeframes: MtfTimeframesConfig | None = None
@@ -165,7 +167,9 @@ class ScreenerConfig(BaseModel):
     setup_expiry_minutes: int = Field(default=90, ge=5)
     quiet_hours_wib: QuietHoursWib = Field(default_factory=QuietHoursWib)
     dead_man_hours: float = Field(default=1.0, gt=0.0)
+    dead_man_minutes: float | None = Field(default=None, gt=0.0)
     universe_path: str = "config/universe.txt"
+    scalp: ScalpConfig = Field(default_factory=ScalpConfig)
 
     @model_validator(mode="before")
     @classmethod
@@ -225,8 +229,26 @@ class ScreenerConfig(BaseModel):
         return tuple(dict.fromkeys(Timeframe(item) for item in raw_items))
 
     @property
+    def is_scalp_mode(self) -> bool:
+        return self.strategy == "scalp_v1"
+
+    @property
     def is_mtf_mode(self) -> bool:
-        return self.mtf_timeframes is not None
+        return self.strategy == "swing_mtf" and self.mtf_timeframes is not None
+
+    @property
+    def effective_dead_man_minutes(self) -> float:
+        if self.dead_man_minutes is not None:
+            return float(self.dead_man_minutes)
+        if self.is_scalp_mode:
+            return 15.0
+        return float(self.dead_man_hours) * 60.0
+
+    @property
+    def effective_universe_path(self) -> str:
+        if self.is_scalp_mode:
+            return self.scalp.universe_path
+        return self.universe_path
 
     def cooldown_for(self, timeframe: Timeframe) -> timedelta:
         if timeframe.value in self.cooldown_hours:
@@ -265,9 +287,10 @@ def _parse_scalar(raw: str) -> Any:
 
 
 def _parse_simple_yaml(text: str) -> dict[str, Any]:
-    """Parse a clean subset of YAML (top-level keys, 1-level nested dicts/lists, comments)."""
+    """Parse a clean YAML subset (top-level keys, up to 2-level nested dicts/lists, comments)."""
     root: dict[str, Any] = {}
     current_key: str | None = None
+    current_subkey: str | None = None
     for raw_line in text.splitlines():
         stripped = raw_line.strip()
         if not stripped or stripped.startswith("#"):
@@ -286,13 +309,25 @@ def _parse_simple_yaml(text: str) -> dict[str, Any]:
             key, _, rest = stripped.partition(":")
             key = key.strip()
             rest = rest.strip()
+            current_subkey = None
             if rest:
                 root[key] = _parse_scalar(rest)
                 current_key = None
             else:
                 current_key = key
         elif current_key is not None:
-            if stripped.startswith("- "):
+            if indent >= 4 and current_subkey is not None and ":" in stripped:
+                sub2_k, _, sub2_v = stripped.partition(":")
+                parent_map = root.get(current_key)
+                if not isinstance(parent_map, dict):
+                    parent_map = {}
+                    root[current_key] = parent_map
+                nested_map = parent_map.get(current_subkey)
+                if not isinstance(nested_map, dict):
+                    nested_map = {}
+                    parent_map[current_subkey] = nested_map
+                nested_map[sub2_k.strip()] = _parse_scalar(sub2_v)
+            elif stripped.startswith("- "):
                 item_val = _parse_scalar(stripped[2:])
                 existing = root.get(current_key)
                 if not isinstance(existing, list):
@@ -301,11 +336,18 @@ def _parse_simple_yaml(text: str) -> dict[str, Any]:
                 existing.append(item_val)
             elif ":" in stripped:
                 sub_k, _, sub_v = stripped.partition(":")
+                sub_k = sub_k.strip()
+                sub_v = sub_v.strip()
                 existing_map = root.get(current_key)
                 if not isinstance(existing_map, dict):
                     existing_map = {}
                     root[current_key] = existing_map
-                existing_map[sub_k.strip()] = _parse_scalar(sub_v)
+                if sub_v:
+                    existing_map[sub_k] = _parse_scalar(sub_v)
+                    current_subkey = None
+                else:
+                    existing_map[sub_k] = {}
+                    current_subkey = sub_k
     return root
 
 
@@ -325,6 +367,48 @@ def _apply_quiet_hours_env(cfg_dict: dict[str, Any]) -> None:
         }
 
 
+def _read_env_file_values(env_path: Path = Path(".env")) -> dict[str, str]:
+    """Read simple KEY=VALUE pairs from `.env` without modifying process env."""
+    if not env_path.is_file():
+        return {}
+    out: dict[str, str] = {}
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        k = k.strip()
+        v = v.strip().strip('"').strip("'")
+        if k and v:
+            out[k] = v
+    return out
+
+
+def _apply_scalp_position_env(cfg_dict: dict[str, Any]) -> None:
+    """Populate `scalp.position` from `SCALP_EQUITY_USD` / `SCALP_RISK_PER_TRADE_PCT`."""
+    env_file_vals = _read_env_file_values()
+    raw_eq = os.environ.get("SCALP_EQUITY_USD", "").strip() or env_file_vals.get(
+        "SCALP_EQUITY_USD", ""
+    )
+    raw_risk = os.environ.get("SCALP_RISK_PER_TRADE_PCT", "").strip() or env_file_vals.get(
+        "SCALP_RISK_PER_TRADE_PCT", ""
+    )
+    if not raw_eq and not raw_risk:
+        return
+    scalp_map = cfg_dict.get("scalp")
+    if not isinstance(scalp_map, dict):
+        scalp_map = {}
+        cfg_dict["scalp"] = scalp_map
+    pos_map = scalp_map.get("position")
+    if not isinstance(pos_map, dict):
+        pos_map = {}
+        scalp_map["position"] = pos_map
+    if raw_eq:
+        pos_map["equity_usd"] = float(raw_eq)
+    if raw_risk:
+        pos_map["risk_per_trade_pct"] = float(raw_risk)
+
+
 def load_screener_config(path: Path | str | None = None) -> ScreenerConfig:
     """Load `ScreenerConfig` from YAML file (defaults to `config/screener.yaml`) + env overrides."""
     target = Path(path) if path is not None else DEFAULT_SCREENER_CONFIG_PATH
@@ -333,4 +417,5 @@ def load_screener_config(path: Path | str | None = None) -> ScreenerConfig:
     if resolved is not None:
         raw_data = _parse_simple_yaml(resolved.read_text(encoding="utf-8"))
     _apply_quiet_hours_env(raw_data)
+    _apply_scalp_position_env(raw_data)
     return ScreenerConfig.model_validate(raw_data)

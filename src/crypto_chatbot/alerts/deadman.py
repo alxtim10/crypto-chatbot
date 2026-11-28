@@ -24,13 +24,17 @@ class AlertDeadManMonitor:
         sender: TelegramOutboxSender,
         chat_id: int,
         max_silence_hours: float = 1.0,
+        max_silence_minutes: float | None = None,
         check_interval_seconds: float = 600.0,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._alert_repo = alert_repo
         self._sender = sender
         self._chat_id = chat_id
-        self._max_silence = timedelta(hours=max(0.1, float(max_silence_hours)))
+        if max_silence_minutes is not None:
+            self._max_silence = timedelta(minutes=max(1.0, float(max_silence_minutes)))
+        else:
+            self._max_silence = timedelta(hours=max(0.1, float(max_silence_hours)))
         self._check_interval = max(10.0, float(check_interval_seconds))
         self._clock = clock or (lambda: datetime.now(UTC))
         self._last_notified_at: datetime | None = None

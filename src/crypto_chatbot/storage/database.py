@@ -129,3 +129,36 @@ def init_db(engine: Engine) -> None:
                 "ADD COLUMN IF NOT EXISTS guard_violations JSONB NOT NULL DEFAULT '[]'::jsonb;"
             )
         )
+        # SC-01 / SC-07: strategy separation and scalp telemetry columns
+        conn.execute(
+            text(
+                "ALTER TABLE trade_setups "
+                "ADD COLUMN IF NOT EXISTS strategy VARCHAR(32) NOT NULL DEFAULT 'swing_mtf';"
+            )
+        )
+        conn.execute(text("ALTER TABLE trade_setups ADD COLUMN IF NOT EXISTS mode VARCHAR(32);"))
+        conn.execute(
+            text("ALTER TABLE trade_setups ADD COLUMN IF NOT EXISTS cost_bps DOUBLE PRECISION;")
+        )
+        conn.execute(
+            text("ALTER TABLE trade_setups ADD COLUMN IF NOT EXISTS cost_pct_r DOUBLE PRECISION;")
+        )
+        conn.execute(text("ALTER TABLE trade_setups ADD COLUMN IF NOT EXISTS features_json JSONB;"))
+        conn.execute(
+            text(
+                "ALTER TABLE alert_runs "
+                "ADD COLUMN IF NOT EXISTS strategy VARCHAR(32) NOT NULL DEFAULT 'swing_mtf';"
+            )
+        )
+        conn.execute(
+            text(
+                "ALTER TABLE alerts "
+                "ADD COLUMN IF NOT EXISTS strategy VARCHAR(32) NOT NULL DEFAULT 'swing_mtf';"
+            )
+        )
+        conn.execute(
+            text(
+                "ALTER TABLE alert_symbol_states "
+                "ADD COLUMN IF NOT EXISTS strategy VARCHAR(32) NOT NULL DEFAULT 'swing_mtf';"
+            )
+        )
