@@ -10,7 +10,7 @@ from datetime import UTC
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from crypto_chatbot.analysis.indicators import (
     MIN_HISTORY_EMA_20,
@@ -111,9 +111,27 @@ class MomentumScreenerReport(BaseModel):
     short_signals: tuple[MomentumSetupResult, ...]
     watching_items: tuple[MomentumSetupResult, ...]
     failed_symbols: tuple[str, ...]
+    symbol_errors: dict[str, str] = Field(default_factory=dict)
     as_of: UtcDatetime
     risk_management_note: str
     disclaimer: str
+
+
+MOMENTUM_PATTERN_LABELS: dict[MomentumPattern, str] = {
+    MomentumPattern.BULLISH_ENGULFING: "Bullish Engulfing (15m)",
+    MomentumPattern.BULLISH_MARUBOZU: "Bullish Marubozu (15m)",
+    MomentumPattern.BEARISH_ENGULFING: "Bearish Engulfing (15m)",
+    MomentumPattern.BEARISH_MARUBOZU: "Bearish Marubozu (15m)",
+    MomentumPattern.NONE: "Belum ada Engulfing/Marubozu",
+}
+
+
+def _pattern_label(pattern: MomentumPattern) -> str:
+    label = MOMENTUM_PATTERN_LABELS.get(pattern)
+    if label is not None:
+        return label
+    logger.warning("Missing MomentumPattern label for %s; falling back to value", pattern.value)
+    return pattern.value
 
 
 def _fmt_price(value: float) -> str:
@@ -133,17 +151,6 @@ def _fmt_usd_millions(value: float) -> str:
     if value >= 1_000_000_000.0:
         return f"${format_indonesian_number(value / 1_000_000_000.0, 2)}B"
     return f"${format_indonesian_number(value / 1_000_000.0, 1)}M"
-
-
-def _pattern_label(pattern: MomentumPattern) -> str:
-    mapping = {
-        MomentumPattern.BULLISH_ENGULFING: "Bullish Engulfing (15m)",
-        MomentumPattern.BULLISH_MARUBOZU: "Bullish Marubozu (15m)",
-        MomentumPattern.BEARISH_ENGULFING: "Bearish Engulfing (15m)",
-        MomentumPattern.BEARISH_MARUBOZU: "Bearish Marubozu (15m)",
-        MomentumPattern.NONE: "Belum ada Engulfing/Marubozu",
-    }
-    return mapping[pattern]
 
 
 def evaluate_15m_momentum_setup(
@@ -499,6 +506,7 @@ async def screen_momentum_movers(
     short_ready: list[MomentumSetupResult] = []
     watching: list[MomentumSetupResult] = []
     failed: list[str] = []
+    symbol_errors: dict[str, str] = {}
 
     async def _eval_one(
         snap: FuturesTickerSnapshot,
@@ -511,32 +519,32 @@ async def screen_momentum_movers(
                     Timeframe.M15,
                     limit=200,
                 )
-            except Exception as exc:
-                logger.warning("Screener 15m OHLCV failed for %s: %s", snap.canonical_symbol, exc)
-                failed.append(snap.canonical_symbol)
-                return
+                if (
+                    batch.has_provider_error
+                    or not batch.candles
+                    or any(f in _BLOCKING_SCREENER_FLAGS for f in batch.quality_flags)
+                ):
+                    failed.append(snap.canonical_symbol)
+                    symbol_errors[snap.canonical_symbol] = "ERROR: data 15m tidak valid/lengkap"
+                    return
 
-            if (
-                batch.has_provider_error
-                or not batch.candles
-                or any(f in _BLOCKING_SCREENER_FLAGS for f in batch.quality_flags)
-            ):
-                failed.append(snap.canonical_symbol)
-                return
-
-            result = evaluate_15m_momentum_setup(
-                batch.candles,
-                side=target_side,
-                change_24h_pct=snap.change_24h_pct,
-                quote_volume_24h_usd=snap.quote_volume_24h_usd,
-            )
-            if result.status is SetupStatus.READY:
-                if target_side == "long":
-                    long_ready.append(result)
+                result = evaluate_15m_momentum_setup(
+                    batch.candles,
+                    side=target_side,
+                    change_24h_pct=snap.change_24h_pct,
+                    quote_volume_24h_usd=snap.quote_volume_24h_usd,
+                )
+                if result.status is SetupStatus.READY:
+                    if target_side == "long":
+                        long_ready.append(result)
+                    else:
+                        short_ready.append(result)
                 else:
-                    short_ready.append(result)
-            else:
-                watching.append(result)
+                    watching.append(result)
+            except Exception as exc:
+                logger.warning("Screener evaluation failed for %s: %s", snap.canonical_symbol, exc)
+                failed.append(snap.canonical_symbol)
+                symbol_errors[snap.canonical_symbol] = f"ERROR: {exc}"
 
     if tasks_spec:
         await asyncio.gather(*(_eval_one(t, s) for t, s in tasks_spec))
@@ -557,6 +565,7 @@ async def screen_momentum_movers(
         short_signals=tuple(short_ready),
         watching_items=tuple(watching),
         failed_symbols=tuple(failed),
+        symbol_errors=symbol_errors,
         as_of=ticker_batch.received_time,
         risk_management_note=RISK_MANAGEMENT_EDUCATIONAL_NOTE,
         disclaimer=SCREENER_DISCLAIMER,
@@ -592,6 +601,7 @@ def render_momentum_screener_report(
             f"Filter Vol 24j >= {min_vol_str} | "
             f"Pasangan Likuid: {report.liquid_pairs_count}/{report.total_pairs_seen} | "
             f"Sinyal READY: LONG ({len(report.long_signals)}), SHORT ({len(report.short_signals)})"
+            + (f" | Gagal/ERROR: {len(report.failed_symbols)}" if report.failed_symbols else "")
         ),
     ]
 
@@ -671,6 +681,13 @@ def render_momentum_screener_report(
                 lines.append(
                     _e(f"• {item.symbol} ({item.side.upper()}, {chg}%): {item.wait_reason}")
                 )
+
+    if report.failed_symbols:
+        lines.append("")
+        err_items = [
+            f"{sym} [{report.symbol_errors.get(sym, 'ERROR')}]" for sym in report.failed_symbols
+        ]
+        lines.append(_e(f"Gagal/ERROR ({len(report.failed_symbols)}): {', '.join(err_items)}"))
 
     lines.append("")
     lines.append(_e(report.risk_management_note))

@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import html
+import logging
 import re
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta, timezone
+from enum import Enum
 from typing import Literal
 
 from crypto_chatbot.schemas.analysis import (
@@ -23,34 +26,79 @@ from crypto_chatbot.schemas.market import (
     Timeframe,
     format_trading_style_label,
 )
+from crypto_chatbot.schemas.news import SentimentLabel
 from crypto_chatbot.storage.repositories import (
     ForgetResult,
     StoredMessage,
     UserPreferences,
 )
 
+logger = logging.getLogger(__name__)
+
 WIB = timezone(timedelta(hours=7))
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096
 
-_REGIME_LABELS: dict[Regime, str] = {
+REGIME_LABELS: dict[Regime, str] = {
     Regime.HIGH_VOLATILITY: "Volatilitas Tinggi",
     Regime.TRENDING_UP: "Tren Naik",
     Regime.TRENDING_DOWN: "Tren Turun",
     Regime.RANGING: "Mendatar (Ranging)",
     Regime.TRANSITIONAL: "Transisi",
 }
+_REGIME_LABELS = REGIME_LABELS
 
-_STRUCTURE_LABELS: dict[MarketStructure, str] = {
+STRUCTURE_LABELS: dict[MarketStructure, str] = {
     MarketStructure.BULLISH: "Bullish (HH + HL terkonfirmasi)",
     MarketStructure.BEARISH: "Bearish (LH + LL terkonfirmasi)",
     MarketStructure.MIXED: "Bercampur (Mixed)",
 }
+_STRUCTURE_LABELS = STRUCTURE_LABELS
 
-_MTF_LABELS: dict[MtfRsiAlignment, str] = {
+MTF_LABELS: dict[MtfRsiAlignment, str] = {
     MtfRsiAlignment.ALIGNED_BULLISH: "Selaras di atas 50 (1h, 4h, 1d)",
     MtfRsiAlignment.ALIGNED_BEARISH: "Selaras di bawah 50 (1h, 4h, 1d)",
     MtfRsiAlignment.MIXED: "Tercampur antar timeframe",
 }
+_MTF_LABELS = MTF_LABELS
+
+DEALING_ZONE_LABELS: dict[DealingZone, str] = {
+    DealingZone.BELOW_RANGE: "Below Range",
+    DealingZone.DISCOUNT: "Discount",
+    DealingZone.EQUILIBRIUM: "Equilibrium",
+    DealingZone.PREMIUM: "Premium",
+    DealingZone.ABOVE_RANGE: "Above Range",
+}
+
+SENTIMENT_LABELS: dict[SentimentLabel, str] = {
+    SentimentLabel.POSITIVE: "Positif",
+    SentimentLabel.NEGATIVE: "Negatif",
+    SentimentLabel.NEUTRAL: "Netral",
+}
+
+SETUP_STATUS_LABELS: dict[SetupStatus, str] = {
+    SetupStatus.READY: "READY",
+    SetupStatus.WAIT: "WAIT / NO_SETUP",
+}
+
+SETUP_BIAS_LABELS: dict[SetupBias, str] = {
+    SetupBias.LONG: "LONG (Pullback)",
+    SetupBias.SHORT: "SHORT (Reli Pullback)",
+    SetupBias.NEUTRAL: "NEUTRAL",
+}
+
+
+def format_enum_label[E: Enum](mapping: Mapping[E, str], value: E) -> str:
+    """Resolve an enum display label, falling back cleanly to `value.value` with a warning."""
+    label = mapping.get(value)
+    if label is not None:
+        return label
+    logger.warning(
+        "Missing display label mapping for %s.%s; falling back to %r",
+        type(value).__name__,
+        value.name,
+        value.value,
+    )
+    return str(value.value)
 
 
 def format_timestamp_utc_wib(dt: datetime) -> str:
@@ -137,12 +185,7 @@ def _append_sentiment_lines(
     sent = snapshot.sentiment
     if sent is None:
         return
-    lbl_map = {
-        "positive": "Positif",
-        "negative": "Negatif",
-        "neutral": "Netral",
-    }
-    dom = lbl_map.get(sent.dominant_label.value, sent.dominant_label.value)
+    dom = format_enum_label(SENTIMENT_LABELS, sent.dominant_label)
     score_fact = next(
         (f for f in snapshot.facts if f.label == "Skor sentimen berita 24h (bukan probabilitas)"),
         None,
@@ -337,8 +380,7 @@ def _append_composite_sentiment_panel(
     # 3. News tone & count: FORWARD_ONLY (S-03 / S-04)
     if snapshot.sentiment is not None:
         sent = snapshot.sentiment
-        lbl_map = {"positive": "Positif", "negative": "Negatif", "neutral": "Netral"}
-        dom = lbl_map.get(sent.dominant_label.value, sent.dominant_label.value)
+        dom = format_enum_label(SENTIMENT_LABELS, sent.dominant_label)
         sc = format_indonesian_number(sent.net_sentiment_score, 2, signed=True)
         lines.append(
             _esc(
@@ -406,13 +448,17 @@ def render_deterministic_snapshot(
         lines.append("")
         lines.append(_bold("Kondisi & Struktur", html_mode))
         if snapshot.regime is not None:
-            lines.append(f"- Rezim: {_esc(_REGIME_LABELS[snapshot.regime], html_mode)}")
-        if snapshot.market_structure is not None:
             lines.append(
-                f"- Struktur pivot: {_esc(_STRUCTURE_LABELS[snapshot.market_structure], html_mode)}"
+                f"- Rezim: {_esc(format_enum_label(REGIME_LABELS, snapshot.regime), html_mode)}"
             )
+        if snapshot.market_structure is not None:
+            struct_lbl = format_enum_label(STRUCTURE_LABELS, snapshot.market_structure)
+            lines.append(f"- Struktur pivot: {_esc(struct_lbl, html_mode)}")
         if snapshot.technical.mtf_rsi_alignment is not None:
-            mtf_label = _esc(_MTF_LABELS[snapshot.technical.mtf_rsi_alignment], html_mode)
+            mtf_label = _esc(
+                format_enum_label(MTF_LABELS, snapshot.technical.mtf_rsi_alignment),
+                html_mode,
+            )
             lines.append(f"- Penyelarasan RSI MTF: {mtf_label}")
 
         if snapshot.events:
@@ -643,13 +689,13 @@ def render_deterministic_snapshot(
                     brk_ev = smc.latest_structure_break.event_type.value
                     lines.append(f"- Break SMC terbaru: {_esc(brk_ev, html_mode)}")
                 if smc.dealing_zone is not None:
-                    lines.append(
-                        f"- Posisi Dealing Range: {_esc(smc.dealing_zone.value, html_mode)}"
-                    )
+                    dz_lbl = format_enum_label(DEALING_ZONE_LABELS, smc.dealing_zone)
+                    lines.append(f"- Posisi Dealing Range: {_esc(dz_lbl, html_mode)}")
             if snapshot.trade_setup is not None:
                 setup = snapshot.trade_setup
+                status_lbl = format_enum_label(SETUP_STATUS_LABELS, setup.status)
                 lines.append(
-                    f"- Status setup: {_esc(setup.status.value.upper(), html_mode)} "
+                    f"- Status setup: {_esc(status_lbl, html_mode)} "
                     f"(bias: {_esc(setup.bias.value.upper(), html_mode)})"
                 )
                 if setup.entry_timeframe is not None:
@@ -782,7 +828,7 @@ def render_compact_snapshot(
         line1_parts.append(f"EMA200: {ema200_tok}")
     lines.append(_esc(" | ".join(line1_parts), html_mode))
 
-    regime_str = _REGIME_LABELS[snapshot.regime] if snapshot.regime else "-"
+    regime_str = format_enum_label(REGIME_LABELS, snapshot.regime) if snapshot.regime else "-"
     struct_str = snapshot.market_structure.value if snapshot.market_structure else "-"
     line2_parts = [f"Rezim: {regime_str}", f"Struktur: {struct_str}"]
     if snapshot.smc is not None:
@@ -791,12 +837,9 @@ def render_compact_snapshot(
             brk_tok = _fmt_fact(by_label.get("Level BOS/CHoCH terbaru"))
             line2_parts.append(f"SMC: {brk} ({brk_tok})" if brk_tok else f"SMC: {brk}")
         if snapshot.smc.dealing_zone is not None:
-            dz_labels = {
-                DealingZone.DISCOUNT: "Discount",
-                DealingZone.EQUILIBRIUM: "Equilibrium",
-                DealingZone.PREMIUM: "Premium",
-            }
-            line2_parts.append(f"Range: {dz_labels[snapshot.smc.dealing_zone]}")
+            line2_parts.append(
+                f"Range: {format_enum_label(DEALING_ZONE_LABELS, snapshot.smc.dealing_zone)}"
+            )
     if rsi_tok:
         line2_parts.append(f"RSI14: {rsi_tok}")
     if adx_tok:
@@ -946,11 +989,6 @@ def render_compact_snapshot(
         tf_chain = " → ".join(ov.timeframe.value for ov in snapshot.mtf_overview)
         lines.append("")
         lines.append(_bold(f"Alur Top-Down Multi-Timeframe ({tf_chain})", html_mode))
-        dz_map = {
-            DealingZone.DISCOUNT: "Discount",
-            DealingZone.EQUILIBRIUM: "Equilibrium",
-            DealingZone.PREMIUM: "Premium",
-        }
         for ov in snapshot.mtf_overview:
             parts: list[str] = []
             if ov.trend_label:
@@ -964,7 +1002,7 @@ def render_compact_snapshot(
                 s_lbl = "Sweep Bull" if "bullish" in ov.sweep.value else "Sweep Bear"
                 parts.append(s_lbl)
             if ov.dealing_zone is not None:
-                parts.append(f"Range: {dz_map[ov.dealing_zone]}")
+                parts.append(f"Range: {format_enum_label(DEALING_ZONE_LABELS, ov.dealing_zone)}")
             if ov.active_poi:
                 parts.append(f"POI: {ov.active_poi}")
             if ov.timeframe is Timeframe.M15:
@@ -984,6 +1022,9 @@ def render_compact_snapshot(
             html_mode,
         )
     )
+    if snapshot.smc is not None and snapshot.smc.dealing_zone is not None:
+        dz_setup_lbl = format_enum_label(DEALING_ZONE_LABELS, snapshot.smc.dealing_zone)
+        lines.append(_esc(f"• Posisi Dealing Range: {dz_setup_lbl}", html_mode))
     setup = snapshot.trade_setup
     sh_htf = _fmt_fact(by_label.get("High dealing range")) or _fmt_fact(
         by_label.get("Swing high terkonfirmasi")
@@ -1017,7 +1058,7 @@ def render_compact_snapshot(
                 )
             )
     else:
-        bias_label = "LONG (Pullback)" if setup.bias is SetupBias.LONG else "SHORT (Reli Pullback)"
+        bias_label = format_enum_label(SETUP_BIAS_LABELS, setup.bias)
         e_low = _fmt_fact(by_label.get("Zona entry (bawah)")) or "-"
         e_high = _fmt_fact(by_label.get("Zona entry (atas)")) or "-"
         sl_tok = _fmt_fact(by_label.get("Stop loss (invalidasi)")) or "-"

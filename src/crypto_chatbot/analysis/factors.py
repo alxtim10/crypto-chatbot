@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping, Sequence
 from datetime import datetime
 
@@ -25,6 +26,16 @@ from crypto_chatbot.schemas.analysis import (
 )
 from crypto_chatbot.schemas.news import SentimentLabel, SentimentMetrics
 from crypto_chatbot.schemas.tradingview import TradingViewMetrics
+
+logger = logging.getLogger(__name__)
+
+DEALING_ZONE_FACTOR_DESCRIPTIONS: dict[DealingZone, str] = {
+    DealingZone.BELOW_RANGE: "Harga berada di bawah rentang swing dealing range (< 0%).",
+    DealingZone.DISCOUNT: "Harga berada di zona Discount (< 45% rentang swing terkonfirmasi).",
+    DealingZone.EQUILIBRIUM: "Harga berada di area Equilibrium dealing range.",
+    DealingZone.PREMIUM: "Harga berada di zona Premium (> 55% rentang swing terkonfirmasi).",
+    DealingZone.ABOVE_RANGE: "Harga berada di atas rentang swing dealing range (> 100%).",
+}
 
 
 def _add_if_facts_present(
@@ -384,18 +395,19 @@ def build_factors(
             )
 
         if smc.dealing_zone is not None:
-            if smc.dealing_zone is DealingZone.DISCOUNT:
-                desc = "Harga berada di zona Discount (< 45% rentang swing terkonfirmasi)."
-            elif smc.dealing_zone is DealingZone.PREMIUM:
-                desc = "Harga berada di zona Premium (> 55% rentang swing terkonfirmasi)."
-            else:
-                desc = "Harga berada di area Equilibrium dealing range."
+            dz_desc = DEALING_ZONE_FACTOR_DESCRIPTIONS.get(smc.dealing_zone)
+            if dz_desc is None:
+                logger.warning(
+                    "Missing DealingZone factor description for %s; falling back to value",
+                    smc.dealing_zone.value,
+                )
+                dz_desc = f"Harga berada di area dealing range ({smc.dealing_zone.value})."
             _add_if_facts_present(
                 factors,
                 fact_ids_by_key,
                 ("last_close", "smc_equilibrium"),
                 rule_id="smc_dealing_zone",
-                description=desc,
+                description=dz_desc,
                 direction=FactorDirection.NEUTRAL,
             )
 
