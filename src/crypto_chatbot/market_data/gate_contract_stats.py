@@ -107,9 +107,12 @@ def normalize_contract_stats_payload(
         if raw_time is None:
             continue
         observed_time = datetime.fromtimestamp(int(raw_time), tz=UTC)
-        available_time = observed_time + step
-        if closed_only and available_time > effective_as_of_utc:
+        bar_close_time = observed_time + step
+        if closed_only and bar_close_time > effective_as_of_utc:
             continue
+        # Backfilled historical rows use bar close time (with BACKFILL flag) for causal
+        # backtest/ML usability; live polls record actual fetch time (>= bar_close_time).
+        available_time = bar_close_time if backfill else max(bar_close_time, received_utc)
 
         flags: list[QualityFlag] = []
         if backfill:

@@ -1822,6 +1822,32 @@ def _row_to_sentiment_observation(row: SentimentObservationRow) -> SentimentObse
     )
 
 
+def _symbol_lookup_keys(symbol: str) -> tuple[str, ...]:
+    """Return normalized canonical/spot/perp/venue symbol keys for cross-table lookups."""
+    raw = symbol.strip().upper()
+    if not raw:
+        return ()
+    if "/" in raw:
+        base = raw.split("/", 1)[0]
+    elif "_" in raw:
+        base = raw.split("_", 1)[0]
+    elif ":" in raw:
+        base = raw.split(":", 1)[0]
+    elif raw.endswith("USDT") and len(raw) > 4:
+        base = raw[:-4]
+    else:
+        base = raw
+    candidates = (
+        symbol.strip(),
+        raw,
+        f"{base}/USDT:USDT",
+        f"{base}/USDT",
+        f"{base}_USDT",
+        base,
+    )
+    return tuple(dict.fromkeys(c for c in candidates if c))
+
+
 class PostgresNewsRepository:
     """Synchronous PostgreSQL persistence and causal reads for news & sentiment."""
 
@@ -1878,8 +1904,13 @@ class PostgresNewsRepository:
                 "sentiment_confidence": obs.sentiment_confidence,
                 "model_version": obs.model_version,
                 "is_probabilistic": False,
-                "published_time": obs.published_time,
-                "available_time": obs.available_time,
+                "published_time": _to_utc(obs.published_time),
+                "available_time": _to_utc(obs.available_time),
+                "scored_at": _to_utc(obs.scored_at) if obs.scored_at is not None else None,
+                "scorer_id": obs.scorer_id,
+                "scorer_version": obs.scorer_version,
+                "scorer_class": obs.scorer_class,
+                "is_backfilled": obs.is_backfilled,
             }
             for obs in items
         ]
@@ -1902,8 +1933,9 @@ class PostgresNewsRepository:
         min_entity_confidence: float = MIN_ENTITY_MATCH_CONFIDENCE,
         limit: int | None = None,
     ) -> tuple[SentimentObservation, ...]:
+        keys = _symbol_lookup_keys(canonical_symbol)
         stmt = select(SentimentObservationRow).where(
-            SentimentObservationRow.canonical_symbol == canonical_symbol,
+            SentimentObservationRow.canonical_symbol.in_(keys),
             SentimentObservationRow.entity_confidence >= min_entity_confidence,
         )
         if start_available_time is not None:
@@ -2446,9 +2478,10 @@ class PostgresContractStatsRepository:
         end_available_time: datetime | None = None,
         limit: int | None = None,
     ) -> tuple[ContractStatsObservation, ...]:
+        keys = _symbol_lookup_keys(canonical_symbol)
         stmt = select(ContractStatsRow).where(
             ContractStatsRow.venue == venue,
-            ContractStatsRow.canonical_symbol == canonical_symbol,
+            ContractStatsRow.canonical_symbol.in_(keys),
             ContractStatsRow.interval == interval,
         )
         if start_time is not None:

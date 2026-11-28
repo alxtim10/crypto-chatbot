@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -90,6 +90,20 @@ def test_normalize_fear_greed_payload_and_causal_cutoff() -> None:
     assert obs[-1].classification == "Extreme Fear"
     assert obs[-1].normalized_score == pytest.approx((11.0 - 50.0) / 50.0)
     assert obs[-1].is_backfilled is True
+    # Backfilled rows use publication time (00:00 UTC value date), NOT fetch time
+    assert obs[0].available_time == obs[0].observed_time
+    assert obs[-1].available_time == obs[-1].observed_time
+
+    # Live fetch (backfill=False) keeps available_time = fetch time (received_time)
+    fetch_time = as_of + timedelta(hours=3, minutes=15)
+    live_obs = normalize_fear_greed_payload(
+        RECORDED_FNG_PAYLOAD,
+        received_time=fetch_time,
+        as_of=as_of,
+        backfill=False,
+    )
+    assert live_obs[-1].is_backfilled is False
+    assert live_obs[-1].available_time == fetch_time
 
 
 @pytest.mark.asyncio

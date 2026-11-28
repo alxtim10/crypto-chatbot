@@ -127,6 +127,7 @@ class TimeframeOverview(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     timeframe: Timeframe
+    regime: Regime | None = None
     trend_label: str | None = None
     market_structure: MarketStructure | None = None
     structure_break: StructureEventType | None = None
@@ -137,6 +138,7 @@ class TimeframeOverview(BaseModel):
     resistance_level: FiniteFloat | None = Field(default=None, gt=0)
     active_poi: str | None = None
     rsi_14: FiniteFloat | None = Field(default=None, ge=0, le=100)
+    adx_14: FiniteFloat | None = Field(default=None, ge=0, le=100)
 
 
 class SetupStatus(StrEnum):
@@ -403,6 +405,34 @@ class DerivativesMetrics(BaseModel):
 
 PositioningStatus = Literal["READY", "WARMING_UP", "UNAVAILABLE"]
 
+SentimentReasonCode = Literal[
+    "no_data",
+    "not_yet_available",
+    "insufficient_history",
+    "not_wired",
+    "error",
+]
+
+
+class SentimentSourceStatus(BaseModel):
+    """Per-source availability and explicit reason code for the composite sentiment panel."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    available: bool = False
+    reason: SentimentReasonCode | None = None
+    detail: str | None = None
+
+
+class SentimentPanelDiagnostics(BaseModel):
+    """Diagnostic status for each of the three composite sentiment sources."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    positioning: SentimentSourceStatus = Field(default_factory=SentimentSourceStatus)
+    fear_greed: SentimentSourceStatus = Field(default_factory=SentimentSourceStatus)
+    news: SentimentSourceStatus = Field(default_factory=SentimentSourceStatus)
+
 
 class PositioningPanel(BaseModel):
     """Gate.io perpetual crowd/top-trader positioning sentiment panel (FORWARD_ONLY, S-01)."""
@@ -411,6 +441,7 @@ class PositioningPanel(BaseModel):
 
     parity_mode: Literal["FORWARD_ONLY"] = "FORWARD_ONLY"
     status: PositioningStatus = "UNAVAILABLE"
+    reason_code: SentimentReasonCode | None = None
     venue: str = Field(default="gateio", min_length=1)
     canonical_symbol: str = Field(min_length=1)
     as_of: UtcDatetime
@@ -484,6 +515,7 @@ class AnalysisSnapshot(BaseModel):
     macro_context: MacroBenchmarkContext | None = None
     positioning: PositioningPanel | None = None
     fear_greed: FearGreedObservation | None = None
+    sentiment_diagnostics: SentimentPanelDiagnostics | None = None
     ml_prediction: ModelPredictionSummary | None = None
     facts: tuple[Fact, ...] = ()
     regime: Regime | None = None

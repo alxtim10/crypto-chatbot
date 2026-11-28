@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from crypto_chatbot.alerts.config import MtfTimeframesConfig
 from crypto_chatbot.analysis.indicators import MIN_HISTORY_EMA_20, compute_technical_metrics
+from crypto_chatbot.analysis.mtf import evaluate_timeframe_context
 from crypto_chatbot.analysis.regimes import classify_regime
 from crypto_chatbot.analysis.scanner import ScannedSetupItem
 from crypto_chatbot.analysis.setup import build_trade_setup
@@ -87,6 +88,9 @@ class MtfBiasEvaluation(BaseModel):
 
     agreed_direction: Literal["long", "short"] | None = None
     per_tf_summary: dict[str, str] = Field(default_factory=dict)
+    per_tf_regime: dict[str, Regime | None] = Field(default_factory=dict)
+    per_tf_structure: dict[str, MarketStructure | None] = Field(default_factory=dict)
+    per_tf_adx_14: dict[str, float | None] = Field(default_factory=dict)
     reason: str
 
 
@@ -95,28 +99,48 @@ def evaluate_htf_bias(
     bias_timeframes: Sequence[Timeframe],
     *,
     cutoff: datetime,
+    expected_venue: str | None = None,
+    use_available_time: bool = True,
 ) -> MtfBiasEvaluation:
-    """Require regime + market structure on EVERY bias timeframe to agree on direction."""
+    """Require regime + market structure on EVERY bias timeframe to agree on direction.
+
+    Delegates directly to the shared `evaluate_timeframe_context` so 4h/1h regime,
+    structure, and ADX are guaranteed identical to standalone `analyze`.
+    """
     directions: list[Literal["long", "short"] | None] = []
     summaries: dict[str, str] = {}
+    regimes: dict[str, Regime | None] = {}
+    structures: dict[str, MarketStructure | None] = {}
+    adx_map: dict[str, float | None] = {}
 
     for tf in bias_timeframes:
         raw = candles_by_tf.get(tf, ())
-        closed = _filter_closed_candles(raw, cutoff)
-        if len(closed) < MIN_HISTORY_EMA_20:
-            summaries[tf.value] = f"insufficient({len(closed)})"
+        ctx = evaluate_timeframe_context(
+            raw,
+            timeframe=tf,
+            as_of=cutoff,
+            expected_venue=expected_venue,
+            use_available_time=use_available_time,
+            min_candles=MIN_HISTORY_EMA_20,
+        )
+        if ctx is None:
+            closed_cnt = len(_filter_closed_candles(raw, cutoff))
+            summaries[tf.value] = f"insufficient({closed_cnt})"
+            regimes[tf.value] = None
+            structures[tf.value] = None
+            adx_map[tf.value] = None
             directions.append(None)
             continue
 
-        ind = compute_technical_metrics(closed)
-        regime = classify_regime(ind.metrics)
-        struct = analyze_market_structure(closed)
-        regime_lbl = regime.value if regime is not None else "unknown"
-        summaries[tf.value] = f"{regime_lbl}/{struct.market_structure.value}"
+        regime_lbl = ctx.regime.value if ctx.regime is not None else "unknown"
+        summaries[tf.value] = f"{regime_lbl}/{ctx.market_structure.value}"
+        regimes[tf.value] = ctx.regime
+        structures[tf.value] = ctx.market_structure
+        adx_map[tf.value] = ctx.adx_14
 
-        if regime is Regime.TRENDING_UP and struct.market_structure is MarketStructure.BULLISH:
+        if ctx.regime is Regime.TRENDING_UP and ctx.market_structure is MarketStructure.BULLISH:
             directions.append("long")
-        elif regime is Regime.TRENDING_DOWN and struct.market_structure is MarketStructure.BEARISH:
+        elif ctx.regime is Regime.TRENDING_DOWN and ctx.market_structure is MarketStructure.BEARISH:
             directions.append("short")
         else:
             directions.append(None)
@@ -126,17 +150,26 @@ def evaluate_htf_bias(
         return MtfBiasEvaluation(
             agreed_direction="long",
             per_tf_summary=summaries,
+            per_tf_regime=regimes,
+            per_tf_structure=structures,
+            per_tf_adx_14=adx_map,
             reason=f"HTF selaras LONG ({summary_str})",
         )
     if directions and all(d == "short" for d in directions):
         return MtfBiasEvaluation(
             agreed_direction="short",
             per_tf_summary=summaries,
+            per_tf_regime=regimes,
+            per_tf_structure=structures,
+            per_tf_adx_14=adx_map,
             reason=f"HTF selaras SHORT ({summary_str})",
         )
     return MtfBiasEvaluation(
         agreed_direction=None,
         per_tf_summary=summaries,
+        per_tf_regime=regimes,
+        per_tf_structure=structures,
+        per_tf_adx_14=adx_map,
         reason=f"Bias HTF belum sepakat ({summary_str})",
     )
 
@@ -398,6 +431,7 @@ def evaluate_symbol_mtf(
                 candles_by_tf,
                 mtf_config.bias,
                 cutoff=setup_close_time,
+                expected_venue=venue,
             )
             if bias_check.agreed_direction != armed.direction:
                 return MtfSymbolDecision(
@@ -460,6 +494,7 @@ def evaluate_symbol_mtf(
         candles_by_tf,
         mtf_config.bias,
         cutoff=setup_close_time,
+        expected_venue=venue,
     )
     if bias_eval.agreed_direction is None:
         return MtfSymbolDecision(

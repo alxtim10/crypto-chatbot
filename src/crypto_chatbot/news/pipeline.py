@@ -578,6 +578,19 @@ def is_sentiment_observation_eligible(
     )
 
 
+def _symbol_match_base(symbol: str) -> str:
+    raw = symbol.strip().upper()
+    if "/" in raw:
+        return raw.split("/", 1)[0]
+    if "_" in raw:
+        return raw.split("_", 1)[0]
+    if ":" in raw:
+        return raw.split(":", 1)[0]
+    if raw.endswith("USDT") and len(raw) > 4:
+        return raw[:-4]
+    return raw
+
+
 def aggregate_sentiment(
     observations: Sequence[SentimentObservation],
     *,
@@ -591,10 +604,15 @@ def aggregate_sentiment(
     """Aggregate causal sentiment observations strictly inside `(as_of - window, as_of]`."""
     as_of_utc = as_of.astimezone(UTC)
     window_start = as_of_utc - timedelta(hours=window_hours)
+    target_base = _symbol_match_base(canonical_symbol)
 
     by_article: dict[str, SentimentObservation] = {}
     for obs in observations:
-        if obs.canonical_symbol != canonical_symbol:
+        if (
+            obs.canonical_symbol != canonical_symbol
+            and _symbol_match_base(obs.canonical_symbol) != target_base
+            and obs.base_asset.strip().upper() != target_base
+        ):
             continue
         if obs.entity_confidence < min_entity_confidence:
             continue

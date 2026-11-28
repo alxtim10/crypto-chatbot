@@ -29,6 +29,7 @@ from crypto_chatbot.bot.templates import (
     format_indonesian_number,
     format_timestamp_utc_wib,
 )
+from crypto_chatbot.market_data.base import DEFAULT_CANDLE_LIMIT
 from crypto_chatbot.schemas.analysis import AnalysisSnapshot, SetupStatus
 from crypto_chatbot.schemas.market import Timeframe, format_trading_style_short
 from crypto_chatbot.storage.repositories import (
@@ -390,8 +391,8 @@ async def _run_mtf_alert_cycle(
 
     tf_limits: dict[Timeframe, int] = {}
     for btf in mtf_cfg.bias:
-        tf_limits[btf] = 120
-    tf_limits[setup_tf] = 200
+        tf_limits[btf] = DEFAULT_CANDLE_LIMIT
+    tf_limits[setup_tf] = DEFAULT_CANDLE_LIMIT
     tf_limits[mtf_cfg.confirm] = 60
 
     decisions: list[MtfSymbolDecision] = []

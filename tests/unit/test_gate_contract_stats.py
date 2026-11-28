@@ -146,6 +146,22 @@ def test_normalize_contract_stats_enforces_closed_bucket_and_extracts_all_fields
     assert QualityFlag.BACKFILL in obs.quality_flags
     assert obs.raw_payload == LIVE_SAMPLE_ITEM
 
+    # Live poll (backfill=False) records available_time = fetch time (>= bar close) without BACKFILL
+    late_fetch = closed_as_of + timedelta(minutes=2)
+    live_norm = normalize_contract_stats_payload(
+        [LIVE_SAMPLE_ITEM],
+        symbol=symbol,
+        provider_symbol="BTC_USDT",
+        interval="5m",
+        received_time=late_fetch,
+        as_of=late_fetch,
+        closed_only=True,
+        backfill=False,
+    )
+    assert len(live_norm) == 1
+    assert live_norm[0].available_time == late_fetch
+    assert QualityFlag.BACKFILL not in live_norm[0].quality_flags
+
 
 @pytest.mark.asyncio
 async def test_repeatable_backfill_inserts_zero_duplicates() -> None:
