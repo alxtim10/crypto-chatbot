@@ -112,7 +112,9 @@ from crypto_chatbot.schemas.tradingview import TradingViewPacket
 from crypto_chatbot.schemas.whale import NetworkType
 from crypto_chatbot.storage.database import create_db_engine, init_db
 from crypto_chatbot.storage.repositories import (
+    ContractStatsRepository,
     DerivativesRepository,
+    FearGreedRepository,
     MarketRepository,
     NewsRepository,
     PostgresContractStatsRepository,
@@ -143,15 +145,29 @@ def _check_config() -> int:
     return 0
 
 
+def _resolve_optional_database_url(database_url: str | None = None) -> str | None:
+    if database_url and database_url.strip():
+        return database_url.strip()
+    env_url = os.environ.get("DATABASE_URL", "").strip()
+    if env_url:
+        return env_url
+    try:
+        return load_settings().database_url.get_secret_value().strip() or None
+    except Exception:
+        return None
+
+
 def _build_repositories_from_env() -> tuple[
     MarketRepository,
     DerivativesRepository,
     SetupLogRepository,
     TradingViewRepository,
     NewsRepository,
+    ContractStatsRepository,
+    FearGreedRepository,
     Any,
 ]:
-    database_url = os.environ.get("DATABASE_URL", "").strip()
+    database_url = _resolve_optional_database_url()
     if not database_url:
         raise ValueError("DATABASE_URL environment variable is required when --persist is set")
     engine = create_db_engine(database_url)
@@ -162,8 +178,32 @@ def _build_repositories_from_env() -> tuple[
         PostgresSetupLogRepository(engine),
         PostgresTradingViewRepository(engine),
         PostgresNewsRepository(engine),
+        PostgresContractStatsRepository(engine),
+        PostgresFearGreedRepository(engine),
         engine,
     )
+
+
+def _build_sentiment_read_repositories() -> tuple[
+    NewsRepository | None,
+    ContractStatsRepository | None,
+    FearGreedRepository | None,
+    Any,
+]:
+    """Best-effort read-only sentiment DB repos for CLI `analyze` when DATABASE_URL is set."""
+    database_url = _resolve_optional_database_url()
+    if not database_url:
+        return None, None, None, None
+    try:
+        engine = create_db_engine(database_url)
+        return (
+            PostgresNewsRepository(engine),
+            PostgresContractStatsRepository(engine),
+            PostgresFearGreedRepository(engine),
+            engine,
+        )
+    except Exception:
+        return None, None, None, None
 
 
 def _load_derivatives_fixture(
@@ -435,6 +475,8 @@ async def _analyze_live(
     setup_repository: SetupLogRepository | None = None,
     tradingview_repository: TradingViewRepository | None = None,
     news_repository: NewsRepository | None = None,
+    contract_stats_repository: ContractStatsRepository | None = None,
+    fear_greed_repository: FearGreedRepository | None = None,
 ) -> AnalysisSnapshot:
     chain = _resolve_exchange_chain_from_env()
     provider, deriv_provider = build_futures_providers(
@@ -455,6 +497,8 @@ async def _analyze_live(
             setup_repository=setup_repository,
             tradingview_repository=tradingview_repository,
             news_repository=news_repository,
+            contract_stats_repository=contract_stats_repository,
+            fear_greed_repository=fear_greed_repository,
             dxy_provider=dxy_provider,
             risk_tiers_client=risk_tiers_client,
             resample_from=_resolve_resample_from_env(),
@@ -517,6 +561,8 @@ def _run_analyze(
         setup_repository: SetupLogRepository | None = None
         tradingview_repository: TradingViewRepository | None = None
         news_repository: NewsRepository | None = None
+        contract_stats_repository: ContractStatsRepository | None = None
+        fear_greed_repository: FearGreedRepository | None = None
         if persist:
             (
                 repository,
@@ -524,8 +570,17 @@ def _run_analyze(
                 setup_repository,
                 tradingview_repository,
                 news_repository,
+                contract_stats_repository,
+                fear_greed_repository,
                 engine,
             ) = _build_repositories_from_env()
+        elif fixture_path is None:
+            (
+                news_repository,
+                contract_stats_repository,
+                fear_greed_repository,
+                engine,
+            ) = _build_sentiment_read_repositories()
 
         if fixture_path is not None:
             snapshot = _analyze_from_fixture(
@@ -553,6 +608,8 @@ def _run_analyze(
                     setup_repository=setup_repository,
                     tradingview_repository=tradingview_repository,
                     news_repository=news_repository,
+                    contract_stats_repository=contract_stats_repository,
+                    fear_greed_repository=fear_greed_repository,
                 )
             )
     except (SymbolError, ValueError, json.JSONDecodeError) as exc:
@@ -2363,6 +2420,165 @@ def _run_alerts(
     return 0
 
 
+def _run_debug_sentiment(
+    *,
+    symbol_raw: str | None = None,
+    as_of_raw: str | None = None,
+    database_url: str | None = None,
+    as_json: bool = False,
+) -> int:
+    """Inspect min/max timestamps, symbol keys, and future-dated counts in sentiment tables."""
+    from sqlalchemy import text as sa_text
+
+    resolved_url = _resolve_optional_database_url(database_url)
+    if not resolved_url:
+        print("Error: DATABASE_URL is required for debug-sentiment.", file=sys.stderr)
+        return 1
+
+    if as_of_raw:
+        as_of_dt = datetime.fromisoformat(as_of_raw.replace("Z", "+00:00"))
+        if as_of_dt.tzinfo is None:
+            as_of_dt = as_of_dt.replace(tzinfo=UTC)
+        as_of_utc = as_of_dt.astimezone(UTC)
+    else:
+        as_of_utc = datetime.now(UTC)
+
+    def _iso(val: Any) -> str | None:
+        if val is None:
+            return None
+        if isinstance(val, datetime):
+            dt = val.astimezone(UTC) if val.tzinfo is not None else val.replace(tzinfo=UTC)
+            return dt.isoformat()
+        return str(val)
+
+    engine = create_db_engine(resolved_url)
+    report: dict[str, Any] = {
+        "as_of_utc": as_of_utc.isoformat(),
+        "symbol_filter": symbol_raw,
+        "tables": {},
+    }
+    try:
+        with engine.connect() as conn:
+            # 1. fear_greed_observations
+            fg_row = conn.execute(
+                sa_text(
+                    "SELECT COUNT(*), MIN(observed_time), MAX(observed_time), "
+                    "MIN(available_time), MAX(available_time), "
+                    "SUM(CASE WHEN available_time > :as_of THEN 1 ELSE 0 END) "
+                    "FROM fear_greed_observations"
+                ),
+                {"as_of": as_of_utc},
+            ).one()
+            report["tables"]["fear_greed_observations"] = {
+                "rows": int(fg_row[0] or 0),
+                "min_observed_time": _iso(fg_row[1]),
+                "max_observed_time": _iso(fg_row[2]),
+                "min_available_time": _iso(fg_row[3]),
+                "max_available_time": _iso(fg_row[4]),
+                "future_available_rows": int(fg_row[5] or 0),
+            }
+
+            # 2. news_sentiment
+            ns_row = conn.execute(
+                sa_text(
+                    "SELECT COUNT(*), MIN(published_time), MAX(published_time), "
+                    "MIN(available_time), MAX(available_time), "
+                    "MIN(scored_at), MAX(scored_at), "
+                    "SUM(CASE WHEN available_time > :as_of THEN 1 ELSE 0 END) "
+                    "FROM news_sentiment"
+                ),
+                {"as_of": as_of_utc},
+            ).one()
+            ns_syms = [
+                str(r[0])
+                for r in conn.execute(
+                    sa_text(
+                        "SELECT DISTINCT canonical_symbol FROM news_sentiment "
+                        "ORDER BY canonical_symbol LIMIT 20"
+                    )
+                ).all()
+            ]
+            report["tables"]["news_sentiment"] = {
+                "rows": int(ns_row[0] or 0),
+                "min_published_time": _iso(ns_row[1]),
+                "max_published_time": _iso(ns_row[2]),
+                "min_available_time": _iso(ns_row[3]),
+                "max_available_time": _iso(ns_row[4]),
+                "min_scored_at": _iso(ns_row[5]),
+                "max_scored_at": _iso(ns_row[6]),
+                "future_available_rows": int(ns_row[7] or 0),
+                "sample_symbols": ns_syms,
+            }
+
+            # 3. news_vote_snapshots
+            nv_row = conn.execute(
+                sa_text(
+                    "SELECT COUNT(*), MIN(snapshot_time), MAX(snapshot_time), "
+                    "SUM(CASE WHEN snapshot_time > :as_of THEN 1 ELSE 0 END) "
+                    "FROM news_vote_snapshots"
+                ),
+                {"as_of": as_of_utc},
+            ).one()
+            report["tables"]["news_vote_snapshots"] = {
+                "rows": int(nv_row[0] or 0),
+                "min_snapshot_time": _iso(nv_row[1]),
+                "max_snapshot_time": _iso(nv_row[2]),
+                "future_snapshot_rows": int(nv_row[3] or 0),
+            }
+
+            # 4. contract_stats
+            cs_row = conn.execute(
+                sa_text(
+                    "SELECT COUNT(*), MIN(observed_time), MAX(observed_time), "
+                    "MIN(available_time), MAX(available_time), "
+                    "SUM(CASE WHEN available_time > :as_of THEN 1 ELSE 0 END) "
+                    "FROM contract_stats"
+                ),
+                {"as_of": as_of_utc},
+            ).one()
+            cs_venues = [
+                str(r[0])
+                for r in conn.execute(
+                    sa_text("SELECT DISTINCT venue FROM contract_stats ORDER BY venue")
+                ).all()
+            ]
+            cs_syms = [
+                str(r[0])
+                for r in conn.execute(
+                    sa_text(
+                        "SELECT DISTINCT canonical_symbol FROM contract_stats "
+                        "ORDER BY canonical_symbol LIMIT 25"
+                    )
+                ).all()
+            ]
+            report["tables"]["contract_stats"] = {
+                "rows": int(cs_row[0] or 0),
+                "min_observed_time": _iso(cs_row[1]),
+                "max_observed_time": _iso(cs_row[2]),
+                "min_available_time": _iso(cs_row[3]),
+                "max_available_time": _iso(cs_row[4]),
+                "future_available_rows": int(cs_row[5] or 0),
+                "venues": cs_venues,
+                "sample_symbols": cs_syms,
+            }
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        engine.dispose()
+
+    if as_json:
+        print(json.dumps(report, indent=2))
+    else:
+        print(f"Sentiment DB Diagnostics (as_of={report['as_of_utc']})")
+        for tbl, info in report["tables"].items():
+            print(f"- {tbl}: rows={info['rows']}")
+            for k, v in info.items():
+                if k != "rows":
+                    print(f"    {k}: {v}")
+    return 0
+
+
 def _run_init_db(*, database_url: str | None = None) -> int:
     """Idempotently create all database tables and apply backwards-compatible column migrations."""
     db_url = database_url
@@ -2401,6 +2617,30 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--database-url",
         default=None,
         help="Optional PostgreSQL URL override (defaults to DATABASE_URL from .env).",
+    )
+    debug_sent_parser = subcommands.add_parser(
+        "debug-sentiment",
+        help="Print min/max timestamps, symbol keys, and future counts for sentiment tables.",
+    )
+    debug_sent_parser.add_argument(
+        "--symbol",
+        default=None,
+        help="Optional symbol label for context.",
+    )
+    debug_sent_parser.add_argument(
+        "--as-of",
+        default=None,
+        help="Optional ISO-8601 UTC cutoff timestamp (defaults to now UTC).",
+    )
+    debug_sent_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Optional PostgreSQL URL override (defaults to DATABASE_URL from .env).",
+    )
+    debug_sent_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print JSON output.",
     )
 
     analyze_parser = subcommands.add_parser(
@@ -3247,6 +3487,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     if args.command == "init-db":
         return _run_init_db(database_url=args.database_url)
+    if args.command == "debug-sentiment":
+        return _run_debug_sentiment(
+            symbol_raw=args.symbol,
+            as_of_raw=args.as_of,
+            database_url=args.database_url,
+            as_json=args.json,
+        )
     parser.error(f"unknown command: {args.command}")  # pragma: no cover
 
 

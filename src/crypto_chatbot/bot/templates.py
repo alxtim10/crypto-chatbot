@@ -334,6 +334,8 @@ def _append_composite_sentiment_panel(
     lines.append("")
     lines.append(_bold("Panel Sentimen (Komposit Multi-Sumber — Bukan Probabilitas)", html_mode))
 
+    diag = snapshot.sentiment_diagnostics
+
     # 1. Positioning: BACKTESTED (funding 8h D-07) + FORWARD_ONLY (contract_stats S-01)
     if (
         has_funding
@@ -346,9 +348,23 @@ def _append_composite_sentiment_panel(
         pos = snapshot.positioning
         pos_tag = pos.parity_mode
         if pos.status == "UNAVAILABLE":
-            lines.append(_esc(f"- Positioning Derivatif [{pos_tag}]: UNAVAILABLE", html_mode))
+            pos_reason = (
+                pos.reason_code
+                or (diag.positioning.reason if diag is not None else None)
+                or "no_data"
+            )
+            lines.append(
+                _esc(
+                    f"- Positioning Derivatif [{pos_tag}]: UNAVAILABLE (reason={pos_reason})",
+                    html_mode,
+                )
+            )
         else:
-            p_parts = [f"status={pos.status}"]
+            if pos.status == "WARMING_UP":
+                status_str = f"insufficient_history ({pos.observation_count} bars)"
+            else:
+                status_str = f"status={pos.status}"
+            p_parts = [status_str]
             if pos.top_lsr_account is not None:
                 p_parts.append(f"Top L/S={format_indonesian_number(pos.top_lsr_account, 2)}")
             if pos.lsr_taker is not None:
@@ -361,7 +377,13 @@ def _append_composite_sentiment_panel(
                 _esc(f"- Positioning Derivatif [{pos_tag}]: " + " | ".join(p_parts), html_mode)
             )
     else:
-        lines.append(_esc("- Positioning Derivatif [FORWARD_ONLY]: UNAVAILABLE", html_mode))
+        pos_reason = (diag.positioning.reason if diag is not None else None) or "not_wired"
+        lines.append(
+            _esc(
+                f"- Positioning Derivatif [FORWARD_ONLY]: UNAVAILABLE (reason={pos_reason})",
+                html_mode,
+            )
+        )
 
     # 2. Fear & Greed Index: CONTEXT_ONLY + Alternative.me attribution (S-02 / S-04)
     if snapshot.fear_greed is not None:
@@ -375,7 +397,10 @@ def _append_composite_sentiment_panel(
             )
         )
     else:
-        lines.append(_esc("- Fear & Greed [CONTEXT_ONLY]: UNAVAILABLE", html_mode))
+        fg_reason = (diag.fear_greed.reason if diag is not None else None) or "not_wired"
+        lines.append(
+            _esc(f"- Fear & Greed [CONTEXT_ONLY]: UNAVAILABLE (reason={fg_reason})", html_mode)
+        )
 
     # 3. News tone & count: FORWARD_ONLY (S-03 / S-04)
     if snapshot.sentiment is not None:
@@ -391,7 +416,10 @@ def _append_composite_sentiment_panel(
             )
         )
     else:
-        lines.append(_esc("- Berita 24h [FORWARD_ONLY]: UNAVAILABLE", html_mode))
+        news_reason = (diag.news.reason if diag is not None else None) or "not_wired"
+        lines.append(
+            _esc(f"- Berita 24h [FORWARD_ONLY]: UNAVAILABLE (reason={news_reason})", html_mode)
+        )
 
 
 def render_deterministic_snapshot(

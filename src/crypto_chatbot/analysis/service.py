@@ -78,6 +78,8 @@ from crypto_chatbot.schemas.analysis import (
     Fact,
     InputRange,
     PositioningPanel,
+    SentimentPanelDiagnostics,
+    SentimentSourceStatus,
     SetupStatus,
     SmcSummary,
     StructureEvent,
@@ -1150,6 +1152,7 @@ def build_analysis_snapshot(
     macro_context: MacroBenchmarkContext | None = None,
     positioning: PositioningPanel | None = None,
     fear_greed: FearGreedObservation | None = None,
+    sentiment_diagnostics: SentimentPanelDiagnostics | None = None,
     maintenance_margin_rate: float | None = None,
     venue_max_leverage: float | None = None,
 ) -> AnalysisSnapshot:
@@ -1452,6 +1455,52 @@ def build_analysis_snapshot(
         as_of=as_of,
         use_available_time=use_available_time,
     )
+    resolved_sent_diag = sentiment_diagnostics
+    if resolved_sent_diag is None:
+        if positioning is None:
+            pos_status = SentimentSourceStatus(available=False, reason="not_wired")
+        elif positioning.status == "UNAVAILABLE":
+            pos_status = SentimentSourceStatus(
+                available=False,
+                reason=positioning.reason_code or "no_data",
+                detail=positioning.note,
+            )
+        elif positioning.status == "WARMING_UP":
+            pos_status = SentimentSourceStatus(
+                available=True,
+                reason="insufficient_history",
+                detail=(
+                    f"{positioning.observation_count} bars / {positioning.history_days:.1f}d < 7d"
+                ),
+            )
+        else:
+            pos_status = SentimentSourceStatus(available=True)
+
+        fg_status = (
+            SentimentSourceStatus(available=True)
+            if fear_greed is not None
+            else SentimentSourceStatus(available=False, reason="not_wired")
+        )
+
+        if sent_metrics is not None:
+            news_status = SentimentSourceStatus(available=True)
+        elif news_observations is None:
+            news_status = SentimentSourceStatus(available=False, reason="not_wired")
+        elif any(obs.available_time.astimezone(UTC) > as_of for obs in news_observations):
+            news_status = SentimentSourceStatus(
+                available=False,
+                reason="not_yet_available",
+                detail="observasi berita tersedia setelah as_of",
+            )
+        else:
+            news_status = SentimentSourceStatus(available=False, reason="no_data")
+
+        resolved_sent_diag = SentimentPanelDiagnostics(
+            positioning=pos_status,
+            fear_greed=fg_status,
+            news=news_status,
+        )
+
     return AnalysisSnapshot(
         snapshot_id=snap_id,
         provider=batch.metadata.provider,
@@ -1476,6 +1525,7 @@ def build_analysis_snapshot(
         macro_context=macro_context,
         positioning=positioning,
         fear_greed=fear_greed,
+        sentiment_diagnostics=resolved_sent_diag,
         facts=facts,
         regime=regime,
         market_structure=structure.market_structure,
@@ -2133,13 +2183,64 @@ class AnalysisService:
             )
 
         news_observations: tuple[SentimentObservation, ...] | None = None
+        news_status = SentimentSourceStatus(available=False, reason="not_wired")
         if self._news_repository is not None and primary_ok and primary.candles:
             primary_as_of = primary.candles[-1].close_time
-            news_observations = self._news_repository.load_observations(
-                canonical_symbol=mapping.canonical_symbol,
-                start_available_time=primary_as_of - timedelta(hours=24),
-                end_available_time=primary_as_of,
-            )
+            spot_symbol_key = f"{mapping.base}/USDT"
+            try:
+                news_observations = self._news_repository.load_observations(
+                    canonical_symbol=mapping.canonical_symbol,
+                    start_available_time=primary_as_of - timedelta(hours=24),
+                    end_available_time=primary_as_of,
+                )
+                if not news_observations and spot_symbol_key != mapping.canonical_symbol:
+                    news_observations = self._news_repository.load_observations(
+                        canonical_symbol=spot_symbol_key,
+                        start_available_time=primary_as_of - timedelta(hours=24),
+                        end_available_time=primary_as_of,
+                    )
+                if news_observations:
+                    agg_check = aggregate_sentiment(
+                        news_observations,
+                        canonical_symbol=mapping.canonical_symbol,
+                        as_of=primary_as_of,
+                    )
+                    if agg_check is not None:
+                        news_status = SentimentSourceStatus(available=True)
+                    else:
+                        news_status = SentimentSourceStatus(
+                            available=False,
+                            reason="not_yet_available",
+                            detail="observasi berita belum memenuhi syarat waktu/skor pada as_of",
+                        )
+                else:
+                    future_probe = self._news_repository.load_observations(
+                        canonical_symbol=mapping.canonical_symbol,
+                        start_available_time=primary_as_of,
+                        limit=1,
+                    )
+                    if not future_probe and spot_symbol_key != mapping.canonical_symbol:
+                        future_probe = self._news_repository.load_observations(
+                            canonical_symbol=spot_symbol_key,
+                            start_available_time=primary_as_of,
+                            limit=1,
+                        )
+                    if future_probe:
+                        news_status = SentimentSourceStatus(
+                            available=False,
+                            reason="not_yet_available",
+                            detail="berita tersedia setelah waktu as_of",
+                        )
+                    else:
+                        news_status = SentimentSourceStatus(available=False, reason="no_data")
+            except Exception as exc:
+                logger.warning("News repository query failed for %s: %s", effective_symbol, exc)
+                news_observations = None
+                news_status = SentimentSourceStatus(
+                    available=False,
+                    reason="error",
+                    detail=type(exc).__name__,
+                )
 
         dxy_candles: tuple[MarketCandle, ...] | None = None
         if self._dxy_provider is not None and primary_ok and primary.candles:
@@ -2173,40 +2274,122 @@ class AnalysisService:
                 btc_candles = None
 
         positioning_panel: PositioningPanel | None = None
+        pos_status = SentimentSourceStatus(available=False, reason="not_wired")
         if self._contract_stats_repository is not None and primary_ok and primary.candles:
             primary_as_of = primary.candles[-1].close_time
             win_start = primary_as_of - timedelta(days=30)
-            stats_obs = self._contract_stats_repository.load_contract_stats(
-                venue="gateio",
-                canonical_symbol=mapping.canonical_symbol,
-                interval="5m",
-                start_time=win_start,
-                end_available_time=primary_as_of,
-            )
-            if not stats_obs:
+            try:
                 stats_obs = self._contract_stats_repository.load_contract_stats(
-                    venue="gate",
+                    venue="gateio",
                     canonical_symbol=mapping.canonical_symbol,
                     interval="5m",
                     start_time=win_start,
                     end_available_time=primary_as_of,
                 )
-            positioning_panel = compute_positioning_panel(
-                stats_obs,
-                canonical_symbol=mapping.canonical_symbol,
-                as_of=primary_as_of,
-                use_available_time=True,
-            )
+                if not stats_obs:
+                    stats_obs = self._contract_stats_repository.load_contract_stats(
+                        venue="gate",
+                        canonical_symbol=mapping.canonical_symbol,
+                        interval="5m",
+                        start_time=win_start,
+                        end_available_time=primary_as_of,
+                    )
+                if not stats_obs:
+                    future_stats = self._contract_stats_repository.load_contract_stats(
+                        venue="gateio",
+                        canonical_symbol=mapping.canonical_symbol,
+                        interval="5m",
+                        limit=1,
+                    )
+                    if not future_stats:
+                        future_stats = self._contract_stats_repository.load_contract_stats(
+                            venue="gate",
+                            canonical_symbol=mapping.canonical_symbol,
+                            interval="5m",
+                            limit=1,
+                        )
+                    positioning_panel = compute_positioning_panel(
+                        future_stats,
+                        canonical_symbol=mapping.canonical_symbol,
+                        as_of=primary_as_of,
+                        use_available_time=True,
+                    )
+                else:
+                    positioning_panel = compute_positioning_panel(
+                        stats_obs,
+                        canonical_symbol=mapping.canonical_symbol,
+                        as_of=primary_as_of,
+                        use_available_time=True,
+                    )
+
+                if positioning_panel.status == "UNAVAILABLE":
+                    pos_status = SentimentSourceStatus(
+                        available=False,
+                        reason=positioning_panel.reason_code or "no_data",
+                        detail=positioning_panel.note,
+                    )
+                elif positioning_panel.status == "WARMING_UP":
+                    pos_status = SentimentSourceStatus(
+                        available=True,
+                        reason="insufficient_history",
+                        detail=(
+                            f"{positioning_panel.observation_count} bars / "
+                            f"{positioning_panel.history_days:.1f}d < 7d"
+                        ),
+                    )
+                else:
+                    pos_status = SentimentSourceStatus(available=True)
+            except Exception as exc:
+                logger.warning(
+                    "Contract stats repository query failed for %s: %s", effective_symbol, exc
+                )
+                positioning_panel = None
+                pos_status = SentimentSourceStatus(
+                    available=False,
+                    reason="error",
+                    detail=type(exc).__name__,
+                )
 
         fear_greed_obs: FearGreedObservation | None = None
+        fg_status = SentimentSourceStatus(available=False, reason="not_wired")
         if self._fear_greed_repository is not None and primary_ok and primary.candles:
-            fg_rows = self._fear_greed_repository.load_observations(
-                source="alternative.me",
-                end_available_time=primary.candles[-1].close_time,
-                limit=1,
-            )
-            if fg_rows:
-                fear_greed_obs = fg_rows[-1]
+            primary_as_of = primary.candles[-1].close_time
+            try:
+                fg_rows = self._fear_greed_repository.load_observations(
+                    source="alternative.me",
+                    end_available_time=primary_as_of,
+                    limit=1,
+                )
+                if fg_rows:
+                    fear_greed_obs = fg_rows[-1]
+                    fg_status = SentimentSourceStatus(available=True)
+                else:
+                    any_fg = self._fear_greed_repository.load_observations(
+                        source="alternative.me",
+                        limit=1,
+                    )
+                    if any_fg:
+                        fg_status = SentimentSourceStatus(
+                            available=False,
+                            reason="not_yet_available",
+                            detail="data Fear & Greed tersedia setelah waktu as_of",
+                        )
+                    else:
+                        fg_status = SentimentSourceStatus(available=False, reason="no_data")
+            except Exception as exc:
+                logger.warning("Fear & Greed repository query failed: %s", exc)
+                fear_greed_obs = None
+                fg_status = SentimentSourceStatus(
+                    available=False,
+                    reason="error",
+                    detail=type(exc).__name__,
+                )
+
+        sent_diag = SentimentPanelDiagnostics(
+            positioning=pos_status,
+            fear_greed=fg_status,
+            news=news_status,
+        )
 
         mmr_rate: float | None = None
         venue_max_lev: float | None = None
@@ -2227,6 +2410,7 @@ class AnalysisService:
             btc_candles=btc_candles,
             positioning=positioning_panel,
             fear_greed=fear_greed_obs,
+            sentiment_diagnostics=sent_diag,
             maintenance_margin_rate=mmr_rate,
             venue_max_leverage=venue_max_lev,
         )

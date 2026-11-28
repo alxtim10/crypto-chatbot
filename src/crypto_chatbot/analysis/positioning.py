@@ -6,7 +6,7 @@ import math
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 
-from crypto_chatbot.schemas.analysis import PositioningPanel
+from crypto_chatbot.schemas.analysis import PositioningPanel, SentimentReasonCode
 from crypto_chatbot.schemas.derivatives import ContractStatsObservation
 
 DEFAULT_POSITIONING_WARMUP_DAYS = 7.0
@@ -99,16 +99,29 @@ def compute_positioning_panel(
     eligible.sort(key=lambda o: o.observed_time)
 
     if not eligible:
+        has_future = any(
+            (obs.available_time if use_available_time else obs.observed_time).astimezone(UTC)
+            > as_of_utc
+            for obs in observations
+        )
+        reason: SentimentReasonCode = "not_yet_available" if has_future else "no_data"
+        note = (
+            "FORWARD_ONLY: data contract_stats hanya tersedia setelah waktu as_of "
+            "(not_yet_available)."
+            if has_future
+            else "FORWARD_ONLY: belum ada histori contract_stats Gate untuk simbol ini (no_data)."
+        )
         return PositioningPanel(
             parity_mode="FORWARD_ONLY",
             status="UNAVAILABLE",
+            reason_code=reason,
             venue=venue,
             canonical_symbol=canonical_symbol,
             as_of=as_of_utc,
             history_days=0.0,
             observation_count=0,
             summary_label="tidak_tersedia",
-            note="FORWARD_ONLY: belum ada histori contract_stats Gate untuk simbol ini.",
+            note=note,
         )
 
     latest = eligible[-1]
@@ -123,6 +136,7 @@ def compute_positioning_panel(
         return PositioningPanel(
             parity_mode="FORWARD_ONLY",
             status="WARMING_UP",
+            reason_code="insufficient_history",
             venue=latest.venue,
             canonical_symbol=canonical_symbol,
             as_of=as_of_utc,
@@ -139,7 +153,8 @@ def compute_positioning_panel(
             liq_skew_24h=liq_skew,
             summary_label="warming_up",
             note=(
-                f"FORWARD_ONLY: pemanasan historis ({history_days:.1f}/{warmup_days:.0f} hari); "
+                f"FORWARD_ONLY: pemanasan / insufficient_history ({len(eligible)} bars / "
+                f"{history_days:.1f}d < {warmup_days:.0f}d); "
                 "persentil/z-score 30d menunggu >= 7 hari rekaman contract_stats."
             ),
         )
