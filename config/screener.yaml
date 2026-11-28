@@ -1,14 +1,10 @@
-# Hourly alert worker & daily digest configuration (no LLM calls in alert worker)
+universe_file: config/universe.txt
+cadence_minutes: 15
 timeframes:
-  - 1h
-cooldown_hours:
-  1h: 6
-  4h: 12
-  1d: 24
-default_cooldown_hours: 6
-max_alerts_per_run: 4
-quiet_hours_wib:
-  start: "23:00"
-  end: "06:00"
-dead_man_hours: 2
-universe_path: config/universe.txt
+  bias: [4h, 1h]
+  setup: 15m
+  confirm: 5m
+cooldown_minutes: 120
+max_alerts_per_run: 3
+setup_expiry_minutes: 90
+quiet_hours_wib: "23:00-06:00"
