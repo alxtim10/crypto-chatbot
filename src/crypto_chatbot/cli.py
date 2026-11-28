@@ -2284,10 +2284,18 @@ def _run_alerts(
     database_url: str | None,
     dry_run: bool,
     as_json: bool,
+    frozen_params_path: Path | None = None,
+    allow_unfrozen: bool = False,
 ) -> int:
     from crypto_chatbot.alerts.config import load_screener_config, load_universe
     from crypto_chatbot.alerts.sender import TelegramOutboxSender
-    from crypto_chatbot.alerts.worker import run_alert_cycle, run_alert_digest, run_alert_warmup
+    from crypto_chatbot.alerts.worker import (
+        compute_active_params_sha256,
+        run_alert_cycle,
+        run_alert_digest,
+        run_alert_warmup,
+    )
+    from crypto_chatbot.analysis.forward_proof import load_frozen_params
     from crypto_chatbot.storage.repositories import PostgresAlertRepository
 
     try:
@@ -2343,6 +2351,41 @@ def _run_alerts(
         return 0
 
     symbols = load_universe(universe_path or screener_cfg.universe_path)
+
+    if action == "run":
+        active_sha = compute_active_params_sha256(
+            screener_config=screener_cfg,
+            universe=symbols,
+        )
+        frozen_target = frozen_params_path or Path("frozen_params.json")
+        if frozen_target.is_file():
+            try:
+                frozen_art = load_frozen_params(frozen_target)
+            except Exception as exc:
+                msg = f"Failed to read {frozen_target}: {exc}"
+                if not allow_unfrozen:
+                    print(f"Error: {msg} (pass --allow-unfrozen to override)", file=sys.stderr)
+                    engine.dispose()
+                    return 2
+                print(f"Warning: {msg} (--allow-unfrozen active)", file=sys.stderr)
+            else:
+                if frozen_art.params_sha256 != active_sha:
+                    mismatch_msg = (
+                        f"params_sha256 mismatch: active={active_sha[:12]}... "
+                        f"!= frozen={frozen_art.params_sha256[:12]}... ({frozen_target}). "
+                        "Run `crypto-chatbot freeze-params v3` to update or pass --allow-unfrozen."
+                    )
+                    if not allow_unfrozen:
+                        print(f"Error: {mismatch_msg}", file=sys.stderr)
+                        engine.dispose()
+                        return 2
+                    print(f"Warning: {mismatch_msg}", file=sys.stderr)
+        else:
+            print(
+                f"Warning: {frozen_target} not found (active params_sha256={active_sha[:12]}...). "
+                "Run `crypto-chatbot freeze-params v3` to freeze parameters.",
+                file=sys.stderr,
+            )
 
     if action == "warmup":
 
@@ -3338,6 +3381,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Write outbox/digest without sending Telegram API requests.",
     )
     alerts_parser.add_argument(
+        "--frozen-params",
+        type=Path,
+        default=Path("frozen_params.json"),
+        help="Path to frozen_params.json for hash verification (default: frozen_params.json).",
+    )
+    alerts_parser.add_argument(
+        "--allow-unfrozen",
+        action="store_true",
+        help="Warn instead of refusing when active params_sha256 differs from frozen_params.json.",
+    )
+    alerts_parser.add_argument(
         "--json",
         action="store_true",
         help="Print JSON output.",
@@ -3526,6 +3580,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             database_url=args.database_url,
             dry_run=args.dry_run,
             as_json=args.json,
+            frozen_params_path=args.frozen_params,
+            allow_unfrozen=args.allow_unfrozen,
         )
     if args.command == "init-db":
         return _run_init_db(database_url=args.database_url)

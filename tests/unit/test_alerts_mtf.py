@@ -850,3 +850,68 @@ def test_cost_gate_classification_5m_confirmation_and_deadman_default_1h() -> No
         chat_id=999,
     )
     assert monitor._max_silence == timedelta(hours=1)
+
+
+def test_freeze_params_hash_matches_alerts_run_and_enforces_mismatch(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`freeze-params v3` and `alerts run` produce the EXACT SAME params_sha256 and detect drift."""
+    from pathlib import Path
+
+    from crypto_chatbot import cli
+    from crypto_chatbot.alerts.config import load_universe
+    from crypto_chatbot.analysis.forward_proof import freeze_variant_params, load_frozen_params
+
+    frozen_file = Path(tmp_path) / "frozen_params.json"
+    cfg = load_screener_config("config/screener.yaml")
+    universe = load_universe(cfg.universe_path)
+
+    artifact = freeze_variant_params(
+        "v3",
+        output_path=frozen_file,
+        screener_config=cfg,
+        universe=universe,
+    )
+    alerts_sha = compute_active_params_sha256(screener_config=cfg, universe=universe)
+
+    assert artifact.params_sha256 == alerts_sha
+    assert artifact.setup_params_sha256 is not None
+    assert artifact.mtf_engine_version == "mtf-15m-v2"
+    assert artifact.screener_config_sha256 is not None
+    assert artifact.universe_sha256 is not None
+
+    reloaded = load_frozen_params(frozen_file)
+    assert reloaded.params_sha256 == alerts_sha
+
+    # Verify CLI `_run_alerts` refuses with exit code 2 when frozen_params.json mismatches
+    drifted_file = Path(tmp_path) / "drifted_frozen.json"
+    freeze_variant_params(
+        "v3",
+        output_path=drifted_file,
+        screener_config=cfg.model_copy(update={"setup_expiry_minutes": 45}),
+        universe=universe,
+    )
+
+    class _DummyEngine:
+        def dispose(self) -> None:
+            pass
+
+    monkeypatch.setattr(cli, "create_db_engine", lambda _url: _DummyEngine())
+    monkeypatch.setattr(cli, "init_db", lambda _eng: None)
+
+    rc = cli._run_alerts(
+        action="run",
+        config_path=Path("config/screener.yaml"),
+        universe_path=None,
+        chat_id=None,
+        database_url="postgresql+psycopg://u:p@localhost/db",
+        dry_run=True,
+        as_json=True,
+        frozen_params_path=drifted_file,
+        allow_unfrozen=False,
+    )
+    assert rc == 2
+    err_out = capsys.readouterr().err
+    assert "params_sha256 mismatch" in err_out

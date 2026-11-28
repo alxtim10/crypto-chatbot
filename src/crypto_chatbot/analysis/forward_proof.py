@@ -48,10 +48,70 @@ FORWARD_PROOF_THRESHOLDS: dict[Timeframe, tuple[int, int]] = {
 }
 
 
+MTF_ENGINE_VERSION = "mtf-15m-v2"
+
+
 def compute_params_sha256(params: dict[str, Any]) -> str:
     """Canonical SHA-256 digest of a parameter dictionary."""
     encoded = json.dumps(params, sort_keys=True, separators=(",", ":"), allow_nan=False)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def compute_runtime_params_bundle(
+    *,
+    variant: str = "v3",
+    params_override: dict[str, Any] | None = None,
+    screener_config: Any | None = None,
+    universe: Sequence[str] | None = None,
+    mtf_engine_version: str = MTF_ENGINE_VERSION,
+) -> tuple[str, dict[str, Any]]:
+    """Single shared SHA-256 hash function used by BOTH `freeze-params` and `alerts run`.
+
+    Combines:
+    - setup variant parameters (`setup_params_sha256`)
+    - MTF alert engine version (`mtf_engine_version`)
+    - normalized `screener.yaml` config (`screener_config_sha256`)
+    - normalized `universe.txt` symbol list (`universe_sha256`)
+    """
+    key = variant.strip().lower()
+    if params_override is not None:
+        setup_params = dict(params_override)
+    elif key in DEFAULT_VARIANT_PARAMS:
+        setup_params = dict(DEFAULT_VARIANT_PARAMS[key])
+    else:
+        raise ValueError(
+            f"Unknown variant {variant!r}; expected one of {sorted(DEFAULT_VARIANT_PARAMS)}"
+        )
+
+    setup_sha = compute_params_sha256(setup_params)
+    screener_sha: str | None = None
+    if screener_config is not None:
+        cfg_dict = (
+            screener_config.model_dump(mode="json")
+            if hasattr(screener_config, "model_dump")
+            else dict(screener_config)
+        )
+        screener_sha = compute_params_sha256(cfg_dict)
+
+    universe_sha: str | None = None
+    if universe is not None:
+        universe_sha = compute_params_sha256({"universe": list(universe)})
+
+    canonical_payload: dict[str, Any] = {
+        "setup_params_sha256": setup_sha,
+        "mtf_engine_version": mtf_engine_version,
+        "screener_config_sha256": screener_sha,
+        "universe_sha256": universe_sha,
+    }
+    digest = compute_params_sha256(canonical_payload)
+    components: dict[str, Any] = {
+        "setup_params": setup_params,
+        "setup_params_sha256": setup_sha,
+        "mtf_engine_version": mtf_engine_version,
+        "screener_config_sha256": screener_sha,
+        "universe_sha256": universe_sha,
+    }
+    return digest, components
 
 
 def _detect_git_sha() -> str | None:
@@ -80,6 +140,10 @@ class FrozenParamsArtifact(BaseModel):
     variant: str = Field(min_length=1)
     params: dict[str, Any]
     params_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    setup_params_sha256: str | None = None
+    mtf_engine_version: str | None = None
+    screener_config_sha256: str | None = None
+    universe_sha256: str | None = None
     frozen_at: UtcDatetime
     git_sha: str | None = None
 
@@ -89,25 +153,42 @@ def freeze_variant_params(
     *,
     output_path: Path | None = None,
     params_override: dict[str, Any] | None = None,
+    screener_config: Any | None = None,
+    universe: Sequence[str] | None = None,
+    screener_config_path: Path | str | None = None,
+    universe_path: Path | str | None = None,
     frozen_at: datetime | None = None,
 ) -> FrozenParamsArtifact:
-    """Freeze a strategy variant's parameters and optionally write `frozen_params.json`."""
-    key = variant.strip().lower()
-    if params_override is not None:
-        params = dict(params_override)
-    elif key in DEFAULT_VARIANT_PARAMS:
-        params = dict(DEFAULT_VARIANT_PARAMS[key])
-    else:
-        raise ValueError(
-            f"Unknown variant {variant!r}; expected one of {sorted(DEFAULT_VARIANT_PARAMS)}"
-        )
+    """Freeze a strategy variant + MTF config/universe using the shared `params_sha256` hash."""
+    from crypto_chatbot.alerts.config import load_screener_config, load_universe
 
-    digest = compute_params_sha256(params)
+    key = variant.strip().lower()
+    resolved_cfg = (
+        screener_config
+        if screener_config is not None
+        else load_screener_config(screener_config_path)
+    )
+    resolved_universe = (
+        tuple(universe)
+        if universe is not None
+        else load_universe(universe_path or resolved_cfg.universe_path)
+    )
+
+    digest, components = compute_runtime_params_bundle(
+        variant=key,
+        params_override=params_override,
+        screener_config=resolved_cfg,
+        universe=resolved_universe,
+    )
     ts = (frozen_at or datetime.now(UTC)).astimezone(UTC)
     artifact = FrozenParamsArtifact(
         variant=key,
-        params=params,
+        params=components["setup_params"],
         params_sha256=digest,
+        setup_params_sha256=components["setup_params_sha256"],
+        mtf_engine_version=components["mtf_engine_version"],
+        screener_config_sha256=components["screener_config_sha256"],
+        universe_sha256=components["universe_sha256"],
         frozen_at=ts,
         git_sha=_detect_git_sha(),
     )
