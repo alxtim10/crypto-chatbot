@@ -469,6 +469,24 @@ async def _run_mtf_alert_cycle(
         sym = decision.canonical_symbol
         prev = alert_repo.get_symbol_state(sym, setup_tf)
 
+        # Record expired ARMED setup as a shadow entry in trade_setups (not alerted)
+        # so settle-setups can settle it and compare confirmed vs unconfirmed outcomes.
+        if decision.expired_armed_setup is not None:
+            expired_count += 1
+            if setup_repo is not None:
+                _save_mtf_setup_to_ledger(
+                    setup_repo,
+                    armed=decision.expired_armed_setup,
+                    trade_setup=None,
+                    params_sha=params_sha,
+                )
+                if hasattr(setup_repo, "record_user_action"):
+                    setup_repo.record_user_action(
+                        decision.expired_armed_setup.snapshot_id,
+                        action="shadow_expired",
+                        acted_at=now_utc,
+                    )
+
         if decision.failed_stage is not None:
             stage_failures[sym] = {
                 "stage": decision.failed_stage,
@@ -512,8 +530,6 @@ async def _run_mtf_alert_cycle(
             continue
 
         if decision.outcome in {"wait", "expired"}:
-            if decision.outcome == "expired":
-                expired_count += 1
             alert_repo.upsert_symbol_state(
                 AlertSymbolState(
                     canonical_symbol=sym,

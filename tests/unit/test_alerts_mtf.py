@@ -212,10 +212,16 @@ class _MemAlertRepo:
 class _MemSetupRepo:
     def __init__(self) -> None:
         self.saved: dict[str, tuple[str | None, int | None]] = {}
+        self.user_actions: dict[str, str] = {}
 
     def save_setup(self, snap: Any, setup: Any, *, params_sha256: str | None = None) -> bool:
         del setup
         self.saved[snap.snapshot_id] = (params_sha256, None)
+        return True
+
+    def record_user_action(self, snapshot_id: str, *, action: str, acted_at: datetime) -> bool:
+        del acted_at
+        self.user_actions[snapshot_id] = action
         return True
 
     def link_telegram_message(self, snapshot_id: str, *, chat_id: int, message_id: int) -> bool:
@@ -637,6 +643,7 @@ async def test_mtf_armed_setup_expires_after_setup_expiry_minutes(
         quiet_hours_wib=QuietHoursWib(enabled=False),
     )
     repo = _MemAlertRepo()
+    setup_repo = _MemSetupRepo()
     sender = _FakeSender()
     svc = _Svc(BASE_TIME)
 
@@ -644,6 +651,7 @@ async def test_mtf_armed_setup_expires_after_setup_expiry_minutes(
     r1 = await run_alert_cycle(
         analysis_service=svc,  # type: ignore[arg-type]
         alert_repo=repo,
+        setup_repo=setup_repo,  # type: ignore[arg-type]
         sender=sender,  # type: ignore[arg-type]
         screener_config=cfg,
         symbols=("BTC/USDT:USDT",),
@@ -651,14 +659,16 @@ async def test_mtf_armed_setup_expires_after_setup_expiry_minutes(
         clock=lambda: BASE_TIME,
     )
     assert r1.results[0].armed_count == 1
+    assert len(setup_repo.saved) == 0
 
-    # Run 2 at +105 minutes (past 90m expiry), bias lost -> expired!
+    # Run 2 at +105 minutes (past 90m expiry), bias lost -> expired & logged as shadow_expired!
     t_exp = BASE_TIME + timedelta(minutes=105)
     svc.now = t_exp
     state_flag["allow_setup"] = False
     r2 = await run_alert_cycle(
         analysis_service=svc,  # type: ignore[arg-type]
         alert_repo=repo,
+        setup_repo=setup_repo,  # type: ignore[arg-type]
         sender=sender,  # type: ignore[arg-type]
         screener_config=cfg,
         symbols=("BTC/USDT:USDT",),
@@ -667,10 +677,17 @@ async def test_mtf_armed_setup_expires_after_setup_expiry_minutes(
     )
     assert r2.results[0].expired_count == 1
     assert r2.results[0].sent_alerts == 0
+    assert len(sender.sent) == 0
     st = repo.get_symbol_state("BTC/USDT:USDT", Timeframe.M15)
     assert st is not None
     assert st.last_status == "wait"
     assert st.armed_setup_json is None
+    # Shadow entry recorded in trade_setups with user_action='shadow_expired', not alerted
+    assert len(setup_repo.saved) == 1
+    shadow_snap_id, (shadow_sha, shadow_msg_id) = next(iter(setup_repo.saved.items()))
+    assert shadow_sha == r2.params_sha256
+    assert shadow_msg_id is None
+    assert setup_repo.user_actions[shadow_snap_id] == "shadow_expired"
 
 
 @pytest.mark.asyncio

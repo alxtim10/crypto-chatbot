@@ -2363,10 +2363,45 @@ def _run_alerts(
     return 0
 
 
+def _run_init_db(*, database_url: str | None = None) -> int:
+    """Idempotently create all database tables and apply backwards-compatible column migrations."""
+    db_url = database_url
+    if not db_url:
+        try:
+            settings = load_settings()
+            db_url = settings.database_url.get_secret_value()
+        except Exception as exc:
+            print(f"Configuration error: {exc}", file=sys.stderr)
+            return 1
+    try:
+        engine = create_db_engine(db_url)
+    except Exception as exc:
+        print(f"Database engine error: {exc}", file=sys.stderr)
+        return 1
+    try:
+        init_db(engine)
+    except Exception as exc:
+        print(f"Database initialization failed: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        engine.dispose()
+    print("OK: database tables and migrations initialized.")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="crypto-chatbot")
     subcommands = parser.add_subparsers(dest="command", required=True)
     subcommands.add_parser("check-config", help="Validate configuration without printing secrets.")
+    init_db_parser = subcommands.add_parser(
+        "init-db",
+        help="Idempotently create database tables and apply schema migrations.",
+    )
+    init_db_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Optional PostgreSQL URL override (defaults to DATABASE_URL from .env).",
+    )
 
     analyze_parser = subcommands.add_parser(
         "analyze",
@@ -3210,6 +3245,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             dry_run=args.dry_run,
             as_json=args.json,
         )
+    if args.command == "init-db":
+        return _run_init_db(database_url=args.database_url)
     parser.error(f"unknown command: {args.command}")  # pragma: no cover
 
 

@@ -272,6 +272,7 @@ class MtfSymbolDecision(BaseModel):
     item: ScannedSetupItem | None = None
     trade_setup: TradeSetup | None = None
     armed_setup: ArmedSetupSnapshot | None = None
+    expired_armed_setup: ArmedSetupSnapshot | None = None
     failed_stage: StageName | None = None
     failed_reason: str | None = None
 
@@ -381,7 +382,7 @@ def evaluate_symbol_mtf(
         candles_by_tf[tf] = _filter_closed_candles(b.candles, setup_close_time) if b else []
 
     # 2. Check existing ARMED setup first (expiry / 5m confirmation promotion).
-    expired_prev = False
+    expired_armed: ArmedSetupSnapshot | None = None
     if (
         prev_state is not None
         and prev_state.last_status == "armed"
@@ -390,7 +391,7 @@ def evaluate_symbol_mtf(
     ):
         armed = ArmedSetupSnapshot.model_validate(prev_state.armed_setup_json)
         if now_utc >= prev_state.armed_expires_at.astimezone(UTC):
-            expired_prev = True
+            expired_armed = armed
         else:
             # Verify HTF bias still agrees with armed direction.
             bias_check = evaluate_htf_bias(
@@ -466,7 +467,8 @@ def evaluate_symbol_mtf(
             venue=venue,
             setup_timeframe=setup_tf,
             setup_close_time=setup_close_time,
-            outcome="expired" if expired_prev else "wait",
+            outcome="expired" if expired_armed is not None else "wait",
+            expired_armed_setup=expired_armed,
             failed_stage="bias",
             failed_reason=bias_eval.reason,
         )
@@ -498,7 +500,8 @@ def evaluate_symbol_mtf(
             venue=venue,
             setup_timeframe=setup_tf,
             setup_close_time=setup_close_time,
-            outcome="expired" if expired_prev else "wait",
+            outcome="expired" if expired_armed is not None else "wait",
+            expired_armed_setup=expired_armed,
             failed_stage=stage,
             failed_reason=reason,
         )
@@ -510,7 +513,8 @@ def evaluate_symbol_mtf(
             venue=venue,
             setup_timeframe=setup_tf,
             setup_close_time=setup_close_time,
-            outcome="expired" if expired_prev else "wait",
+            outcome="expired" if expired_armed is not None else "wait",
+            expired_armed_setup=expired_armed,
             failed_stage="setup",
             failed_reason=(
                 f"Setup 15m ({trade_setup.bias.value.upper()}) berlawanan dengan "
@@ -528,7 +532,8 @@ def evaluate_symbol_mtf(
             venue=venue,
             setup_timeframe=setup_tf,
             setup_close_time=setup_close_time,
-            outcome="expired" if expired_prev else "wait",
+            outcome="expired" if expired_armed is not None else "wait",
+            expired_armed_setup=expired_armed,
             failed_stage="setup",
             failed_reason="Zona entry atau SL pada setup 15m tidak lengkap",
         )
@@ -560,7 +565,8 @@ def evaluate_symbol_mtf(
             venue=venue,
             setup_timeframe=setup_tf,
             setup_close_time=setup_close_time,
-            outcome="expired" if expired_prev else "wait",
+            outcome="expired" if expired_armed is not None else "wait",
+            expired_armed_setup=expired_armed,
             failed_stage="setup",
             failed_reason=confirm_detail,
         )
@@ -578,6 +584,7 @@ def evaluate_symbol_mtf(
             item=item,
             trade_setup=trade_setup,
             armed_setup=armed_snap,
+            expired_armed_setup=expired_armed,
         )
 
     # Without 5m confirmation, store as ARMED (no alert yet).
@@ -590,6 +597,7 @@ def evaluate_symbol_mtf(
         direction=htf_dir,
         trade_setup=trade_setup,
         armed_setup=armed_snap,
+        expired_armed_setup=expired_armed,
         failed_stage="confirm",
         failed_reason=f"Setup 15m ARMED ({htf_dir.upper()}); {confirm_detail}",
     )

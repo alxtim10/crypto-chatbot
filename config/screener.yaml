@@ -1,15 +1,32 @@
+# Multi-Timeframe (MTF) Alert Worker Configuration
 universe_file: config/universe.txt
 cadence_minutes: 15
+
+# Top-down MTF pipeline (all timeframes fetched from ONE venue, closed candles only):
+# - bias: 4h and 1h regime + market structure must both agree (TRENDING_UP+BULLISH or TRENDING_DOWN+BEARISH).
+# - setup: 15m entry zone, SL, TP1-3, and execution cost gate.
+# - confirm: last CLOSED 5m candle (close_time <= 15m_close_time, available_time <= cutoff):
+#     * Invalidation: 5m close <= SL (LONG) or 5m close >= SL (SHORT) -> setup disarmed.
+#     * LONG confirm: 5m bullish close (close > open) AND
+#         (close > prev_5m.high OR (low <= entry_high AND close >= entry_low)).
+#     * SHORT confirm: 5m bearish close (close < open) AND
+#         (close < prev_5m.low OR (high >= entry_low AND close <= entry_high)).
+#     * Without 5m confirmation, setup is stored as ARMED (no alert) until setup_expiry_minutes.
+#       Expired ARMED setups are logged to trade_setups with user_action='shadow_expired' for
+#       unconfirmed vs confirmed settlement comparison.
 timeframes:
   bias: [4h, 1h]
   setup: 15m
   confirm: 5m
-cooldown_minutes: 120
+
+# Per-timeframe cooldown per (symbol, direction).
+# Precedence: cooldown_hours[<tf>] > legacy cooldown_minutes (if set) > default_cooldown_hours (2h).
 cooldown_hours:
   15m: 2
   1h: 6
   4h: 12
   1d: 24
+
 max_alerts_per_run: 3
 setup_expiry_minutes: 90
 dead_man_hours: 1
