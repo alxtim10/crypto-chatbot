@@ -127,6 +127,7 @@ class TimeframeOverview(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     timeframe: Timeframe
+    regime: Regime | None = None
     trend_label: str | None = None
     market_structure: MarketStructure | None = None
     structure_break: StructureEventType | None = None
@@ -137,6 +138,7 @@ class TimeframeOverview(BaseModel):
     resistance_level: FiniteFloat | None = Field(default=None, gt=0)
     active_poi: str | None = None
     rsi_14: FiniteFloat | None = Field(default=None, ge=0, le=100)
+    adx_14: FiniteFloat | None = Field(default=None, ge=0, le=100)
 
 
 class SetupStatus(StrEnum):

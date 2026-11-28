@@ -27,6 +27,14 @@ from crypto_chatbot.analysis.indicators import (
     compute_technical_metrics,
 )
 from crypto_chatbot.analysis.macro import build_macro_benchmark_context
+from crypto_chatbot.analysis.mtf import (
+    MTF_REGIME_LABELS as MTF_REGIME_LABELS,
+)
+from crypto_chatbot.analysis.mtf import (
+    MtfVenueMismatchError,
+    evaluate_mtf_overview,
+    filter_causal_venue_candles,
+)
 from crypto_chatbot.analysis.orderflow import compute_closed_candle_orderflow
 from crypto_chatbot.analysis.positioning import compute_positioning_panel
 from crypto_chatbot.analysis.regimes import classify_regime, classify_volatility_regime
@@ -70,7 +78,6 @@ from crypto_chatbot.schemas.analysis import (
     Fact,
     InputRange,
     PositioningPanel,
-    Regime,
     SetupStatus,
     SmcSummary,
     StructureEvent,
@@ -108,14 +115,6 @@ from crypto_chatbot.storage.repositories import (
 )
 
 logger = logging.getLogger(__name__)
-
-MTF_REGIME_LABELS: dict[Regime, str] = {
-    Regime.HIGH_VOLATILITY: "Volatilitas Tinggi",
-    Regime.TRENDING_UP: "Tren Naik",
-    Regime.TRENDING_DOWN: "Tren Turun",
-    Regime.RANGING: "Mendatar (Ranging)",
-    Regime.TRANSITIONAL: "Transisi",
-}
 
 _BLOCKING_BATCH_FLAGS: frozenset[QualityFlag] = frozenset(
     {
@@ -1027,102 +1026,13 @@ def _build_mtf_overview(
     as_of: datetime,
     use_available_time: bool,
 ) -> tuple[TimeframeOverview, ...]:
-    if not mtf_batches:
-        return ()
-
-    by_tf: dict[Timeframe, Sequence[MarketCandle]] = {batch.timeframe: batch.candles}
-    for tf, mtf_b in mtf_batches.items():
-        if tf is batch.timeframe:
-            continue
-        if not mtf_b.candles or (set(mtf_b.quality_flags) & _BLOCKING_BATCH_FLAGS):
-            continue
-        filtered = [
-            c
-            for c in mtf_b.candles
-            if (c.available_time if use_available_time else c.close_time) <= as_of
-        ]
-        if len(filtered) >= 15:
-            by_tf[tf] = filtered
-
-    if len(by_tf) < 2:
-        return ()
-
-    overviews: list[TimeframeOverview] = []
-    for tf in (Timeframe.D1, Timeframe.H4, Timeframe.H1, Timeframe.M15, Timeframe.M5):
-        seq = by_tf.get(tf)
-        if not seq:
-            continue
-        struct = analyze_market_structure(seq)
-        smc_tf = analyze_smc(seq, structure=struct)
-        rsi_val: float | None = None
-        trend_label: str | None = None
-        if len(seq) >= 43:
-            ind_tf = compute_technical_metrics(seq)
-            rsi_val = ind_tf.metrics.rsi_14
-            reg_tf = classify_regime(ind_tf.metrics)
-            ref_ema = (
-                ind_tf.metrics.ema_50
-                if ind_tf.metrics.ema_50 is not None
-                else ind_tf.metrics.ema_20
-            )
-            if reg_tf is not None:
-                mapped_trend = MTF_REGIME_LABELS.get(reg_tf)
-                if mapped_trend is None:
-                    logger.warning(
-                        "Missing MTF regime label for %s; falling back to value",
-                        reg_tf.value,
-                    )
-                    trend_label = reg_tf.value
-                else:
-                    trend_label = mapped_trend
-            elif ref_ema is not None:
-                trend_label = "Tren Naik" if ind_tf.metrics.last_close > ref_ema else "Tren Turun"
-
-        sup = (
-            smc_tf.dealing_range_low
-            if smc_tf.dealing_range_low is not None
-            else (struct.last_swing_lows[-1].level if struct.last_swing_lows else None)
-        )
-        res = (
-            smc_tf.dealing_range_high
-            if smc_tf.dealing_range_high is not None
-            else (struct.last_swing_highs[-1].level if struct.last_swing_highs else None)
-        )
-        pois: list[str] = []
-        if smc_tf.active_bullish_fvg is not None:
-            pois.append("Bull FVG")
-        if smc_tf.active_bullish_ob is not None:
-            pois.append("Bull OB")
-        if smc_tf.active_bearish_fvg is not None:
-            pois.append("Bear FVG")
-        if smc_tf.active_bearish_ob is not None:
-            pois.append("Bear OB")
-
-        overviews.append(
-            TimeframeOverview(
-                timeframe=tf,
-                trend_label=trend_label,
-                market_structure=struct.market_structure,
-                structure_break=(
-                    smc_tf.latest_structure_break.event_type
-                    if smc_tf.latest_structure_break is not None
-                    else None
-                ),
-                structure_break_level=(
-                    smc_tf.latest_structure_break.level
-                    if smc_tf.latest_structure_break is not None
-                    else None
-                ),
-                sweep=(smc_tf.latest_sweep.event_type if smc_tf.latest_sweep is not None else None),
-                dealing_zone=smc_tf.dealing_zone,
-                support_level=sup,
-                resistance_level=res,
-                active_poi=", ".join(pois) if pois else None,
-                rsi_14=rsi_val,
-            )
-        )
-
-    return tuple(overviews)
+    """Delegate to the single shared MTF context evaluator (`analysis/mtf.py`)."""
+    return evaluate_mtf_overview(
+        batch,
+        mtf_batches=mtf_batches,
+        as_of=as_of,
+        use_available_time=use_available_time,
+    )
 
 
 def _build_limitations(
@@ -1285,6 +1195,7 @@ def build_analysis_snapshot(
             if batch.timeframe in (Timeframe.H1, Timeframe.H4, Timeframe.D1)
             else {}
         )
+        expected_venue = batch.metadata.venue.strip().lower() or None
         for tf, mtf_batch in mtf_batches.items():
             if tf is batch.timeframe:
                 continue
@@ -1292,15 +1203,31 @@ def build_analysis_snapshot(
                 if tf in (Timeframe.H1, Timeframe.H4, Timeframe.D1):
                     dropped_mtf.append(tf)
                 continue
-            mtf_hashes[tf.value] = compute_candles_sha256(mtf_batch.candles)
+            try:
+                causal_mtf = filter_causal_venue_candles(
+                    mtf_batch.candles,
+                    as_of=as_of,
+                    expected_venue=expected_venue,
+                    use_available_time=use_available_time,
+                )
+            except MtfVenueMismatchError as exc:
+                logger.warning("Dropping MTF %s batch: %s", tf.value, exc)
+                if tf in (Timeframe.H1, Timeframe.H4, Timeframe.D1):
+                    dropped_mtf.append(tf)
+                continue
+            if not causal_mtf:
+                if tf in (Timeframe.H1, Timeframe.H4, Timeframe.D1):
+                    dropped_mtf.append(tf)
+                continue
+            mtf_hashes[tf.value] = compute_candles_sha256(causal_mtf)
             if tf in (Timeframe.H1, Timeframe.H4, Timeframe.D1):
-                mtf_candles[tf] = mtf_batch.candles
+                mtf_candles[tf] = causal_mtf
                 if batch.timeframe is Timeframe.M15:
-                    htf_candles_by_tf[tf] = mtf_batch.candles
+                    htf_candles_by_tf[tf] = causal_mtf
             elif tf is Timeframe.M15 and batch.timeframe is not Timeframe.M15:
-                ltf_15m_candles = mtf_batch.candles
+                ltf_15m_candles = causal_mtf
             elif tf is Timeframe.M5 and batch.timeframe is not Timeframe.M5:
-                micro_5m_candles = mtf_batch.candles
+                micro_5m_candles = causal_mtf
 
     ind_result = compute_technical_metrics(
         batch.candles,
@@ -1933,9 +1860,7 @@ class AnalysisService:
         def _fetch_limit(tf: Timeframe) -> int:
             if tf is Timeframe.M15:
                 return max(limit, 200)
-            if tf in requested_tfs or tf in (Timeframe.H1, Timeframe.H4):
-                return limit
-            return 100
+            return limit
 
         core_requests = [(tf, _fetch_limit(tf)) for tf in core_tfs]
         batches, pinned_provider, pinned_venue = await self._fetch_timeframe_bundle(
@@ -2084,7 +2009,7 @@ class AnalysisService:
         )
         bundle_requests: list[tuple[Timeframe, int]] = [
             (timeframe, limit),
-            *((tf, 100) for tf in other_tfs),
+            *((tf, limit) for tf in other_tfs),
         ]
         batches, pinned_provider, pinned_venue = await self._fetch_timeframe_bundle(
             mapping.canonical_symbol,
@@ -2410,7 +2335,7 @@ class AnalysisService:
                     market_type=stored.market_type,
                     timeframe=tf,
                     end_close_time=stored.as_of,
-                    limit=100,
+                    limit=DEFAULT_CANDLE_LIMIT,
                 )
                 if mtf_candles:
                     mtf_batches[tf] = _batch_from_stored_candles(
