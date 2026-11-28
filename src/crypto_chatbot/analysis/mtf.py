@@ -208,10 +208,6 @@ def evaluate_timeframe_context(
                 trend_label = regime.value
             else:
                 trend_label = mapped_trend
-        else:
-            ref_ema = metrics.ema_50 if metrics.ema_50 is not None else metrics.ema_20
-            if ref_ema is not None:
-                trend_label = "Tren Naik" if metrics.last_close > ref_ema else "Tren Turun"
 
     return TimeframeContext(
         timeframe=timeframe,

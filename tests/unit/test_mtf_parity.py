@@ -144,8 +144,21 @@ async def test_mtf_parity_across_standalone_analyze_15m_alerts_and_scanner() -> 
     t_4h = datetime(2026, 11, 28, 12, 0, tzinfo=UTC)
     t_1h = datetime(2026, 11, 28, 14, 0, tzinfo=UTC)
     t_15m = datetime(2026, 11, 28, 14, 15, tzinfo=UTC)
+    t_15m_later = datetime(2026, 11, 28, 15, 15, tzinfo=UTC)
     t_1d = datetime(2026, 11, 28, 0, 0, tzinfo=UTC)
 
+    c_1d_closed = _make_ranging_then_dip_candles(
+        timeframe=Timeframe.D1,
+        end_close=t_1d,
+        count=220,
+        append_forming_crash=False,
+    )
+    c_1d_with_forming = _make_ranging_then_dip_candles(
+        timeframe=Timeframe.D1,
+        end_close=t_1d,
+        count=220,
+        append_forming_crash=True,
+    )
     c_4h_closed = _make_ranging_then_dip_candles(
         timeframe=Timeframe.H4,
         end_close=t_4h,
@@ -175,22 +188,23 @@ async def test_mtf_parity_across_standalone_analyze_15m_alerts_and_scanner() -> 
         end_close=t_15m,
         count=220,
     )
+    c_15m_later = _make_ranging_then_dip_candles(
+        timeframe=Timeframe.M15,
+        end_close=t_15m_later,
+        count=220,
+    )
     c_5m = _make_ranging_then_dip_candles(
         timeframe=Timeframe.M5,
         end_close=t_15m,
         count=80,
     )
-    c_1d = _make_ranging_then_dip_candles(
-        timeframe=Timeframe.D1,
-        end_close=t_1d,
-        count=150,
-    )
 
     class _FixtureProvider:
         venue = "gate"
 
-        def __init__(self, *, include_forming_htf: bool) -> None:
+        def __init__(self, *, include_forming_htf: bool, use_later_15m: bool = False) -> None:
             self.include_forming_htf = include_forming_htf
+            self.use_later_15m = use_later_15m
             self.requested_limits: list[tuple[Timeframe, int]] = []
 
         async def get_closed_ohlcv(
@@ -199,23 +213,30 @@ async def test_mtf_parity_across_standalone_analyze_15m_alerts_and_scanner() -> 
             del symbol
             self.requested_limits.append((timeframe, limit))
             mapping = {
-                Timeframe.D1: c_1d,
+                Timeframe.D1: c_1d_with_forming if self.include_forming_htf else c_1d_closed,
                 Timeframe.H4: c_4h_with_forming if self.include_forming_htf else c_4h_closed,
                 Timeframe.H1: c_1h_with_forming if self.include_forming_htf else c_1h_closed,
-                Timeframe.M15: c_15m,
+                Timeframe.M15: c_15m_later if self.use_later_15m else c_15m,
                 Timeframe.M5: c_5m,
             }
             seq = mapping[timeframe]
             return _to_batch(seq[-limit:], timeframe)
 
-    # 1. Standalone 4h (as_of 12:00 UTC) and standalone 1h (as_of 14:00 UTC)
+    # 1. Standalone 1d (00:00 UTC), 4h (12:00 UTC), and 1h (14:00 UTC)
     standalone_svc = AnalysisService(provider=_FixtureProvider(include_forming_htf=False))  # type: ignore[arg-type]
+    snap_1d = await standalone_svc.analyze(
+        "BTC/USDT:USDT", Timeframe.D1, include_mtf=False, include_derivatives=False, persist=False
+    )
     snap_4h = await standalone_svc.analyze(
         "BTC/USDT:USDT", Timeframe.H4, include_mtf=False, include_derivatives=False, persist=False
     )
     snap_1h = await standalone_svc.analyze(
         "BTC/USDT:USDT", Timeframe.H1, include_mtf=False, include_derivatives=False, persist=False
     )
+    assert snap_1d.as_of == t_1d
+    assert snap_1d.regime is Regime.RANGING
+    assert snap_1d.technical is not None
+    assert snap_1d.technical.adx_14 is not None
     assert snap_4h.as_of == t_4h
     assert snap_4h.regime is Regime.RANGING
     assert snap_4h.technical is not None
@@ -225,21 +246,38 @@ async def test_mtf_parity_across_standalone_analyze_15m_alerts_and_scanner() -> 
     assert snap_1h.technical is not None
     assert snap_1h.technical.adx_14 is not None
 
-    # 2. Top-down `analyze BTC 15m` (as_of 14:15 UTC) even when forming 4h/1h crash bars exist!
+    # 2. Top-down `analyze BTC 15m` at 14:15 UTC AND 15:15 UTC with forming 1d/4h/1h crash bars!
     mtf_provider = _FixtureProvider(include_forming_htf=True)
     mtf_svc = AnalysisService(provider=mtf_provider)  # type: ignore[arg-type]
     snap_15m = await mtf_svc.analyze(
         "BTC/USDT:USDT", Timeframe.M15, include_mtf=True, include_derivatives=False, persist=False
     )
+    snap_15m_later = await AnalysisService(
+        provider=_FixtureProvider(include_forming_htf=True, use_later_15m=True)  # type: ignore[arg-type]
+    ).analyze(
+        "BTC/USDT:USDT", Timeframe.M15, include_mtf=True, include_derivatives=False, persist=False
+    )
     assert snap_15m.as_of == t_15m
-    # Verify HTF timeframes were fetched with the same full lookback (1000), not 100!
+    assert snap_15m_later.as_of == t_15m_later
+    # Verify all HTF timeframes (1d, 4h, 1h) were fetched with full lookback (1000)
     limits_by_tf = dict(mtf_provider.requested_limits)
+    assert limits_by_tf[Timeframe.D1] == 1000
     assert limits_by_tf[Timeframe.H4] == limits_by_tf[Timeframe.M15] == 1000
     assert limits_by_tf[Timeframe.H1] == 1000
 
     ov_by_tf = {ov.timeframe: ov for ov in snap_15m.mtf_overview}
+    ov_later_by_tf = {ov.timeframe: ov for ov in snap_15m_later.mtf_overview}
+    assert Timeframe.D1 in ov_by_tf
     assert Timeframe.H4 in ov_by_tf
     assert Timeframe.H1 in ov_by_tf
+
+    # Exact parity & intraday invariance on 1d (14:15 UTC == 15:15 UTC == standalone 1d 00:00 UTC)
+    assert ov_by_tf[Timeframe.D1].regime is snap_1d.regime
+    assert ov_by_tf[Timeframe.D1].market_structure is snap_1d.market_structure
+    assert ov_by_tf[Timeframe.D1].adx_14 == pytest.approx(snap_1d.technical.adx_14)
+    assert ov_later_by_tf[Timeframe.D1].regime is snap_1d.regime
+    assert ov_later_by_tf[Timeframe.D1].market_structure is snap_1d.market_structure
+    assert ov_later_by_tf[Timeframe.D1].adx_14 == pytest.approx(snap_1d.technical.adx_14)
 
     # Exact parity on 4h: regime, structure, ADX14, and Indonesian trend label
     assert ov_by_tf[Timeframe.H4].regime is snap_4h.regime
