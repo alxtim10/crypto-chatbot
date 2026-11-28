@@ -1,0 +1,31 @@
+{
+  "generated_at": "2026-11-27T17:33:59.636699Z",
+  "venue": "gate",
+  "canonical_symbol": "BTC/USDT:USDT",
+  "base_timeframe": "1h",
+  "threshold_bps": 5.0,
+  "targets": [
+    {
+      "target_timeframe": "4h",
+      "base_timeframe": "1h",
+      "matched_bars": 200,
+      "max_close_diff_bps": 0.0,
+      "mean_close_diff_bps": 0.0,
+      "max_volume_rel_diff_pct": 0.129901,
+      "mismatch_flagged": false,
+      "quality_flags": [],
+      "worst_bar_open_time": "2026-10-25T08:00:00Z"
+    },
+    {
+      "target_timeframe": "1d",
+      "base_timeframe": "1h",
+      "matched_bars": 200,
+      "max_close_diff_bps": 0.673968,
+      "mean_close_diff_bps": 0.0067,
+      "max_volume_rel_diff_pct": 12.724612,
+      "mismatch_flagged": false,
+      "quality_flags": [],
+      "worst_bar_open_time": "2026-10-25T00:00:00Z"
+    }
+  ]
+}

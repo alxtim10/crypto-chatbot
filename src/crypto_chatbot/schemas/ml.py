@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from enum import StrEnum
 from typing import Literal
 
@@ -15,8 +16,8 @@ from crypto_chatbot.schemas.analysis import (
 )
 from crypto_chatbot.schemas.market import FiniteFloat, QualityStatus, Timeframe, UtcDatetime
 
-FEATURE_VERSION = "ml-feat-v1.1.0"
-MODEL_VERSION = "l2-logreg-platt-v1.0.0"
+FEATURE_VERSION = "ml-feat-v1.2.0"
+MODEL_VERSION = "l2-logreg-platt-v1.0.1"
 DEFAULT_TARGET_NAME = "next_24h_return_exceeds_cost"
 
 
@@ -83,7 +84,7 @@ class FeatureRow(BaseModel):
     available_time: UtcDatetime
     label_end_time: UtcDatetime
     regime: Regime | None = None
-    features: dict[str, FiniteFloat]
+    features: Mapping[str, FiniteFloat | None]
     forward_return: FiniteFloat
     label: int = Field(ge=0, le=1)
 
@@ -237,6 +238,7 @@ class MlModelArtifact(BaseModel):
     bias: FiniteFloat
     platt_a: FiniteFloat
     platt_b: FiniteFloat
+    base_rate: FiniteFloat = Field(default=0.5, gt=0.0, lt=1.0)
     seen_regimes: tuple[str, ...]
     accepted: bool
     created_at: UtcDatetime

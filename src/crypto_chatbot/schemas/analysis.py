@@ -21,7 +21,7 @@ from crypto_chatbot.schemas.market import (
     UtcDatetime,
     validate_symbol_market_type,
 )
-from crypto_chatbot.schemas.news import SentimentMetrics
+from crypto_chatbot.schemas.news import FearGreedObservation, SentimentMetrics
 from crypto_chatbot.schemas.prediction_market import PredictionMarketSummary
 from crypto_chatbot.schemas.tradingview import TradingViewMetrics
 
@@ -74,9 +74,11 @@ class StructureEventType(StrEnum):
 
 
 class DealingZone(StrEnum):
+    BELOW_RANGE = "below_range"
     DISCOUNT = "discount"
     EQUILIBRIUM = "equilibrium"
     PREMIUM = "premium"
+    ABOVE_RANGE = "above_range"
 
 
 class PriceZone(BaseModel):
@@ -116,6 +118,7 @@ class SmcSummary(BaseModel):
     equilibrium: FiniteFloat | None = Field(default=None, gt=0)
     position_in_range: FiniteFloat | None = None
     dealing_zone: DealingZone | None = None
+    range_invalid: bool = False
 
 
 class TimeframeOverview(BaseModel):
@@ -179,9 +182,12 @@ class TradeSetup(BaseModel):
     net_rr_tp1: FiniteFloat | None = None
     net_rr_tp2: FiniteFloat | None = None
     net_rr_tp3: FiniteFloat | None = None
+    net_rr_blend: FiniteFloat | None = None
     cost_rate_round_trip: FiniteFloat | None = Field(default=None, ge=0)
+    min_sl_pct_implied: FiniteFloat | None = Field(default=None, ge=0)
     stop_loss_distance_pct: FiniteFloat | None = Field(default=None, ge=0)
     max_theoretical_leverage: int | None = Field(default=None, ge=1)
+    mmr_assumed: bool = False
     wait_reason: str | None = None
     risk_notes: tuple[str, ...] = ()
 
@@ -225,6 +231,14 @@ class TradeSetup(BaseModel):
         return self
 
 
+class FactStatus(StrEnum):
+    """Availability status of a fact in the AnalysisSnapshot ledger (PRD v1.7 §2.3)."""
+
+    OK = "OK"
+    DEGRADED = "DEGRADED"
+    NONE = "NONE"
+
+
 class Fact(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -235,6 +249,7 @@ class Fact(BaseModel):
     display_format: str = Field(min_length=1)
     source: str = Field(min_length=1)
     as_of: UtcDatetime
+    status: FactStatus = FactStatus.OK
 
 
 class InputRange(BaseModel):
@@ -386,6 +401,38 @@ class DerivativesMetrics(BaseModel):
     cross_source_pair: str | None = None
 
 
+PositioningStatus = Literal["READY", "WARMING_UP", "UNAVAILABLE"]
+
+
+class PositioningPanel(BaseModel):
+    """Gate.io perpetual crowd/top-trader positioning sentiment panel (FORWARD_ONLY, S-01)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    parity_mode: Literal["FORWARD_ONLY"] = "FORWARD_ONLY"
+    status: PositioningStatus = "UNAVAILABLE"
+    venue: str = Field(default="gateio", min_length=1)
+    canonical_symbol: str = Field(min_length=1)
+    as_of: UtcDatetime
+    history_days: FiniteFloat = Field(default=0.0, ge=0.0)
+    observation_count: int = Field(default=0, ge=0)
+    top_lsr_account: FiniteFloat | None = None
+    lsr_taker: FiniteFloat | None = None
+    lsr_account: FiniteFloat | None = None
+    top_lsr_size: FiniteFloat | None = None
+    open_interest_usd: FiniteFloat | None = Field(default=None, ge=0.0)
+    oi_24h_delta_pct: FiniteFloat | None = None
+    long_liq_24h_usd: FiniteFloat | None = Field(default=None, ge=0.0)
+    short_liq_24h_usd: FiniteFloat | None = Field(default=None, ge=0.0)
+    liq_skew_24h: FiniteFloat | None = Field(default=None, ge=-1.0, le=1.0)
+    top_lsr_account_pct_30d: FiniteFloat | None = Field(default=None, ge=0.0, le=100.0)
+    top_lsr_account_z_30d: FiniteFloat | None = None
+    lsr_taker_pct_30d: FiniteFloat | None = Field(default=None, ge=0.0, le=100.0)
+    lsr_taker_z_30d: FiniteFloat | None = None
+    summary_label: str = "tidak_tersedia"
+    note: str | None = None
+
+
 class ModelPredictionSummary(BaseModel):
     """User-facing experimental prediction attached only when ML release mode is PROMOTED."""
 
@@ -435,6 +482,8 @@ class AnalysisSnapshot(BaseModel):
     cross_venue_derivatives: CrossVenueDerivativesSummary | None = None
     prediction_markets: PredictionMarketSummary | None = None
     macro_context: MacroBenchmarkContext | None = None
+    positioning: PositioningPanel | None = None
+    fear_greed: FearGreedObservation | None = None
     ml_prediction: ModelPredictionSummary | None = None
     facts: tuple[Fact, ...] = ()
     regime: Regime | None = None
@@ -518,6 +567,12 @@ class AnalysisSnapshot(BaseModel):
                 and self.macro_context.btc_benchmark.as_of > self.as_of
             ):
                 raise ValueError("btc_benchmark as_of cannot exceed snapshot as_of (lookahead)")
+
+        if self.positioning is not None and self.positioning.as_of > self.as_of:
+            raise ValueError("positioning as_of cannot exceed snapshot as_of (lookahead)")
+
+        if self.fear_greed is not None and self.fear_greed.available_time > self.as_of:
+            raise ValueError("fear_greed available_time cannot exceed snapshot as_of (lookahead)")
 
         if self.quality_status in (QualityStatus.READY, QualityStatus.DEGRADED):
             if self.input_range is None:

@@ -53,17 +53,141 @@ class Settings(BaseSettings):
         TRADINGVIEW_PUBLISHED_WEBHOOK_IPS
     )
     ml_inference_mode: MlInferenceMode = MlInferenceMode.OFF
-    futures_exchange: str = Field(default="binance")
+    futures_exchange: str = Field(default="gate")
+    futures_exchange_fallbacks: Annotated[tuple[str, ...], NoDecode] = Field(
+        default=(),
+        validate_default=True,
+    )
+    primary_venue: str = Field(default="gateio")
+    venue_fallbacks: Annotated[tuple[str, ...], NoDecode] = Field(
+        default=(),
+        validate_default=True,
+    )
+    binance_enabled: bool = Field(default=False)
+    venue_cooldown_min: int = Field(default=360, ge=1, le=10080)
+    gate_direct_candles: bool = Field(default=True)
+    resample_from: str | None = Field(default=None)
+    gate_contract_stats_enabled: bool = Field(default=False)
+    gate_contract_stats_interval_seconds: int = Field(default=300, ge=10, le=3600)
+    gate_contract_stats_backfill_days: int = Field(default=179, ge=1, le=180)
+    gate_ws_enabled: bool = Field(default=False)
+    gate_ws_symbols: Annotated[tuple[str, ...], NoDecode] = Field(
+        default=("BTC", "ETH", "SOL"),
+        validate_default=True,
+    )
+    gate_ws_timeframes: Annotated[tuple[str, ...], NoDecode] = Field(
+        default=("1m", "5m", "15m", "1h"),
+        validate_default=True,
+    )
 
     @field_validator("futures_exchange", mode="before")
     @classmethod
     def _validate_futures_exchange(cls, value: object) -> str:
         if value is None or (isinstance(value, str) and not value.strip()):
-            return "binance"
+            return "gate"
         cleaned = str(value).strip().lower()
+        if cleaned == "gateio":
+            return "gate"
         if cleaned not in {"binance", "gate", "bingx"}:
-            raise ValueError("must be one of: binance, gate, bingx")
+            raise ValueError("must be one of: binance, gate, gateio, bingx")
         return cleaned
+
+    @field_validator("primary_venue", mode="before")
+    @classmethod
+    def _validate_primary_venue(cls, value: object) -> str:
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return "gateio"
+        cleaned = str(value).strip().lower()
+        if cleaned not in {"binance", "gate", "gateio", "bingx"}:
+            raise ValueError("must be one of: gateio, gate, bingx, binance")
+        return cleaned
+
+    @field_validator("futures_exchange_fallbacks", "venue_fallbacks", mode="before")
+    @classmethod
+    def _validate_futures_exchange_fallbacks(cls, value: object) -> tuple[str, ...]:
+        if value is None:
+            return ()
+        items: list[str]
+        if isinstance(value, str):
+            items = [part.strip().lower() for part in value.split(",") if part.strip()]
+        elif isinstance(value, (tuple, list)):
+            items = [str(part).strip().lower() for part in value if str(part).strip()]
+        else:
+            raise ValueError("must be a comma-separated list of exchanges")
+
+        allowed = {"binance", "gate", "gateio", "bingx"}
+        normalized: list[str] = []
+        for item in items:
+            if item not in allowed:
+                raise ValueError(
+                    f"unsupported fallback exchange '{item}'; "
+                    "must be one of: binance, gate, gateio, bingx"
+                )
+            mapped = "gate" if item == "gateio" else item
+            if mapped not in normalized:
+                normalized.append(mapped)
+        return tuple(normalized)
+
+    @property
+    def futures_exchange_chain(self) -> tuple[str, ...]:
+        """Ordered, deduplicated exchange chain honoring D-01 defaults and legacy flags."""
+        if (
+            "futures_exchange" in self.model_fields_set
+            or "futures_exchange_fallbacks" in self.model_fields_set
+        ):
+            return tuple(dict.fromkeys((self.futures_exchange, *self.futures_exchange_fallbacks)))
+
+        primary_norm = "gate" if self.primary_venue == "gateio" else self.primary_venue
+        raw_chain = tuple(dict.fromkeys((primary_norm, *self.venue_fallbacks)))
+        if not self.binance_enabled:
+            filtered = tuple(ex for ex in raw_chain if ex != "binance")
+            if not filtered:
+                raise ValueError(
+                    "No enabled venue remains when binance_enabled is false; "
+                    "set PRIMARY_VENUE=gateio or BINANCE_ENABLED=true"
+                )
+            return filtered
+        return raw_chain
+
+    @field_validator("resample_from", mode="before")
+    @classmethod
+    def _validate_resample_from(cls, value: object) -> str | None:
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return None
+        cleaned = str(value).strip().lower()
+        if cleaned not in {"1m", "5m", "15m", "1h"}:
+            raise ValueError("resample_from must be one of: 1m, 5m, 15m, 1h")
+        return cleaned
+
+    @field_validator("gate_ws_symbols", mode="before")
+    @classmethod
+    def _validate_gate_ws_symbols(cls, value: object) -> tuple[str, ...]:
+        if value is None:
+            return ("BTC", "ETH", "SOL")
+        if isinstance(value, str):
+            items = tuple(p.strip().upper() for p in value.split(",") if p.strip())
+            return items or ("BTC", "ETH", "SOL")
+        if isinstance(value, (tuple, list)):
+            items = tuple(str(p).strip().upper() for p in value if str(p).strip())
+            return items or ("BTC", "ETH", "SOL")
+        raise ValueError("must be comma-separated symbol strings")
+
+    @field_validator("gate_ws_timeframes", mode="before")
+    @classmethod
+    def _validate_gate_ws_timeframes(cls, value: object) -> tuple[str, ...]:
+        allowed = {"1m", "5m", "15m", "1h", "4h", "1d"}
+        if value is None:
+            return ("1m", "5m", "15m", "1h")
+        if isinstance(value, str):
+            raw = [p.strip().lower() for p in value.split(",") if p.strip()]
+        elif isinstance(value, (tuple, list)):
+            raw = [str(p).strip().lower() for p in value if str(p).strip()]
+        else:
+            raise ValueError("must be comma-separated timeframe strings")
+        for tf in raw:
+            if tf not in allowed:
+                raise ValueError(f"unsupported WS timeframe '{tf}'")
+        return tuple(dict.fromkeys(raw)) or ("1m", "5m", "15m", "1h")
 
     @field_validator("tradingview_webhook_secret", mode="before")
     @classmethod

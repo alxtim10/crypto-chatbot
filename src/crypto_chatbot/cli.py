@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import os
 import sys
 from collections.abc import Sequence
@@ -13,19 +14,55 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from sqlalchemy import Engine
 
+from crypto_chatbot.analysis.backtest import (
+    BacktestConfig,
+    RoundBoundaryMode,
+    render_backtest_report,
+    render_dual_book_report,
+    run_dual_paper_book_backtest,
+    run_setup_backtest,
+    send_round_events_webhook,
+    write_decision_log_jsonl,
+)
+from crypto_chatbot.analysis.forward_proof import freeze_variant_params
+from crypto_chatbot.analysis.momentum_screener import (
+    DEFAULT_MIN_VOLUME_24H_USD,
+    DEFAULT_TOP_PER_SIDE,
+    render_momentum_screener_report,
+    screen_momentum_movers,
+)
+from crypto_chatbot.analysis.pine_export import generate_pine_script
+from crypto_chatbot.analysis.scanner import (
+    DEFAULT_SCAN_BASKET,
+    render_market_scan_report,
+    scan_market_setups,
+)
 from crypto_chatbot.analysis.service import AnalysisService, build_analysis_snapshot
 from crypto_chatbot.analysis.setup import evaluate_setup_against_candles
+from crypto_chatbot.analysis.whale_tracker import (
+    WhaleWatchlistManager,
+    aggregate_whale_positions,
+    format_whale_overview_telegram,
+    format_whale_wallet_telegram,
+    format_whale_watchlist_telegram,
+)
 from crypto_chatbot.app import run_bot
 from crypto_chatbot.bot.templates import render_compact_snapshot, render_deterministic_snapshot
 from crypto_chatbot.config import ConfigError, load_settings
-from crypto_chatbot.market_data.ccxt_provider import CcxtMarketDataProvider
-from crypto_chatbot.market_data.derivatives_provider import CcxtDerivativesLiquidityProvider
+from crypto_chatbot.market_data.base import HistoryMarketDataProvider, OhlcvBatch
+from crypto_chatbot.market_data.bybit_derivatives import BybitDerivativesProvider
 from crypto_chatbot.market_data.derivatives_quality import (
     normalize_funding_rate_payload,
     normalize_liquidation_events,
     normalize_open_interest_payload,
 )
+from crypto_chatbot.market_data.fallback_provider import (
+    build_futures_providers,
+    normalize_exchange_chain,
+)
+from crypto_chatbot.market_data.gate_risk_tiers import GateRiskTiersClient
 from crypto_chatbot.market_data.macro_provider import DxyMarketDataProvider
 from crypto_chatbot.market_data.orderbook import normalize_order_book_payload
 from crypto_chatbot.market_data.quality import normalize_ohlcv_rows
@@ -37,8 +74,21 @@ from crypto_chatbot.market_data.symbols import (
     resolve_symbol,
 )
 from crypto_chatbot.market_data.tradingview import parse_ai_agent_lens_packet
+from crypto_chatbot.market_data.whale_provider import (
+    WhaleDataProvider,
+)
 from crypto_chatbot.ml.experiment import run_offline_experiment
+from crypto_chatbot.ml.meta_labels import (
+    build_meta_label_dataset,
+    run_meta_labeling_experiment,
+)
 from crypto_chatbot.ml.shadow import compute_shadow_monitoring_report
+from crypto_chatbot.ml.trials import (
+    JsonlTrialRegistry,
+    PostgresTrialRegistry,
+    TrialRecord,
+    TrialRegistry,
+)
 from crypto_chatbot.news.pipeline import build_sentiment_observations, deduplicate_articles
 from crypto_chatbot.ops import (
     BackupError,
@@ -48,16 +98,27 @@ from crypto_chatbot.ops import (
 )
 from crypto_chatbot.schemas.analysis import AnalysisSnapshot
 from crypto_chatbot.schemas.derivatives import DerivativesContext
-from crypto_chatbot.schemas.market import MarketType, Timeframe
+from crypto_chatbot.schemas.market import (
+    MULTI_STYLE_SCAN_TIMEFRAMES,
+    PRIMARY_TIMEFRAMES,
+    MarketType,
+    QualityStatus,
+    Timeframe,
+    resolve_primary_timeframe,
+)
 from crypto_chatbot.schemas.ml import MlExperimentConfig
 from crypto_chatbot.schemas.news import RawNewsItem, SentimentObservation
 from crypto_chatbot.schemas.tradingview import TradingViewPacket
+from crypto_chatbot.schemas.whale import NetworkType
 from crypto_chatbot.storage.database import create_db_engine, init_db
 from crypto_chatbot.storage.repositories import (
     DerivativesRepository,
     MarketRepository,
     NewsRepository,
+    PostgresContractStatsRepository,
     PostgresDerivativesRepository,
+    PostgresFearGreedRepository,
+    PostgresGateIngestRepository,
     PostgresMarketRepository,
     PostgresMlExperimentRepository,
     PostgresModelPredictionRepository,
@@ -193,21 +254,12 @@ def _load_derivatives_fixture(
     return context
 
 
-def _analyze_from_fixture(
+def _load_fixture_batch(
     *,
-    symbol: str,
+    mapping: SymbolMapping,
     timeframe: Timeframe,
     fixture_path: Path,
-    derivatives_fixture_path: Path | None,
-    tradingview_fixture_path: Path | None,
-    news_fixture_path: Path | None,
-    repository: MarketRepository | None,
-    derivatives_repository: DerivativesRepository | None,
-    setup_repository: SetupLogRepository | None = None,
-    tradingview_repository: TradingViewRepository | None = None,
-    news_repository: NewsRepository | None = None,
-) -> AnalysisSnapshot:
-    mapping = resolve_mvp_spot_symbol(symbol)
+) -> tuple[OhlcvBatch, datetime]:
     if not fixture_path.is_file():
         raise ValueError(f"fixture file not found: {fixture_path}")
 
@@ -237,6 +289,29 @@ def _analyze_from_fixture(
         timeframe=timeframe,
         received_time=received_time,
         now=received_time,
+    )
+    return batch, received_time
+
+
+def _analyze_from_fixture(
+    *,
+    symbol: str,
+    timeframe: Timeframe,
+    fixture_path: Path,
+    derivatives_fixture_path: Path | None,
+    tradingview_fixture_path: Path | None,
+    news_fixture_path: Path | None,
+    repository: MarketRepository | None,
+    derivatives_repository: DerivativesRepository | None,
+    setup_repository: SetupLogRepository | None = None,
+    tradingview_repository: TradingViewRepository | None = None,
+    news_repository: NewsRepository | None = None,
+) -> AnalysisSnapshot:
+    mapping = resolve_mvp_spot_symbol(symbol)
+    batch, received_time = _load_fixture_batch(
+        mapping=mapping,
+        timeframe=timeframe,
+        fixture_path=fixture_path,
     )
     derivatives_context = (
         _load_derivatives_fixture(
@@ -303,6 +378,52 @@ def _analyze_from_fixture(
     return snapshot
 
 
+def _resolve_exchange_chain_from_env() -> tuple[str, ...]:
+    legacy_primary = os.environ.get("FUTURES_EXCHANGE", "").strip().lower()
+    legacy_fallbacks = os.environ.get("FUTURES_EXCHANGE_FALLBACKS", "").strip()
+    if legacy_primary or legacy_fallbacks:
+        primary = legacy_primary or "gate"
+        fallbacks = [part.strip().lower() for part in legacy_fallbacks.split(",") if part.strip()]
+        return normalize_exchange_chain((primary, *fallbacks), default=("gate",))
+
+    primary_venue = os.environ.get("PRIMARY_VENUE", "gateio").strip().lower() or "gateio"
+    raw_fallbacks = os.environ.get("VENUE_FALLBACKS", "")
+    fallbacks = [part.strip().lower() for part in raw_fallbacks.split(",") if part.strip()]
+    binance_enabled = os.environ.get("BINANCE_ENABLED", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    chain = normalize_exchange_chain((primary_venue, *fallbacks), default=("gate",))
+    if not binance_enabled:
+        chain = tuple(ex for ex in chain if ex != "binance")
+    return chain or ("gate",)
+
+
+def _resolve_venue_cooldown_from_env() -> int:
+    raw = os.environ.get("VENUE_COOLDOWN_MIN", "360").strip()
+    try:
+        parsed = int(raw)
+    except ValueError:
+        return 360
+    return max(1, parsed)
+
+
+def _resolve_gate_direct_candles_from_env() -> bool:
+    raw = os.environ.get("GATE_DIRECT_CANDLES", "true").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _resolve_resample_from_env() -> Timeframe | None:
+    raw = os.environ.get("RESAMPLE_FROM", "").strip().lower()
+    if not raw:
+        return None
+    if raw not in {"1m", "5m", "15m", "1h"}:
+        raise ConfigError(f"RESAMPLE_FROM must be one of 1m, 5m, 15m, 1h (got {raw!r})")
+    return Timeframe(raw)
+
+
 async def _analyze_live(
     *,
     symbol: str,
@@ -315,43 +436,57 @@ async def _analyze_live(
     tradingview_repository: TradingViewRepository | None = None,
     news_repository: NewsRepository | None = None,
 ) -> AnalysisSnapshot:
-    futures_exchange = os.environ.get("FUTURES_EXCHANGE", "binance").strip().lower() or "binance"
-    async with CcxtMarketDataProvider(exchange_id=futures_exchange) as provider:
-        if include_derivatives:
-            async with CcxtDerivativesLiquidityProvider(
-                exchange_id=futures_exchange
-            ) as deriv_provider:
-                service = AnalysisService(
-                    provider=provider,
-                    repository=repository,
-                    derivatives_provider=deriv_provider,
-                    derivatives_repository=derivatives_repository,
-                    setup_repository=setup_repository,
-                    tradingview_repository=tradingview_repository,
-                    news_repository=news_repository,
-                    dxy_provider=DxyMarketDataProvider(),
-                )
-                return await service.analyze(
-                    symbol,
-                    timeframe,
-                    include_mtf=include_mtf,
-                    include_derivatives=True,
-                    persist=repository is not None,
-                )
+    chain = _resolve_exchange_chain_from_env()
+    provider, deriv_provider = build_futures_providers(
+        chain,
+        cooldown_minutes=_resolve_venue_cooldown_from_env(),
+        gate_direct_candles=_resolve_gate_direct_candles_from_env(),
+    )
+    bybit_provider = BybitDerivativesProvider() if "binance" in chain else None
+    dxy_provider = DxyMarketDataProvider() if include_derivatives else None
+    risk_tiers_client = GateRiskTiersClient() if "gate" in chain else None
+    try:
         service = AnalysisService(
             provider=provider,
             repository=repository,
+            derivatives_provider=deriv_provider if include_derivatives else None,
+            bybit_provider=bybit_provider if include_derivatives else None,
+            derivatives_repository=derivatives_repository,
             setup_repository=setup_repository,
             tradingview_repository=tradingview_repository,
             news_repository=news_repository,
+            dxy_provider=dxy_provider,
+            risk_tiers_client=risk_tiers_client,
+            resample_from=_resolve_resample_from_env(),
         )
         return await service.analyze(
             symbol,
             timeframe,
             include_mtf=include_mtf,
-            include_derivatives=False,
+            include_derivatives=include_derivatives,
             persist=repository is not None,
         )
+    finally:
+        await provider.close()
+        await deriv_provider.close()
+        if risk_tiers_client is not None:
+            await risk_tiers_client.close()
+        if bybit_provider is not None:
+            await bybit_provider.close()
+        if dxy_provider is not None:
+            await dxy_provider.close()
+
+
+def _parse_primary_timeframe(timeframe_raw: str) -> Timeframe:
+    resolved = resolve_primary_timeframe(timeframe_raw)
+    if resolved is not None:
+        return resolved
+    supported = ", ".join(
+        tf.value for tf in sorted(PRIMARY_TIMEFRAMES, key=lambda item: item.duration)
+    )
+    raise ValueError(
+        f"unsupported timeframe '{timeframe_raw}' (supported: {supported}, scalp, intraday, swing)"
+    )
 
 
 def _run_analyze(
@@ -375,13 +510,7 @@ def _run_analyze(
             if fixture_path is not None
             else resolve_default_perp_symbol(symbol_raw)
         )
-        try:
-            timeframe = Timeframe(timeframe_raw.strip().lower())
-        except ValueError:
-            supported = ", ".join(tf.value for tf in Timeframe)
-            raise ValueError(
-                f"unsupported timeframe '{timeframe_raw}' (supported: {supported})"
-            ) from None
+        timeframe = _parse_primary_timeframe(timeframe_raw)
 
         repository: MarketRepository | None = None
         derivatives_repository: DerivativesRepository | None = None
@@ -460,10 +589,16 @@ def _run_settle_setups(max_bars: int = 24) -> int:
         setup_repo = PostgresSetupLogRepository(engine)
         pending = setup_repo.list_pending_setups(limit=200)
         for rec in pending:
+            if rec.market_type in (MarketType.SPOT.value, MarketType.PERPETUAL.value):
+                resolved_market_type = MarketType(rec.market_type)
+            else:
+                resolved_market_type = (
+                    MarketType.PERPETUAL if ":" in rec.canonical_symbol else MarketType.SPOT
+                )
             future_candles = market_repo.load_candles(
                 venue=rec.venue,
                 canonical_symbol=rec.canonical_symbol,
-                market_type=MarketType.SPOT,
+                market_type=resolved_market_type,
                 timeframe=rec.timeframe,
                 start_open_time=rec.as_of,
             )
@@ -615,6 +750,29 @@ def _load_news_observations_from_fixture(
     return build_sentiment_observations(articles)
 
 
+logger = logging.getLogger(__name__)
+
+
+def _record_cli_trial(
+    trial: TrialRecord,
+    *,
+    engine: Engine | None = None,
+) -> None:
+    """Best-effort Trial Registry recording (PostgreSQL when configured, else local JSONL)."""
+    registry: TrialRegistry
+    if engine is not None:
+        registry = PostgresTrialRegistry(engine)
+    else:
+        trials_path_raw = os.environ.get("TRIALS_JSONL_PATH", "").strip()
+        registry = (
+            JsonlTrialRegistry(Path(trials_path_raw)) if trials_path_raw else JsonlTrialRegistry()
+        )
+    try:
+        registry.record_trial(trial)
+    except Exception:
+        logger.debug("Trial registry recording skipped due to storage error", exc_info=True)
+
+
 def _run_ml_experiment(
     *,
     symbol_raw: str,
@@ -623,6 +781,7 @@ def _run_ml_experiment(
     news_fixture_path: Path | None,
     as_json: bool,
     persist: bool,
+    target: str = "legacy",
 ) -> int:
     engine: Any = None
     try:
@@ -665,6 +824,26 @@ def _run_ml_experiment(
             now=received_time,
         )
         news_obs = _load_news_observations_from_fixture(news_fixture_path)
+        if target == "meta":
+            meta_ds = build_meta_label_dataset(
+                {mapping.canonical_symbol: batch.candles},
+                timeframe=timeframe,
+                sentiment_by_symbol=(
+                    {mapping.canonical_symbol: news_obs} if news_obs is not None else None
+                ),
+            )
+            meta_res = run_meta_labeling_experiment(meta_ds)
+            if as_json:
+                print(meta_res.model_dump_json(indent=2))
+            else:
+                print(
+                    f"Meta-Labeling {meta_res.timeframe.value} ({', '.join(meta_res.symbols)}) "
+                    f"| status={meta_res.status} | model={meta_res.model_version} "
+                    f"| filled={meta_res.filled_events_count} "
+                    f"| no_fill={meta_res.no_fill_excluded_count} "
+                    f"| promoted={meta_res.promoted}"
+                )
+            return 0
         config = MlExperimentConfig(
             canonical_symbol=mapping.canonical_symbol,
             timeframe=timeframe,
@@ -684,6 +863,23 @@ def _run_ml_experiment(
             engine = create_db_engine(database_url)
             init_db(engine)
             PostgresMlExperimentRepository(engine).save_experiment(report)
+
+        _record_cli_trial(
+            TrialRecord.create(
+                family=f"ml:{config.target_name}",
+                variant_params=config.model_dump(mode="json"),
+                data_window=(
+                    f"{batch.candles[0].open_time.strftime('%Y-%m-%d')}.."
+                    f"{batch.candles[-1].close_time.strftime('%Y-%m-%d')}"
+                ),
+                symbols=(config.canonical_symbol,),
+                timeframe=config.timeframe.value,
+                obs_frequency=config.timeframe.value,
+                sr_per_obs=None,
+                n_obs=report.oof_summary.sample_count,
+            ),
+            engine=engine,
+        )
     except (SymbolError, ValueError, json.JSONDecodeError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
@@ -912,6 +1108,1033 @@ def _run_shadow_report(
     return 0
 
 
+async def _fetch_live_ohlcv_for_backtest(
+    *,
+    symbol: str,
+    timeframe: Timeframe,
+    limit: int,
+) -> OhlcvBatch:
+    chain = _resolve_exchange_chain_from_env()
+    provider, deriv_provider = build_futures_providers(
+        chain,
+        cooldown_minutes=_resolve_venue_cooldown_from_env(),
+        gate_direct_candles=_resolve_gate_direct_candles_from_env(),
+    )
+    try:
+        if isinstance(provider, HistoryMarketDataProvider):
+            return await provider.get_closed_ohlcv_history(symbol, timeframe, limit=limit)
+        return await provider.get_closed_ohlcv(symbol, timeframe, limit=limit)
+    finally:
+        await provider.close()
+        await deriv_provider.close()
+
+
+def _load_causal_funding_for_backtest(
+    *,
+    venue: str,
+    canonical_symbol: str,
+    as_of: datetime,
+) -> tuple[tuple[datetime, float], ...] | None:
+    db_url = os.environ.get("DATABASE_URL")
+    if not db_url:
+        return None
+    engine = create_db_engine(db_url)
+    try:
+        repo = PostgresDerivativesRepository(engine)
+        obs = repo.load_funding_observations(
+            venue=venue,
+            canonical_symbol=canonical_symbol,
+            end_available_time=as_of,
+        )
+        if not obs:
+            return None
+        return tuple((o.observed_time, o.funding_rate) for o in obs)
+    except Exception:
+        return None
+    finally:
+        engine.dispose()
+
+
+def _run_backtest(
+    *,
+    symbol_raw: str,
+    timeframe_raw: str,
+    limit: int,
+    warmup: int,
+    max_hold: int,
+    step: int,
+    fixture_path: Path | None,
+    as_json: bool,
+    dual_book: bool = False,
+    boundary: str = "daily_utc",
+    log_jsonl: Path | None = None,
+    webhook_url: str | None = None,
+) -> int:
+    try:
+        resolved_tf = resolve_primary_timeframe(timeframe_raw)
+        if resolved_tf is not None:
+            timeframe = resolved_tf
+        else:
+            try:
+                timeframe = Timeframe(timeframe_raw.strip().lower())
+            except ValueError:
+                supported = ", ".join(tf.value for tf in Timeframe)
+                raise ValueError(
+                    f"unsupported timeframe '{timeframe_raw}' (supported: {supported})"
+                ) from None
+
+        if fixture_path is not None:
+            mapping = resolve_mvp_spot_symbol(symbol_raw)
+            batch, _ = _load_fixture_batch(
+                mapping=mapping,
+                timeframe=timeframe,
+                fixture_path=fixture_path,
+            )
+        else:
+            mapping = resolve_default_perp_symbol(symbol_raw)
+            batch = asyncio.run(
+                _fetch_live_ohlcv_for_backtest(
+                    symbol=mapping.canonical_symbol,
+                    timeframe=timeframe,
+                    limit=limit,
+                )
+            )
+
+        if batch.has_provider_error or not batch.candles:
+            msg = batch.error_message or "failed to load OHLCV candles for backtest"
+            raise ValueError(msg)
+
+        config = BacktestConfig(
+            warmup_bars=warmup,
+            max_hold_bars=max_hold,
+            step_bars=step,
+        )
+        funding_pairs = (
+            _load_causal_funding_for_backtest(
+                venue=batch.metadata.venue,
+                canonical_symbol=batch.canonical_symbol,
+                as_of=batch.candles[-1].close_time,
+            )
+            if fixture_path is None
+            else None
+        )
+        if dual_book:
+            dual_report = run_dual_paper_book_backtest(
+                batch.candles,
+                config=config,
+                boundary_mode=RoundBoundaryMode(boundary),
+                funding_history=funding_pairs,
+            )
+            events = (
+                *dual_report.always_on.decision_log,
+                *dual_report.flat_at_boundary.decision_log,
+            )
+            if log_jsonl is not None:
+                write_decision_log_jsonl(events, log_jsonl)
+            if webhook_url:
+                send_round_events_webhook(
+                    webhook_url,
+                    {
+                        "mode": "dual_book",
+                        "symbol": dual_report.always_on.symbol,
+                        "timeframe": dual_report.always_on.timeframe.value,
+                        "boundary_mode": dual_report.boundary_mode.value,
+                        "summary": dual_report.summary_note,
+                        "events": [ev.model_dump(mode="json") for ev in events],
+                    },
+                )
+            if as_json:
+                print(dual_report.model_dump_json(indent=2))
+            else:
+                print(render_dual_book_report(dual_report))
+            return 0
+
+        report = run_setup_backtest(
+            batch.candles,
+            config=config,
+            funding_history=funding_pairs,
+        )
+        _record_cli_trial(
+            TrialRecord.create(
+                family="setup_backtest",
+                variant_params={
+                    "symbol": report.symbol,
+                    "timeframe": report.timeframe.value,
+                    "warmup_bars": config.warmup_bars,
+                    "max_hold_bars": config.max_hold_bars,
+                    "step_bars": config.step_bars,
+                    "require_ema200": config.require_ema200,
+                    "cost_bps": config.cost_assumptions.round_trip_cost_bps,
+                },
+                data_window=(
+                    f"{report.start_time.strftime('%Y-%m-%d')}.."
+                    f"{report.end_time.strftime('%Y-%m-%d')}"
+                ),
+                symbols=(report.symbol,),
+                timeframe=report.timeframe.value,
+                obs_frequency="per_trade",
+                sr_per_obs=report.sharpe_per_trade,
+                n_obs=report.executed_trades,
+            ),
+        )
+        if log_jsonl is not None:
+            write_decision_log_jsonl(report.decision_log, log_jsonl)
+        if webhook_url:
+            send_round_events_webhook(
+                webhook_url,
+                {
+                    "mode": "single_book",
+                    "symbol": report.symbol,
+                    "timeframe": report.timeframe.value,
+                    "book_name": report.book_name,
+                    "executed_trades": report.executed_trades,
+                    "total_net_r": report.total_net_r,
+                    "events": [ev.model_dump(mode="json") for ev in report.decision_log],
+                },
+            )
+    except (SymbolError, ValueError, OSError, json.JSONDecodeError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if as_json:
+        print(report.model_dump_json(indent=2))
+    else:
+        print(render_backtest_report(report))
+    return 0
+
+
+def _run_pine(
+    *,
+    symbol_raw: str,
+    timeframe_raw: str,
+    fixture_path: Path | None,
+    out_path: Path | None,
+) -> int:
+    try:
+        mapping = (
+            resolve_mvp_spot_symbol(symbol_raw)
+            if fixture_path is not None
+            else resolve_default_perp_symbol(symbol_raw)
+        )
+        timeframe = _parse_primary_timeframe(timeframe_raw)
+
+        if fixture_path is not None:
+            snapshot = _analyze_from_fixture(
+                symbol=mapping.canonical_symbol,
+                timeframe=timeframe,
+                fixture_path=fixture_path,
+                derivatives_fixture_path=None,
+                tradingview_fixture_path=None,
+                news_fixture_path=None,
+                repository=None,
+                derivatives_repository=None,
+            )
+        else:
+            snapshot = asyncio.run(
+                _analyze_live(
+                    symbol=mapping.canonical_symbol,
+                    timeframe=timeframe,
+                    include_mtf=True,
+                    include_derivatives=True,
+                    repository=None,
+                    derivatives_repository=None,
+                )
+            )
+    except (SymbolError, ValueError, json.JSONDecodeError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if snapshot.quality_status is QualityStatus.INSUFFICIENT_DATA:
+        print(
+            f"Error: INSUFFICIENT_DATA for {snapshot.canonical_symbol} {snapshot.timeframe.value}",
+            file=sys.stderr,
+        )
+        return 1
+
+    script = generate_pine_script(snapshot)
+    if out_path is not None:
+        out_path.write_text(script, encoding="utf-8")
+        print(f"Pine Script written to {out_path}")
+    else:
+        print(script, end="")
+    return 0
+
+
+async def _run_scan_live(
+    *,
+    symbols: Sequence[str],
+    timeframe: Timeframe,
+    timeframes: Sequence[Timeframe] | None = None,
+) -> Any:
+    chain = _resolve_exchange_chain_from_env()
+    provider, deriv_provider = build_futures_providers(
+        chain,
+        cooldown_minutes=_resolve_venue_cooldown_from_env(),
+        gate_direct_candles=_resolve_gate_direct_candles_from_env(),
+    )
+    bybit_provider = BybitDerivativesProvider() if "binance" in chain else None
+    dxy_provider = DxyMarketDataProvider()
+    try:
+        service = AnalysisService(
+            provider=provider,
+            derivatives_provider=deriv_provider,
+            bybit_provider=bybit_provider,
+            dxy_provider=dxy_provider,
+        )
+        return await scan_market_setups(
+            service,
+            symbols,
+            timeframe=timeframe,
+            timeframes=timeframes,
+        )
+    finally:
+        await provider.close()
+        await deriv_provider.close()
+        await dxy_provider.close()
+        if bybit_provider is not None:
+            await bybit_provider.close()
+
+
+def _run_scan(
+    *,
+    symbols_raw: str | None,
+    timeframe_raw: str,
+    as_json: bool,
+) -> int:
+    try:
+        tf_norm = timeframe_raw.strip().lower()
+        if tf_norm in ("all", "multi"):
+            timeframe = Timeframe.H4
+            scan_tfs: tuple[Timeframe, ...] | None = MULTI_STYLE_SCAN_TIMEFRAMES
+        else:
+            timeframe = _parse_primary_timeframe(timeframe_raw)
+            scan_tfs = None
+        if symbols_raw and symbols_raw.strip():
+            targets = [part.strip() for part in symbols_raw.split(",") if part.strip()]
+        else:
+            targets = list(DEFAULT_SCAN_BASKET)
+        report = asyncio.run(
+            _run_scan_live(
+                symbols=targets,
+                timeframe=timeframe,
+                timeframes=scan_tfs,
+            )
+        )
+    except (SymbolError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if as_json:
+        print(report.model_dump_json(indent=2))
+    else:
+        print(render_market_scan_report(report, html_mode=False))
+    return 0
+
+
+async def _run_screen_live(
+    *,
+    side: Any,
+    min_vol: float,
+    top_per_side: int,
+) -> Any:
+    chain = _resolve_exchange_chain_from_env()
+    provider, deriv_provider = build_futures_providers(
+        chain,
+        cooldown_minutes=_resolve_venue_cooldown_from_env(),
+        gate_direct_candles=_resolve_gate_direct_candles_from_env(),
+    )
+    bybit_provider = BybitDerivativesProvider() if "binance" in chain else None
+    dxy_provider = DxyMarketDataProvider()
+    try:
+        service = AnalysisService(
+            provider=provider,
+            derivatives_provider=deriv_provider,
+            bybit_provider=bybit_provider,
+            dxy_provider=dxy_provider,
+        )
+        return await screen_momentum_movers(
+            service,
+            side=side,
+            min_volume_usd=min_vol,
+            top_per_side=top_per_side,
+        )
+    finally:
+        await provider.close()
+        await deriv_provider.close()
+        await dxy_provider.close()
+        if bybit_provider is not None:
+            await bybit_provider.close()
+
+
+def _run_screen(
+    *,
+    side: Any,
+    min_vol: float,
+    top_per_side: int,
+    as_json: bool,
+) -> int:
+    try:
+        report = asyncio.run(
+            _run_screen_live(
+                side=side,
+                min_vol=min_vol,
+                top_per_side=top_per_side,
+            )
+        )
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if as_json:
+        print(report.model_dump_json(indent=2))
+    else:
+        print(render_momentum_screener_report(report, html_mode=False))
+    return 0
+
+
+async def _run_whale_live(
+    *,
+    symbol: str | None,
+    wallet: str | None,
+    list_wallets: bool,
+) -> tuple[str, dict[str, Any]]:
+    manager = WhaleWatchlistManager()
+    if list_wallets:
+        entries = manager.list_entries()
+        text = format_whale_watchlist_telegram(entries, html_mode=False)
+        json_data = {"wallets": [e.model_dump(mode="json") for e in entries]}
+        return text, json_data
+
+    provider = WhaleDataProvider()
+    if wallet:
+        profile = await provider.get_wallet_profile(wallet)
+        text = format_whale_wallet_telegram(profile, html_mode=False)
+        json_data = profile.model_dump(mode="json")
+        return text, json_data
+
+    sym = symbol or "BTC"
+    entries = manager.list_entries()
+    targets = [(e.address, e.label) for e in entries if e.network == NetworkType.EVM]
+    positions = await provider.get_positions_for_symbol(sym, wallets=targets)
+    overview = aggregate_whale_positions(sym, positions)
+    text = format_whale_overview_telegram(overview, html_mode=False)
+    json_data = overview.model_dump(mode="json")
+    return text, json_data
+
+
+def _run_whale(
+    *,
+    symbol: str | None,
+    wallet: str | None,
+    list_wallets: bool,
+    as_json: bool,
+) -> int:
+    try:
+        text, json_data = asyncio.run(
+            _run_whale_live(
+                symbol=symbol,
+                wallet=wallet,
+                list_wallets=list_wallets,
+            )
+        )
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if as_json:
+        print(json.dumps(json_data, indent=2, default=str))
+    else:
+        print(text)
+    return 0
+
+
+def _run_contract_stats(
+    *,
+    action: str,
+    symbols_raw: str | None,
+    interval: str,
+    days: int,
+    limit: int,
+    interval_seconds: int,
+    as_json: bool,
+    database_url: str | None,
+) -> int:
+    from crypto_chatbot.analysis.scanner import DEFAULT_SCAN_BASKET
+    from crypto_chatbot.market_data.gate_contract_stats import (
+        ContractStatsRecorder,
+        ContractStatsScheduler,
+        GateContractStatsClient,
+    )
+
+    resolved_url = database_url or os.environ.get("DATABASE_URL")
+    if not resolved_url:
+        try:
+            settings = load_settings()
+            resolved_url = settings.database_url.get_secret_value()
+        except Exception:
+            resolved_url = None
+    if not resolved_url:
+        print("Error: DATABASE_URL is required for contract-stats.", file=sys.stderr)
+        return 1
+
+    if interval not in {"5m", "1h"}:
+        print(f"Error: unsupported interval '{interval}' (use 5m or 1h).", file=sys.stderr)
+        return 1
+    interval_lit: Any = interval
+    symbols = (
+        tuple(item.strip() for item in symbols_raw.split(",") if item.strip())
+        if symbols_raw
+        else DEFAULT_SCAN_BASKET
+    )
+
+    engine = create_db_engine(resolved_url)
+    init_db(engine)
+    repo = PostgresContractStatsRepository(engine)
+    client = GateContractStatsClient()
+    recorder = ContractStatsRecorder(
+        client=client,
+        repository=repo,
+        symbols=symbols,
+        interval=interval_lit,
+    )
+
+    try:
+        if action == "gap-report":
+            report = recorder.generate_gap_report(lookback_days=days)
+            if as_json:
+                print(report.model_dump_json(indent=2))
+            else:
+                print(
+                    f"Gate contract_stats gap report ({report.venue}, interval={report.interval}, "
+                    f"lookback={report.lookback_days}d)"
+                )
+                for item in report.symbols:
+                    print(
+                        f"- {item.canonical_symbol}: observed={item.observed_bars}/"
+                        f"{item.expected_bars} ({item.coverage_pct:.2f}%), "
+                        f"missing={item.missing_bars}, gaps={len(item.gaps)}"
+                    )
+            return 0
+
+        async def _run_async() -> int:
+            try:
+                if action == "poll":
+                    summary = await recorder.poll_once(limit=limit)
+                elif action == "backfill":
+                    summary = await recorder.backfill_history(lookback_days=days)
+                elif action == "schedule":
+                    scheduler = ContractStatsScheduler(
+                        recorder,
+                        interval_seconds=interval_seconds,
+                        backfill_days=days,
+                        run_backfill_on_start=True,
+                    )
+                    await scheduler.run_loop()
+                    return 0
+                else:
+                    raise ValueError(f"unknown action: {action}")
+            finally:
+                await client.close()
+
+            payload = {
+                "action": action,
+                "venue": summary.venue,
+                "interval": summary.interval,
+                "symbols_processed": summary.symbols_processed,
+                "fetched_rows": summary.fetched_rows,
+                "inserted_rows": summary.inserted_rows,
+                "skipped_duplicates": summary.skipped_duplicates,
+                "errors": list(summary.errors),
+            }
+            if as_json:
+                print(json.dumps(payload, indent=2))
+            else:
+                print(
+                    f"contract-stats {action}: symbols={summary.symbols_processed}, "
+                    f"fetched={summary.fetched_rows}, inserted={summary.inserted_rows}, "
+                    f"dupes={summary.skipped_duplicates}, errors={len(summary.errors)}"
+                )
+            return 0 if not summary.errors else 1
+
+        return asyncio.run(_run_async())
+    finally:
+        engine.dispose()
+
+
+def _run_ingest_gate_history(
+    *,
+    symbols_raw: str | None,
+    from_ym: str,
+    to_ym: str,
+    types_raw: str,
+    data_dir: Path,
+    validate_contiguity: bool,
+    as_json: bool,
+    database_url: str | None,
+) -> int:
+    from crypto_chatbot.market_data.gate_candles import GateFuturesRestClient
+    from crypto_chatbot.market_data.gate_contract_stats import DEFAULT_CONTRACT_STATS_UNIVERSE
+    from crypto_chatbot.market_data.gate_history_ingest import (
+        VERIFIED_GATEDATA_CANDLESTICK_TYPES,
+        GateHistoryIngestor,
+        validate_dataset_type,
+    )
+
+    symbols = (
+        tuple(item.strip() for item in symbols_raw.split(",") if item.strip())
+        if symbols_raw
+        else DEFAULT_CONTRACT_STATS_UNIVERSE
+    )
+    datasets = tuple(item.strip() for item in types_raw.split(",") if item.strip())
+    if not datasets:
+        print("Error: --types must specify at least one dataset.", file=sys.stderr)
+        return 1
+    try:
+        validated_datasets = tuple(validate_dataset_type(d) for d in datasets)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    resolved_url = database_url or os.environ.get("DATABASE_URL")
+    if not resolved_url:
+        try:
+            settings = load_settings()
+            resolved_url = settings.database_url.get_secret_value()
+        except Exception:
+            resolved_url = None
+    if not resolved_url:
+        print("Error: DATABASE_URL is required for ingest-gate-history.", file=sys.stderr)
+        return 1
+
+    engine = create_db_engine(resolved_url)
+    init_db(engine)
+    market_repo = PostgresMarketRepository(engine)
+    deriv_repo = PostgresDerivativesRepository(engine)
+    ledger_repo = PostgresGateIngestRepository(engine)
+
+    async def _run_async() -> dict[str, Any]:
+        need_multipliers = any(
+            d in VERIFIED_GATEDATA_CANDLESTICK_TYPES and VERIFIED_GATEDATA_CANDLESTICK_TYPES[d]
+            for d in validated_datasets
+        )
+        multipliers = {}
+        if need_multipliers:
+            spec_client = GateFuturesRestClient()
+            try:
+                multipliers = await spec_client.fetch_contracts()
+            finally:
+                await spec_client.close()
+
+        ingestor = GateHistoryIngestor(
+            data_dir=data_dir,
+            market_repository=market_repo,
+            derivatives_repository=deriv_repo,
+            ledger_repository=ledger_repo,
+            multipliers=multipliers,
+        )
+        try:
+            summary = await ingestor.ingest_range(
+                symbols=symbols,
+                from_ym=from_ym,
+                to_ym=to_ym,
+                datasets=validated_datasets,
+                validate_contiguity=validate_contiguity,
+            )
+        finally:
+            await ingestor.close()
+
+        return {
+            "files_processed": summary.files_processed,
+            "downloaded_files": summary.downloaded_files,
+            "skipped_files": summary.skipped_files,
+            "inserted_rows": summary.inserted_rows,
+            "missing_files": summary.missing_files,
+            "results": [
+                {
+                    "dataset": r.dataset,
+                    "contract": r.contract,
+                    "yyyymm": r.yyyymm,
+                    "status": r.status,
+                    "sha256": r.sha256,
+                    "row_count": r.row_count,
+                    "inserted_rows": r.inserted_rows,
+                    "contiguity_ok": r.contiguity_ok,
+                    "local_path": r.local_path,
+                }
+                for r in summary.results
+            ],
+        }
+
+    try:
+        payload = asyncio.run(_run_async())
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        engine.dispose()
+
+    if as_json:
+        print(json.dumps(payload, indent=2))
+    else:
+        print(
+            f"ingest-gate-history: files={payload['files_processed']}, "
+            f"downloaded={payload['downloaded_files']}, skipped={payload['skipped_files']}, "
+            f"inserted={payload['inserted_rows']}, missing={payload['missing_files']}"
+        )
+    return 0
+
+
+def _run_sync_gate_funding(
+    *,
+    symbols_raw: str | None,
+    days: int,
+    as_json: bool,
+    database_url: str | None,
+) -> int:
+    from crypto_chatbot.market_data.gate_contract_stats import DEFAULT_CONTRACT_STATS_UNIVERSE
+    from crypto_chatbot.market_data.gate_funding import (
+        GateFundingHistoryClient,
+        sync_gate_funding_history,
+    )
+
+    resolved_url = database_url or os.environ.get("DATABASE_URL")
+    if not resolved_url:
+        try:
+            settings = load_settings()
+            resolved_url = settings.database_url.get_secret_value()
+        except Exception:
+            resolved_url = None
+    if not resolved_url:
+        print("Error: DATABASE_URL is required for sync-gate-funding.", file=sys.stderr)
+        return 1
+
+    symbols = (
+        tuple(item.strip() for item in symbols_raw.split(",") if item.strip())
+        if symbols_raw
+        else DEFAULT_CONTRACT_STATS_UNIVERSE
+    )
+    engine = create_db_engine(resolved_url)
+    init_db(engine)
+    deriv_repo = PostgresDerivativesRepository(engine)
+
+    async def _run_async() -> dict[str, int]:
+        client = GateFundingHistoryClient()
+        try:
+            return await sync_gate_funding_history(
+                symbols,
+                client=client,
+                repository=deriv_repo,
+                days=days,
+            )
+        finally:
+            await client.close()
+
+    try:
+        counts = asyncio.run(_run_async())
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        engine.dispose()
+
+    if as_json:
+        print(json.dumps({"days": days, "inserted": counts}, indent=2))
+    else:
+        total = sum(counts.values())
+        print(f"sync-gate-funding ({days}d): symbols={len(counts)} total_inserted={total}")
+        for sym, count in counts.items():
+            print(f"- {sym}: {count}")
+    return 0
+
+
+def _run_sync_fear_greed(
+    *,
+    limit: int,
+    as_json: bool,
+    database_url: str | None,
+) -> int:
+    from crypto_chatbot.news.fear_greed import FearGreedClient, sync_fear_greed
+
+    resolved_url = database_url or os.environ.get("DATABASE_URL")
+    if not resolved_url:
+        try:
+            settings = load_settings()
+            resolved_url = settings.database_url.get_secret_value()
+        except Exception:
+            resolved_url = None
+    if not resolved_url:
+        print("Error: DATABASE_URL is required for sync-fear-greed.", file=sys.stderr)
+        return 1
+
+    engine = create_db_engine(resolved_url)
+    init_db(engine)
+    repo = PostgresFearGreedRepository(engine)
+
+    async def _run_async() -> Any:
+        client = FearGreedClient()
+        try:
+            return await sync_fear_greed(client=client, repository=repo, limit=limit)
+        finally:
+            await client.close()
+
+    try:
+        res = asyncio.run(_run_async())
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        engine.dispose()
+
+    payload = {
+        "fetched_rows": res.fetched_rows,
+        "inserted_rows": res.inserted_rows,
+        "skipped_duplicates": res.skipped_duplicates,
+        "latest_value": res.latest.value if res.latest else None,
+        "latest_classification": res.latest.classification if res.latest else None,
+    }
+    if as_json:
+        print(json.dumps(payload, indent=2))
+    else:
+        print(
+            f"sync-fear-greed: fetched={res.fetched_rows}, inserted={res.inserted_rows}, "
+            f"dupes={res.skipped_duplicates}"
+        )
+    return 0
+
+
+def _run_resample_parity(
+    *,
+    symbol_raw: str,
+    bars: int,
+    out_path: str | None,
+    as_json: bool,
+) -> int:
+    from crypto_chatbot.market_data.gate_candles import GateFuturesMarketDataProvider
+    from crypto_chatbot.market_data.resampling import (
+        ResampleParityReport,
+        compare_resampled_with_native,
+        resample_candles,
+    )
+
+    try:
+        mapping = resolve_default_perp_symbol(symbol_raw)
+    except SymbolError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    target_bars = max(1, bars)
+
+    async def _run_async() -> ResampleParityReport:
+        provider = GateFuturesMarketDataProvider()
+        try:
+            needed_1h = target_bars * 24 + 24
+            base_batch, native_4h, native_1d = await asyncio.gather(
+                provider.get_closed_ohlcv_history(
+                    mapping.canonical_symbol, Timeframe.H1, limit=needed_1h
+                ),
+                provider.get_closed_ohlcv_history(
+                    mapping.canonical_symbol, Timeframe.H4, limit=target_bars + 2
+                ),
+                provider.get_closed_ohlcv_history(
+                    mapping.canonical_symbol, Timeframe.D1, limit=target_bars + 2
+                ),
+            )
+            if not base_batch.candles:
+                raise RuntimeError(base_batch.error_message or "No closed 1h Gate candles received")
+            as_of = base_batch.candles[-1].close_time
+            res_4h = resample_candles(
+                base_batch.candles, target_timeframe=Timeframe.H4, as_of=as_of
+            )
+            res_1d = resample_candles(
+                base_batch.candles, target_timeframe=Timeframe.D1, as_of=as_of
+            )
+            summary_4h = compare_resampled_with_native(
+                res_4h.candles,
+                native_4h.candles,
+                base_timeframe=Timeframe.H1,
+                target_timeframe=Timeframe.H4,
+                max_bars=target_bars,
+            )
+            summary_1d = compare_resampled_with_native(
+                res_1d.candles,
+                native_1d.candles,
+                base_timeframe=Timeframe.H1,
+                target_timeframe=Timeframe.D1,
+                max_bars=target_bars,
+            )
+            return ResampleParityReport(
+                generated_at=datetime.now(UTC),
+                venue="gate",
+                canonical_symbol=mapping.canonical_symbol,
+                base_timeframe=Timeframe.H1,
+                targets=(summary_4h, summary_1d),
+            )
+        finally:
+            await provider.close()
+
+    try:
+        report = asyncio.run(_run_async())
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    rendered = report.model_dump_json(indent=2)
+    if out_path:
+        dest = Path(out_path)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(rendered + "\n", encoding="utf-8")
+
+    if as_json:
+        print(rendered)
+    else:
+        for t in report.targets:
+            print(
+                f"{report.canonical_symbol} {t.base_timeframe.value}->{t.target_timeframe.value}: "
+                f"matched={t.matched_bars}, max_diff_bps={t.max_close_diff_bps:.4f}, "
+                f"mean_diff_bps={t.mean_close_diff_bps:.4f}, mismatch={t.mismatch_flagged}"
+            )
+    return 0
+
+
+def _run_sync_news(
+    *,
+    source: str,
+    as_json: bool,
+    database_url: str | None,
+) -> int:
+    from crypto_chatbot.news.ingestor import PublicRssNewsClient, sync_public_rss_news
+    from crypto_chatbot.storage.database import create_db_engine, init_db
+    from crypto_chatbot.storage.repositories import PostgresNewsRepository
+
+    src = source.strip().lower()
+    if src == "cryptopanic":
+        print(
+            "Error: CryptoPanic API live endpoints return HTTP 403 Cloudflare challenge "
+            "without a verified CRYPTOPANIC_API_KEY; use --source rss instead.",
+            file=sys.stderr,
+        )
+        return 1
+    if src != "rss":
+        print(f"Error: unsupported news source '{source}' (expected: rss)", file=sys.stderr)
+        return 1
+
+    try:
+        db_url = _resolve_database_url(database_url)
+    except ConfigError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    engine = create_db_engine(db_url)
+    init_db(engine)
+    repo = PostgresNewsRepository(engine)
+
+    async def _run_async() -> tuple[int, int, int, int, int, int]:
+        client = PublicRssNewsClient()
+        try:
+            summary, _arts, _obs = await sync_public_rss_news(client=client, repository=repo)
+            return (
+                summary.feeds_attempted,
+                summary.feeds_succeeded,
+                summary.dedup_articles,
+                summary.inserted_articles,
+                summary.inserted_observations,
+                summary.inserted_snapshots,
+            )
+        finally:
+            await client.close()
+
+    try:
+        attempted, ok, dedup, ins_art, ins_obs, ins_snap = asyncio.run(_run_async())
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        engine.dispose()
+
+    payload = {
+        "source": "rss",
+        "feeds_attempted": attempted,
+        "feeds_succeeded": ok,
+        "dedup_articles": dedup,
+        "inserted_articles": ins_art,
+        "inserted_observations": ins_obs,
+        "inserted_snapshots": ins_snap,
+    }
+    if as_json:
+        print(json.dumps(payload, indent=2))
+    else:
+        print(
+            f"sync-news (rss): feeds={ok}/{attempted}, dedup={dedup}, "
+            f"inserted_articles={ins_art}, inserted_observations={ins_obs}, "
+            f"inserted_snapshots={ins_snap}"
+        )
+    return 0
+
+
+def _run_export_sentiment_eval(
+    *,
+    count: int,
+    out_path: Path,
+    as_json: bool,
+) -> int:
+    from crypto_chatbot.news.eval_dataset import export_unlabeled_headlines_csv
+    from crypto_chatbot.news.ingestor import PublicRssNewsClient
+    from crypto_chatbot.news.pipeline import deduplicate_articles
+
+    async def _fetch() -> int:
+        client = PublicRssNewsClient()
+        try:
+            raw_items, _ok = await client.fetch_all()
+            dedup_articles, _dropped = deduplicate_articles(raw_items)
+            return export_unlabeled_headlines_csv(
+                dedup_articles,
+                output_path=out_path,
+                count=count,
+            )
+        finally:
+            await client.close()
+
+    try:
+        exported = asyncio.run(_fetch())
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    payload = {
+        "output_path": str(out_path),
+        "exported_rows": exported,
+        "manual_label_prefilled": False,
+    }
+    if as_json:
+        print(json.dumps(payload, indent=2))
+    else:
+        print(f"export-sentiment-eval: wrote {exported} unlabeled rows -> {out_path}")
+    return 0
+
+
+def _run_evaluate_sentiment_csv(
+    *,
+    input_path: Path,
+    as_json: bool,
+) -> int:
+    from crypto_chatbot.news.eval_dataset import evaluate_labeled_headlines_csv
+
+    try:
+        report = evaluate_labeled_headlines_csv(input_path)
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if as_json:
+        print(report.model_dump_json(indent=2))
+    else:
+        print(
+            f"evaluate-sentiment-csv: labeled={report.labeled_rows}/{report.total_rows}, "
+            f"accuracy={report.accuracy:.4f}, matrix={report.confusion_matrix}"
+        )
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="crypto-chatbot")
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -1016,6 +2239,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Optional Phase 11 news JSON fixture.",
     )
     ml_parser.add_argument(
+        "--target",
+        choices=("legacy", "meta"),
+        default="legacy",
+        help="ML target mode: 'meta' (PRD v1.7 meta-labeling) or 'legacy' (shadow-only 24h).",
+    )
+    ml_parser.add_argument(
         "--json", action="store_true", help="Print full MlExperimentReport JSON."
     )
     ml_parser.add_argument(
@@ -1106,6 +2335,426 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Optional PostgreSQL URL override.",
     )
 
+    backtest_parser = subcommands.add_parser(
+        "backtest",
+        help="Run deterministic point-in-time trade setup replay backtest.",
+    )
+    backtest_parser.add_argument("symbol", help="Target symbol (e.g. BTC, ETH, SOL).")
+    backtest_parser.add_argument(
+        "timeframe",
+        nargs="?",
+        default="4h",
+        help="Candle timeframe (default: 4h).",
+    )
+    backtest_parser.add_argument(
+        "--limit",
+        type=int,
+        default=1000,
+        help="Maximum closed candles to fetch in live mode (default: 1000).",
+    )
+    backtest_parser.add_argument(
+        "--warmup",
+        type=int,
+        default=600,
+        help="Minimum warmup bars before first signal evaluation (default: 600).",
+    )
+    backtest_parser.add_argument(
+        "--max-hold",
+        type=int,
+        default=24,
+        help="Maximum holding bars per setup before expiration (default: 24).",
+    )
+    backtest_parser.add_argument(
+        "--step",
+        type=int,
+        default=1,
+        help="Bar step interval between evaluations when idle (default: 1).",
+    )
+    backtest_parser.add_argument(
+        "--fixture",
+        type=Path,
+        default=None,
+        help="Optional recorded CCXT JSON fixture for offline replay.",
+    )
+    backtest_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print full BacktestReport JSON instead of Indonesian text report.",
+    )
+    backtest_parser.add_argument(
+        "--dual-book",
+        action="store_true",
+        help="Run always-on vs flat-at-boundary dual paper books on identical candles.",
+    )
+    backtest_parser.add_argument(
+        "--boundary",
+        choices=("daily_utc", "funding_8h"),
+        default="daily_utc",
+        help="Session boundary mode for the second paper book (default: daily_utc).",
+    )
+    backtest_parser.add_argument(
+        "--log-jsonl",
+        type=Path,
+        default=None,
+        help="Optional output .jsonl path for plain-English HOLD/FILL/FEE/EXIT/FLAT log.",
+    )
+    backtest_parser.add_argument(
+        "--webhook-url",
+        default=None,
+        help="Optional HTTPS (or localhost HTTP) webhook URL to POST round log summary.",
+    )
+
+    pine_parser = subcommands.add_parser(
+        "pine",
+        help="Generate TradingView Pine Script v6 overlay from deterministic analysis.",
+    )
+    pine_parser.add_argument("symbol", help="Target symbol (e.g. BTC, ETH, SOL).")
+    pine_parser.add_argument(
+        "timeframe",
+        nargs="?",
+        default="4h",
+        help="Primary timeframe (default: 4h).",
+    )
+    pine_parser.add_argument(
+        "--fixture",
+        type=Path,
+        default=None,
+        help="Optional recorded CCXT JSON fixture for offline generation.",
+    )
+    pine_parser.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help="Optional output .pine file path (prints to stdout if omitted).",
+    )
+
+    scan_parser = subcommands.add_parser(
+        "scan",
+        help="Scan multiple futures pairs concurrently to surface READY unified MTF setups.",
+    )
+    scan_parser.add_argument(
+        "--symbols",
+        default=None,
+        help="Comma-separated symbols (default: liquid perpetual basket).",
+    )
+    scan_parser.add_argument(
+        "--timeframe",
+        default="4h",
+        help="Primary timeframe, style, or 'all' for multi-style (default: 4h).",
+    )
+    scan_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print raw MarketScanReport JSON instead of Indonesian text report.",
+    )
+
+    screen_parser = subcommands.add_parser(
+        "screen",
+        help="Screen Top Gainers/Losers (>= $5M vol) for 15m Engulfing/Marubozu momentum setups.",
+    )
+    screen_parser.add_argument(
+        "--side",
+        choices=("all", "long", "short"),
+        default="all",
+        help="Filter side: all (gainers + losers), long (gainers), or short (losers).",
+    )
+    screen_parser.add_argument(
+        "--min-vol",
+        type=float,
+        default=DEFAULT_MIN_VOLUME_24H_USD,
+        help="Minimum 24h quote volume in USD (default: 5000000).",
+    )
+    screen_parser.add_argument(
+        "--top",
+        type=int,
+        default=DEFAULT_TOP_PER_SIDE,
+        help="Maximum top movers per side to inspect on 15m (default: 8).",
+    )
+    screen_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print raw MomentumScreenerReport JSON instead of Indonesian text report.",
+    )
+
+    whale_parser = subcommands.add_parser(
+        "whale",
+        help="Track perpetual futures whale positioning (Hyperliquid) & on-chain wallet flows.",
+    )
+    whale_parser.add_argument(
+        "--symbol",
+        type=str,
+        default=None,
+        help="Futures symbol to aggregate whale positioning for (default: BTC).",
+    )
+    whale_parser.add_argument(
+        "--wallet",
+        type=str,
+        default=None,
+        help="Wallet address to inspect (EVM 0x... or Bitcoin bc1.../1.../3...).",
+    )
+    whale_parser.add_argument(
+        "--list",
+        action="store_true",
+        help="List all tracked whale and institutional addresses.",
+    )
+    whale_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output raw JSON instead of formatted text report.",
+    )
+
+    freeze_parser = subcommands.add_parser(
+        "freeze-params",
+        help="Freeze strategy variant parameters to frozen_params.json with params_sha256.",
+    )
+    freeze_parser.add_argument(
+        "variant",
+        type=str,
+        help="Strategy variant name to freeze (e.g. v3, v0).",
+    )
+    freeze_parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("frozen_params.json"),
+        help="Output JSON path (default: frozen_params.json).",
+    )
+    freeze_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print frozen artifact JSON to stdout.",
+    )
+
+    stats_parser = subcommands.add_parser(
+        "contract-stats",
+        help="Poll, backfill, schedule, or audit gaps for Gate.io futures contract_stats.",
+    )
+    stats_parser.add_argument(
+        "action",
+        choices=("poll", "backfill", "gap-report", "schedule"),
+        help="Action to execute: poll once, backfill history, print gap report, or run scheduler.",
+    )
+    stats_parser.add_argument(
+        "--symbols",
+        default=None,
+        help="Comma-separated symbols (default: liquid perpetual basket).",
+    )
+    stats_parser.add_argument(
+        "--interval",
+        choices=("5m", "1h"),
+        default="5m",
+        help="contract_stats bucket interval (default: 5m).",
+    )
+    stats_parser.add_argument(
+        "--days",
+        type=int,
+        default=179,
+        help="Lookback window in days for backfill or gap-report (default: 179).",
+    )
+    stats_parser.add_argument(
+        "--limit",
+        type=int,
+        default=12,
+        help="Bars per symbol to fetch on `poll` (default: 12).",
+    )
+    stats_parser.add_argument(
+        "--interval-seconds",
+        type=int,
+        default=300,
+        help="Polling cadence in seconds for `schedule` (default: 300).",
+    )
+    stats_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Optional PostgreSQL URL override.",
+    )
+    stats_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print JSON output.",
+    )
+
+    ingest_parser = subcommands.add_parser(
+        "ingest-gate-history",
+        help="Idempotently download & ingest bulk archives from download.gatedata.org.",
+    )
+    ingest_parser.add_argument(
+        "--symbols",
+        default=None,
+        help="Comma-separated symbols (default: liquid perpetual basket).",
+    )
+    ingest_parser.add_argument(
+        "--from",
+        dest="from_month",
+        required=True,
+        help="Start month inclusive (YYYYMM).",
+    )
+    ingest_parser.add_argument(
+        "--to",
+        dest="to_month",
+        required=True,
+        help="End month inclusive (YYYYMM).",
+    )
+    ingest_parser.add_argument(
+        "--types",
+        required=True,
+        help=(
+            "Comma-separated dataset types (candlesticks_1h, trades, mark_prices, funding_applies)."
+        ),
+    )
+    ingest_parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=Path("data/raw/gate"),
+        help="Root directory for compressed archive storage (default: data/raw/gate).",
+    )
+    ingest_parser.add_argument(
+        "--no-contiguity-check",
+        action="store_true",
+        help="Skip contiguity validation on loaded candle series.",
+    )
+    ingest_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Optional PostgreSQL URL override.",
+    )
+    ingest_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print JSON output.",
+    )
+
+    funding_parser = subcommands.add_parser(
+        "sync-gate-funding",
+        help="Fetch paginated Gate /futures/usdt/funding_rate history into PostgreSQL.",
+    )
+    funding_parser.add_argument(
+        "--symbols",
+        default=None,
+        help="Comma-separated symbols (default: liquid perpetual basket).",
+    )
+    funding_parser.add_argument(
+        "--days",
+        type=int,
+        default=90,
+        help="Lookback window in days (1..180, default: 90).",
+    )
+    funding_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Optional PostgreSQL URL override.",
+    )
+    funding_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print JSON output.",
+    )
+
+    fng_parser = subcommands.add_parser(
+        "sync-fear-greed",
+        help="Fetch Alternative.me Crypto Fear & Greed daily observations into PostgreSQL.",
+    )
+    fng_parser.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Days to fetch (0 = full historical backfill since 2018-02-01, default: 0).",
+    )
+    fng_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Optional PostgreSQL URL override.",
+    )
+    fng_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print JSON output.",
+    )
+
+    parity_parser = subcommands.add_parser(
+        "resample-parity",
+        help="Compare UTC-resampled 1h->4h/1d candles against native Gate candlesticks.",
+    )
+    parity_parser.add_argument(
+        "--symbol",
+        default="BTC",
+        help="Target symbol (default: BTC).",
+    )
+    parity_parser.add_argument(
+        "--bars",
+        type=int,
+        default=200,
+        help="Number of overlapping bars to compare per target timeframe (default: 200).",
+    )
+    parity_parser.add_argument(
+        "--out",
+        default=None,
+        help="Optional JSON report output file path.",
+    )
+    parity_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print JSON output.",
+    )
+
+    sync_news_parser = subcommands.add_parser(
+        "sync-news",
+        help="Ingest verified public crypto RSS news feeds and append vote snapshots.",
+    )
+    sync_news_parser.add_argument(
+        "--source",
+        default="rss",
+        choices=("rss", "cryptopanic"),
+        help="News source (default: rss).",
+    )
+    sync_news_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Optional PostgreSQL URL override.",
+    )
+    sync_news_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print JSON output.",
+    )
+
+    export_eval_parser = subcommands.add_parser(
+        "export-sentiment-eval",
+        help="Export recent unlabeled headlines CSV for manual bullish/bearish/neutral labeling.",
+    )
+    export_eval_parser.add_argument(
+        "--count",
+        type=int,
+        default=300,
+        help="Maximum headlines to export (default: 300).",
+    )
+    export_eval_parser.add_argument(
+        "--out",
+        type=Path,
+        default=Path("tests/fixtures/sentiment_eval_unlabeled.csv"),
+        help="Output CSV path (default: tests/fixtures/sentiment_eval_unlabeled.csv).",
+    )
+    export_eval_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print JSON output.",
+    )
+
+    eval_csv_parser = subcommands.add_parser(
+        "evaluate-sentiment-csv",
+        help="Score manually labeled headlines CSV and print lexicon accuracy/confusion matrix.",
+    )
+    eval_csv_parser.add_argument(
+        "--input",
+        type=Path,
+        default=Path("tests/fixtures/sentiment_eval_unlabeled.csv"),
+        help="Input labeled CSV path.",
+    )
+    eval_csv_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print JSON output.",
+    )
+
     args = parser.parse_args(argv)
     if args.command == "check-config":
         return _check_config()
@@ -1122,6 +2771,48 @@ def main(argv: Sequence[str] | None = None) -> int:
             persist=args.persist,
             include_mtf=not args.no_mtf,
             include_derivatives=not args.no_derivatives,
+        )
+    if args.command == "backtest":
+        return _run_backtest(
+            symbol_raw=args.symbol,
+            timeframe_raw=args.timeframe,
+            limit=args.limit,
+            warmup=args.warmup,
+            max_hold=args.max_hold,
+            step=args.step,
+            fixture_path=args.fixture,
+            as_json=args.json,
+            dual_book=args.dual_book,
+            boundary=args.boundary,
+            log_jsonl=args.log_jsonl,
+            webhook_url=args.webhook_url,
+        )
+    if args.command == "pine":
+        return _run_pine(
+            symbol_raw=args.symbol,
+            timeframe_raw=args.timeframe,
+            fixture_path=args.fixture,
+            out_path=args.out,
+        )
+    if args.command == "scan":
+        return _run_scan(
+            symbols_raw=args.symbols,
+            timeframe_raw=args.timeframe,
+            as_json=args.json,
+        )
+    if args.command == "screen":
+        return _run_screen(
+            side=args.side,
+            min_vol=args.min_vol,
+            top_per_side=args.top,
+            as_json=args.json,
+        )
+    if args.command == "whale":
+        return _run_whale(
+            symbol=args.symbol,
+            wallet=args.wallet,
+            list_wallets=args.list,
+            as_json=args.json,
         )
     if args.command == "setup-stats":
         return _run_setup_stats(
@@ -1151,6 +2842,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             news_fixture_path=args.news_fixture,
             as_json=args.json,
             persist=args.persist,
+            target=args.target,
         )
     if args.command == "backup-db":
         return _run_backup_db(
@@ -1164,6 +2856,79 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     if args.command == "health-check":
         return _run_health_check(database_url=args.database_url)
+    if args.command == "freeze-params":
+        try:
+            artifact = freeze_variant_params(args.variant, output_path=args.output)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        if args.json:
+            print(artifact.model_dump_json(indent=2))
+        else:
+            print(
+                f"Frozen variant={artifact.variant} params_sha256={artifact.params_sha256} "
+                f"frozen_at={artifact.frozen_at.isoformat()} -> {args.output}"
+            )
+        return 0
+    if args.command == "contract-stats":
+        return _run_contract_stats(
+            action=args.action,
+            symbols_raw=args.symbols,
+            interval=args.interval,
+            days=args.days,
+            limit=args.limit,
+            interval_seconds=args.interval_seconds,
+            as_json=args.json,
+            database_url=args.database_url,
+        )
+    if args.command == "ingest-gate-history":
+        return _run_ingest_gate_history(
+            symbols_raw=args.symbols,
+            from_ym=args.from_month,
+            to_ym=args.to_month,
+            types_raw=args.types,
+            data_dir=args.data_dir,
+            validate_contiguity=not args.no_contiguity_check,
+            as_json=args.json,
+            database_url=args.database_url,
+        )
+    if args.command == "sync-gate-funding":
+        return _run_sync_gate_funding(
+            symbols_raw=args.symbols,
+            days=args.days,
+            as_json=args.json,
+            database_url=args.database_url,
+        )
+    if args.command == "sync-fear-greed":
+        return _run_sync_fear_greed(
+            limit=args.limit,
+            as_json=args.json,
+            database_url=args.database_url,
+        )
+    if args.command == "resample-parity":
+        return _run_resample_parity(
+            symbol_raw=args.symbol,
+            bars=args.bars,
+            out_path=args.out,
+            as_json=args.json,
+        )
+    if args.command == "sync-news":
+        return _run_sync_news(
+            source=args.source,
+            as_json=args.json,
+            database_url=args.database_url,
+        )
+    if args.command == "export-sentiment-eval":
+        return _run_export_sentiment_eval(
+            count=args.count,
+            out_path=args.out,
+            as_json=args.json,
+        )
+    if args.command == "evaluate-sentiment-csv":
+        return _run_evaluate_sentiment_csv(
+            input_path=args.input,
+            as_json=args.json,
+        )
     parser.error(f"unknown command: {args.command}")  # pragma: no cover
 
 

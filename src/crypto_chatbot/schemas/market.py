@@ -33,6 +33,8 @@ class MarketType(StrEnum):
 
 
 class Timeframe(StrEnum):
+    M1 = "1m"
+    M5 = "5m"
     M15 = "15m"
     H1 = "1h"
     H4 = "4h"
@@ -43,7 +45,71 @@ class Timeframe(StrEnum):
         return _TIMEFRAME_DURATIONS[self]
 
 
+PRIMARY_TIMEFRAMES: frozenset[Timeframe] = frozenset(
+    {Timeframe.M15, Timeframe.H1, Timeframe.H4, Timeframe.D1}
+)
+
+TRADING_STYLE_ALIASES: dict[str, Timeframe] = {
+    "scalp": Timeframe.M15,
+    "scalping": Timeframe.M15,
+    "intraday": Timeframe.H1,
+    "daytrade": Timeframe.H1,
+    "hourly": Timeframe.H1,
+    "swing": Timeframe.H4,
+    "position": Timeframe.D1,
+    "macro": Timeframe.D1,
+    "daily": Timeframe.D1,
+}
+
+TRADING_STYLE_LABELS: dict[Timeframe, str] = {
+    Timeframe.M5: "MICRO (5m)",
+    Timeframe.M15: "SCALP / Quick Intraday (15m → 5m)",
+    Timeframe.H1: "INTRADAY / Hourly (1h → 15m → 5m)",
+    Timeframe.H4: "SWING / Day-Swing (1d → 4h → 1h → 15m → 5m)",
+    Timeframe.D1: "POSITION / Macro Swing (1d → 4h → 15m)",
+}
+
+MULTI_STYLE_SCAN_TIMEFRAMES: tuple[Timeframe, ...] = (
+    Timeframe.M15,
+    Timeframe.H1,
+    Timeframe.H4,
+)
+
+TRADING_STYLE_SHORT_LABELS: dict[Timeframe, str] = {
+    Timeframe.M5: "MICRO (5m)",
+    Timeframe.M15: "SCALP (15m)",
+    Timeframe.H1: "INTRADAY (1h)",
+    Timeframe.H4: "SWING (4h)",
+    Timeframe.D1: "POSITION (1d)",
+}
+
+
+def resolve_primary_timeframe(raw: str) -> Timeframe | None:
+    """Resolve a primary timeframe ('15m','1h','4h','1d') or style ('scalp','intraday','swing')."""
+    cleaned = raw.strip().lower()
+    alias_tf = TRADING_STYLE_ALIASES.get(cleaned)
+    if alias_tf is not None:
+        return alias_tf
+    try:
+        tf = Timeframe(cleaned)
+    except ValueError:
+        return None
+    return tf if tf in PRIMARY_TIMEFRAMES else None
+
+
+def format_trading_style_label(timeframe: Timeframe) -> str:
+    """Return human-readable trading style mode label for a primary timeframe."""
+    return TRADING_STYLE_LABELS.get(timeframe, timeframe.value)
+
+
+def format_trading_style_short(timeframe: Timeframe) -> str:
+    """Return compact trading style badge (e.g. 'SCALP (15m)', 'INTRADAY (1h)', 'SWING (4h)')."""
+    return TRADING_STYLE_SHORT_LABELS.get(timeframe, timeframe.value)
+
+
 _TIMEFRAME_DURATIONS: dict[Timeframe, timedelta] = {
+    Timeframe.M1: timedelta(minutes=1),
+    Timeframe.M5: timedelta(minutes=5),
     Timeframe.M15: timedelta(minutes=15),
     Timeframe.H1: timedelta(hours=1),
     Timeframe.H4: timedelta(hours=4),
@@ -67,6 +133,9 @@ class QualityFlag(StrEnum):
     PRICE_MISMATCH = "PRICE_MISMATCH"
     SEVERE_PRICE_MISMATCH = "SEVERE_PRICE_MISMATCH"
     UNIT_MISMATCH = "UNIT_MISMATCH"
+    BACKFILL = "BACKFILL"
+    QUOTE_VOL_ESTIMATED = "QUOTE_VOL_ESTIMATED"
+    RESAMPLE_MISMATCH = "RESAMPLE_MISMATCH"
 
 
 class QualityStatus(StrEnum):
@@ -149,6 +218,7 @@ class MarketCandle(BaseModel):
     high: FiniteFloat = Field(gt=0)
     low: FiniteFloat = Field(gt=0)
     close: FiniteFloat = Field(gt=0)
+    raw_contracts: FiniteFloat | None = Field(default=None, ge=0)
     base_volume: FiniteFloat = Field(ge=0)
     quote_volume: FiniteFloat | None = Field(default=None, ge=0)
     taker_buy_base_volume: FiniteFloat | None = Field(default=None, ge=0)

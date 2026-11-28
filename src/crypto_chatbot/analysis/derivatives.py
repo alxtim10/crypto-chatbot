@@ -355,8 +355,9 @@ def compute_derivatives_metrics(
                 "ke DEGRADED."
             )
 
+    deriv_venue = (funding_venue or oi_venue or ob_venue or "satu venue").capitalize()
     limitations.append(
-        "Data derivatif dan order book berasal dari satu venue (Binance) dan tidak "
+        f"Data derivatif dan order book berasal dari satu venue ({deriv_venue}) dan tidak "
         "merepresentasikan likuiditas seluruh pasar kripto."
     )
 

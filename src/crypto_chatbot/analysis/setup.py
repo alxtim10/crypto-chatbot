@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import math
+import os
 from collections.abc import Mapping, Sequence
 from datetime import datetime
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
-from crypto_chatbot.analysis.indicators import MIN_HISTORY_EMA_20, compute_technical_metrics
+from crypto_chatbot.analysis.indicators import (
+    MIN_HISTORY_EMA_20,
+    MIN_HISTORY_EMA_200,
+    compute_technical_metrics,
+)
 from crypto_chatbot.analysis.regimes import classify_regime
 from crypto_chatbot.analysis.smc import analyze_smc
 from crypto_chatbot.analysis.structure import StructureAnalysis, analyze_market_structure
@@ -34,6 +40,7 @@ MIN_SL_ATR = 0.5
 MIN_LTF_SL_HTF_ATR = 0.35
 MAX_SL_ATR = 3.5
 MIN_RR_TP2 = 1.5
+MAX_EXEC_COST_R = 0.15
 DEFAULT_TP1_R = 1.0
 DEFAULT_TP2_R = 2.0
 DEFAULT_TP3_R = 3.0
@@ -41,9 +48,15 @@ CROWDED_FUNDING_8H = 0.0010
 
 SETUP_PARAMETERS: dict[str, int | float | str] = {
     "trade_setup_min_rr_tp2": MIN_RR_TP2,
+    "trade_setup_max_exec_cost_r": MAX_EXEC_COST_R,
     "trade_setup_sl_atr_buffer": SL_ATR_BUFFER,
     "trade_setup_tp_levels": 3,
 }
+
+
+def ema200_available(closed_count: int) -> bool:
+    """Single canonical predicate for EMA200 availability across live and backtest (§3.2)."""
+    return closed_count >= MIN_HISTORY_EMA_200
 
 
 def _net_reward_risk(
@@ -466,12 +479,50 @@ def _collect_risk_notes(
     return notes
 
 
+DEFAULT_ASSUMED_MMR = 0.01
+
+
+def compute_leverage_ceiling(
+    sl_dist_ratio: float,
+    cost_rate: float,
+    *,
+    maintenance_margin_rate: float | None = None,
+    venue_max_leverage: float | None = None,
+) -> tuple[int, bool]:
+    """Compute theoretical leverage ceiling with maintenance margin rate (PRD v1.7 §5.4).
+
+    Returns `(leverage, mmr_assumed)`. With `maintenance_margin_rate=0.0`, reproduces v1.6.
+    """
+    if sl_dist_ratio <= 0.0:
+        return 1, maintenance_margin_rate is None
+    mmr_assumed = maintenance_margin_rate is None
+    mmr = (
+        DEFAULT_ASSUMED_MMR
+        if maintenance_margin_rate is None
+        else max(0.0, maintenance_margin_rate)
+    )
+    denom = ((sl_dist_ratio + cost_rate) / 0.75) + mmr
+    if denom <= 0.0:
+        return 1, mmr_assumed
+    upper = 20
+    if (
+        venue_max_leverage is not None
+        and math.isfinite(venue_max_leverage)
+        and venue_max_leverage > 0
+    ):
+        upper = min(20, max(1, math.floor(venue_max_leverage)))
+    lev = min(upper, max(1, math.floor(1.0 / denom)))
+    return lev, mmr_assumed
+
+
 def _resolve_bias(
     *,
     metrics: TechnicalMetrics,
     regime: Regime,
     structure: StructureAnalysis,
     smc: SmcSummary,
+    require_ema200: bool = False,
+    variant: str = "v3",
 ) -> tuple[SetupBias, str | None]:
     brk = smc.latest_structure_break.event_type if smc.latest_structure_break else None
     swp = smc.latest_sweep.event_type if smc.latest_sweep else None
@@ -527,7 +578,11 @@ def _resolve_bias(
     elif swp is StructureEventType.LIQUIDITY_SWEEP_BEARISH:
         score -= 1
 
-    if metrics.ema_50 is not None:
+    count_ema50_score = variant != "v4" or regime not in (
+        Regime.TRENDING_UP,
+        Regime.TRENDING_DOWN,
+    )
+    if metrics.ema_50 is not None and count_ema50_score:
         if metrics.last_close > metrics.ema_50:
             score += 1
         elif metrics.last_close < metrics.ema_50:
@@ -548,8 +603,32 @@ def _resolve_bias(
         )
 
     if score >= 2:
+        if require_ema200 and metrics.ema_200 is None:
+            return (
+                SetupBias.NEUTRAL,
+                "WAIT_EMA200_UNAVAILABLE: EMA 200 belum tersedia (butuh minimal 600 candle "
+                "tertutup).",
+            )
+        if metrics.ema_200 is not None and metrics.last_close < metrics.ema_200:
+            return (
+                SetupBias.NEUTRAL,
+                "Harga masih di bawah EMA 200 (tren makro turun) tanpa konfirmasi "
+                "Liquidity Sweep + CHoCH bullish (WAIT).",
+            )
         return SetupBias.LONG, None
     if score <= -2:
+        if require_ema200 and metrics.ema_200 is None:
+            return (
+                SetupBias.NEUTRAL,
+                "WAIT_EMA200_UNAVAILABLE: EMA 200 belum tersedia (butuh minimal 600 candle "
+                "tertutup).",
+            )
+        if metrics.ema_200 is not None and metrics.last_close > metrics.ema_200:
+            return (
+                SetupBias.NEUTRAL,
+                "Harga masih di atas EMA 200 (tren makro naik) tanpa konfirmasi "
+                "Liquidity Sweep + CHoCH bearish (WAIT).",
+            )
         return SetupBias.SHORT, None
 
     return (
@@ -605,6 +684,59 @@ def _build_htf_levels_and_sl(
     )
 
 
+def _evaluate_micro_5m_confirmation(
+    *,
+    bias: SetupBias,
+    micro_candles: Sequence[MarketCandle] | None,
+    as_of: datetime | None,
+    use_available_time: bool,
+) -> str | None:
+    """Evaluate causal 5m micro-confirmation inside/near setup entry without tightening SL."""
+    if not micro_candles or bias not in (SetupBias.LONG, SetupBias.SHORT):
+        return None
+    filtered = _filter_causal_candles(micro_candles, as_of, use_available_time=use_available_time)
+    if len(filtered) < 15 or filtered[0].timeframe is not Timeframe.M5:
+        return None
+
+    m5_struct = analyze_market_structure(filtered)
+    m5_smc = analyze_smc(filtered, structure=m5_struct)
+    m5_brk = m5_smc.latest_structure_break.event_type if m5_smc.latest_structure_break else None
+    m5_swp = m5_smc.latest_sweep.event_type if m5_smc.latest_sweep else None
+
+    if bias is SetupBias.LONG:
+        if (
+            m5_swp is StructureEventType.LIQUIDITY_SWEEP_BULLISH
+            and m5_brk is StructureEventType.CHOCH_BULLISH
+        ):
+            return "5m CHoCH+Sweep searah (micro trigger kuat)"
+        if m5_brk in (StructureEventType.BOS_BULLISH, StructureEventType.CHOCH_BULLISH):
+            return "5m CHoCH/BOS searah terkonfirmasi"
+        if m5_struct.market_structure is MarketStructure.BULLISH:
+            return "5m struktur searah"
+        if (
+            m5_brk in (StructureEventType.BOS_BEARISH, StructureEventType.CHOCH_BEARISH)
+            or m5_struct.market_structure is MarketStructure.BEARISH
+        ):
+            return "5m masih koreksi (tunggu CHoCH 5m di zona entry)"
+        return "5m konsolidasi"
+
+    if (
+        m5_swp is StructureEventType.LIQUIDITY_SWEEP_BEARISH
+        and m5_brk is StructureEventType.CHOCH_BEARISH
+    ):
+        return "5m CHoCH+Sweep searah (micro trigger kuat)"
+    if m5_brk in (StructureEventType.BOS_BEARISH, StructureEventType.CHOCH_BEARISH):
+        return "5m CHoCH/BOS searah terkonfirmasi"
+    if m5_struct.market_structure is MarketStructure.BEARISH:
+        return "5m struktur searah"
+    if (
+        m5_brk in (StructureEventType.BOS_BULLISH, StructureEventType.CHOCH_BULLISH)
+        or m5_struct.market_structure is MarketStructure.BULLISH
+    ):
+        return "5m masih koreksi (tunggu CHoCH 5m di zona entry)"
+    return "5m konsolidasi"
+
+
 def build_trade_setup(
     *,
     metrics: TechnicalMetrics,
@@ -615,11 +747,16 @@ def build_trade_setup(
     sentiment: SentimentMetrics | None = None,
     primary_timeframe: Timeframe = Timeframe.H4,
     ltf_candles: Sequence[MarketCandle] | None = None,
+    micro_candles: Sequence[MarketCandle] | None = None,
     htf_candles_by_tf: Mapping[Timeframe, Sequence[MarketCandle]] | None = None,
     as_of: datetime | None = None,
     use_available_time: bool = False,
     cost_assumptions: CostAssumptions | None = None,
     macro_context: MacroBenchmarkContext | None = None,
+    require_ema200: bool = False,
+    maintenance_margin_rate: float | None = None,
+    venue_max_leverage: float | None = None,
+    setup_variant: Literal["v3", "v4"] | None = None,
 ) -> TradeSetup:
     """Compute 1 deterministic conditional trade setup (Entry, SL, TP1-3) or honest WAIT."""
     htf_sup, htf_res = _extract_sr_levels(structure, smc)
@@ -648,11 +785,14 @@ def build_trade_setup(
             ltf_resistance=ltf_res,
         )
 
+    resolved_variant = (setup_variant or os.getenv("SETUP_VARIANT") or "v3").strip().lower()
     bias, wait_reason = _resolve_bias(
         metrics=metrics,
         regime=regime,
         structure=structure,
         smc=smc,
+        require_ema200=require_ema200,
+        variant=resolved_variant,
     )
     if bias is SetupBias.NEUTRAL or wait_reason is not None:
         return _wait_setup(
@@ -870,6 +1010,15 @@ def build_trade_setup(
                     invalidation_reason = ltf_ref.invalidation_reason
                     entry_tf = Timeframe.M15
 
+    micro_note = _evaluate_micro_5m_confirmation(
+        bias=bias,
+        micro_candles=micro_candles,
+        as_of=as_of,
+        use_available_time=use_available_time,
+    )
+    if micro_note is not None:
+        ltf_confirmation = f"{ltf_confirmation} | {micro_note}" if ltf_confirmation else micro_note
+
     entry_mid = (entry_low + entry_high) / 2.0
     if bias is SetupBias.LONG:
         risk = entry_mid - stop_loss
@@ -894,6 +1043,17 @@ def build_trade_setup(
             smc=smc,
             ltf_resistance=ltf_res,
         )
+        if not (entry_mid < tp1 < tp2 < tp3):
+            return _wait_setup(
+                "WAIT_TARGET_INVALID: target TP1/TP2/TP3 LONG tidak monoton secara ketat (WAIT).",
+                risk_notes,
+                entry_timeframe=entry_tf,
+                ltf_confirmation=ltf_confirmation,
+                htf_support=htf_sup,
+                htf_resistance=htf_res,
+                ltf_support=ltf_sup,
+                ltf_resistance=ltf_res,
+            )
         rr_tp1 = (tp1 - entry_mid) / risk
         rr_tp2 = (tp2 - entry_mid) / risk
         rr_tp3 = (tp3 - entry_mid) / risk
@@ -937,6 +1097,18 @@ def build_trade_setup(
             smc=smc,
             ltf_support=ltf_sup,
         )
+        if tp3 <= 0.0 or not (entry_mid > tp1 > tp2 > tp3):
+            return _wait_setup(
+                "WAIT_TARGET_INVALID: target take profit SHORT tidak monoton atau melampaui "
+                "batas harga positif (WAIT).",
+                risk_notes,
+                entry_timeframe=entry_tf,
+                ltf_confirmation=ltf_confirmation,
+                htf_support=htf_sup,
+                htf_resistance=htf_res,
+                ltf_support=ltf_sup,
+                ltf_resistance=ltf_res,
+            )
         rr_tp1 = (entry_mid - tp1) / risk
         rr_tp2 = (entry_mid - tp2) / risk
         rr_tp3 = (entry_mid - tp3) / risk
@@ -971,6 +1143,22 @@ def build_trade_setup(
         )
 
     costs = cost_assumptions or CostAssumptions()
+    exec_costs = costs.model_copy(update={"funding_bps_per_24h": 0.0})
+    exec_cost_r = (exec_costs.round_trip_cost_rate * entry_mid) / risk if risk > 0.0 else None
+    if exec_cost_r is None or exec_cost_r > MAX_EXEC_COST_R:
+        pct_text = f"{exec_cost_r * 100:.1f}%" if exec_cost_r is not None else "tak terhingga"
+        return _wait_setup(
+            f"Biaya eksekusi round-trip ({pct_text} dari 1R) melebihi batas maksimal 15,0% "
+            "dari jarak Stop Loss (WAIT).",
+            risk_notes,
+            entry_timeframe=entry_tf,
+            ltf_confirmation=ltf_confirmation,
+            htf_support=htf_sup,
+            htf_resistance=htf_res,
+            ltf_support=ltf_sup,
+            ltf_resistance=ltf_res,
+        )
+
     cost_rate = costs.round_trip_cost_rate
     net_rr_tp1 = _net_reward_risk(
         entry_mid=entry_mid, target=tp1, stop_loss=stop_loss, cost_rate=cost_rate
@@ -981,15 +1169,33 @@ def build_trade_setup(
     net_rr_tp3 = _net_reward_risk(
         entry_mid=entry_mid, target=tp3, stop_loss=stop_loss, cost_rate=cost_rate
     )
-    if net_rr_tp2 is not None and net_rr_tp2 < MIN_RR_TP2:
-        risk_notes.append(
-            "Rasio Risk:Reward ke TP 2 setelah biaya (fee + spread + slippage) turun di bawah "
-            "1:1,5; perkecil ukuran posisi atau tunggu zona entry lebih presisi."
+    if net_rr_tp2 is None or net_rr_tp2 < MIN_RR_TP2:
+        return _wait_setup(
+            "Rasio Risk:Reward ke TP 2 setelah biaya (fee + spread + slippage) "
+            "di bawah batas minimum 1:1,5 (WAIT).",
+            risk_notes,
+            entry_timeframe=entry_tf,
+            ltf_confirmation=ltf_confirmation,
+            htf_support=htf_sup,
+            htf_resistance=htf_res,
+            ltf_support=ltf_sup,
+            ltf_resistance=ltf_res,
         )
 
     sl_dist_ratio = abs(entry_mid - stop_loss) / entry_mid
     sl_dist_pct = round(sl_dist_ratio * 100.0, 4)
-    max_theor_lev = max(1, int(0.8 / sl_dist_ratio)) if sl_dist_ratio > 0 else 1
+    min_sl_pct_implied = round((exec_costs.round_trip_cost_rate / MAX_EXEC_COST_R) * 100.0, 4)
+    max_theor_lev, mmr_assumed = compute_leverage_ceiling(
+        sl_dist_ratio,
+        cost_rate,
+        maintenance_margin_rate=maintenance_margin_rate,
+        venue_max_leverage=venue_max_leverage,
+    )
+    net_rr_blend = (
+        round(0.4 * net_rr_tp1 + 0.4 * net_rr_tp2 + 0.2 * net_rr_tp3, 4)
+        if net_rr_tp1 is not None and net_rr_tp2 is not None and net_rr_tp3 is not None
+        else None
+    )
 
     return TradeSetup(
         status=SetupStatus.READY,
@@ -1007,7 +1213,9 @@ def build_trade_setup(
         stop_loss=stop_loss,
         invalidation_reason=invalidation_reason,
         stop_loss_distance_pct=sl_dist_pct,
+        min_sl_pct_implied=min_sl_pct_implied,
         max_theoretical_leverage=max_theor_lev,
+        mmr_assumed=mmr_assumed,
         tp1=tp1,
         tp1_label=tp1_label,
         tp2=tp2,
@@ -1020,6 +1228,7 @@ def build_trade_setup(
         net_rr_tp1=net_rr_tp1,
         net_rr_tp2=net_rr_tp2,
         net_rr_tp3=net_rr_tp3,
+        net_rr_blend=net_rr_blend,
         cost_rate_round_trip=cost_rate,
         risk_notes=tuple(dict.fromkeys(risk_notes)),
     )
@@ -1127,7 +1336,7 @@ def _select_long_targets(
     if tp2_match is not None:
         tp2, tp2_label = tp2_match
     else:
-        tp2 = max(tp1 + 0.8 * risk, entry_mid + DEFAULT_TP2_R * risk)
+        tp2 = max(tp1 + 0.3 * risk, entry_mid + DEFAULT_TP2_R * risk)
         tp2_label = "Ekspansi 2,0R"
 
     tp3_match = next(
@@ -1141,7 +1350,7 @@ def _select_long_targets(
     if tp3_match is not None:
         tp3, tp3_label = tp3_match
     else:
-        tp3 = max(tp2 + risk, entry_mid + DEFAULT_TP3_R * risk)
+        tp3 = min(entry_mid + 5.0 * risk, max(tp2 + 0.5 * risk, entry_mid + DEFAULT_TP3_R * risk))
         tp3_label = "Ekspansi 3,0R"
 
     return tp1, tp1_label, tp2, tp2_label, tp3, tp3_label
@@ -1181,7 +1390,7 @@ def _select_short_targets(
     if tp1_match is not None:
         tp1, tp1_label = tp1_match
     else:
-        tp1 = max(1e-8, entry_mid - DEFAULT_TP1_R * risk)
+        tp1 = entry_mid - DEFAULT_TP1_R * risk
         tp1_label = "Ekspansi 1,0R"
 
     tp2_match = next(
@@ -1196,7 +1405,7 @@ def _select_short_targets(
     if tp2_match is not None:
         tp2, tp2_label = tp2_match
     else:
-        tp2 = max(1e-8, min(tp1 - 0.8 * risk, entry_mid - DEFAULT_TP2_R * risk))
+        tp2 = min(tp1 - 0.3 * risk, entry_mid - DEFAULT_TP2_R * risk)
         tp2_label = "Ekspansi 2,0R"
 
     tp3_match = next(
@@ -1210,7 +1419,7 @@ def _select_short_targets(
     if tp3_match is not None:
         tp3, tp3_label = tp3_match
     else:
-        tp3 = max(1e-8, min(tp2 - risk, entry_mid - DEFAULT_TP3_R * risk))
+        tp3 = max(entry_mid - 5.0 * risk, min(tp2 - 0.5 * risk, entry_mid - DEFAULT_TP3_R * risk))
         tp3_label = "Ekspansi 3,0R"
 
     return tp1, tp1_label, tp2, tp2_label, tp3, tp3_label
@@ -1221,11 +1430,13 @@ def evaluate_setup_against_candles(
     future_candles: Sequence[MarketCandle],
     *,
     max_bars: int = 24,
+    cost_assumptions: CostAssumptions | None = None,
 ) -> tuple[str, datetime | None, float | None]:
     """Deterministically settle a logged setup against subsequent closed candles.
 
-    Conservative tie-break: if any candle after/at trigger touches both SL and TP,
-    SL takes precedence (`hit_sl`, `-1.0R`).
+    Uses causal scaled partial exits (40% TP1 + move SL to breakeven, 40% TP2, 20% TP3),
+    gap-through-SL pricing at `candle.open`, round-trip cost deduction, and never settles
+    partial TPs before `max_bars` candles have closed.
     """
     if setup.status != SetupStatus.READY.value:
         return "skipped_wait", None, None
@@ -1253,56 +1464,84 @@ def evaluate_setup_against_candles(
     if risk <= 0:
         return "skipped_wait", None, None
 
+    costs = cost_assumptions or CostAssumptions()
     is_long = setup.bias == SetupBias.LONG.value
     triggered = False
-    highest_tp = 0
-    tp_hit_times: dict[int, datetime] = {}
+    just_triggered_idx = -1
+    fill_price = setup.entry_mid
+    current_sl = setup.stop_loss
+    remaining = 1.0
+    realized_r = 0.0
+    hit_tp1 = False
+    hit_tp2 = False
 
-    for candle in candles:
+    for idx, candle in enumerate(candles):
         if not triggered:
             if candle.low <= setup.entry_high and candle.high >= setup.entry_low:
                 triggered = True
+                just_triggered_idx = idx
+                if is_long:
+                    fill_price = (
+                        setup.entry_high if candle.open >= setup.entry_high else candle.open
+                    )
+                elif candle.open <= setup.entry_low:
+                    fill_price = setup.entry_low
+                else:
+                    fill_price = candle.open
             else:
                 continue
 
-        if is_long:
-            if candle.low <= setup.stop_loss:
-                return "hit_sl", candle.close_time, -1.0
-            if candle.high >= setup.tp3:
-                return "hit_tp3", candle.close_time, setup.rr_tp3
-            if candle.high >= setup.tp2 and highest_tp < 2:
-                highest_tp = 2
-                tp_hit_times[2] = candle.close_time
-            if candle.high >= setup.tp1 and highest_tp < 1:
-                highest_tp = 1
-                tp_hit_times[1] = candle.close_time
-        else:
-            if candle.high >= setup.stop_loss:
-                return "hit_sl", candle.close_time, -1.0
-            if candle.low <= setup.tp3:
-                return "hit_tp3", candle.close_time, setup.rr_tp3
-            if candle.low <= setup.tp2 and highest_tp < 2:
-                highest_tp = 2
-                tp_hit_times[2] = candle.close_time
-            if candle.low <= setup.tp1 and highest_tp < 1:
-                highest_tp = 1
-                tp_hit_times[1] = candle.close_time
+        gap_sl = (candle.open <= current_sl) if is_long else (candle.open >= current_sl)
+        touched_sl = gap_sl or (
+            (candle.low <= current_sl) if is_long else (candle.high >= current_sl)
+        )
+        if touched_sl:
+            exit_px = candle.open if gap_sl else current_sl
+            ref_entry = (
+                setup.entry_mid
+                if (gap_sl and just_triggered_idx == idx and not hit_tp1)
+                else fill_price
+            )
+            leg_r = (exit_px - ref_entry) / risk if is_long else (ref_entry - exit_px) / risk
+            realized_r += remaining * leg_r
+            cost_r = (costs.round_trip_cost_rate * fill_price) / risk
+            sl_outcome = "hit_tp2" if hit_tp2 else ("hit_tp1" if hit_tp1 else "hit_sl")
+            return sl_outcome, candle.close_time, realized_r - cost_r
 
-    if highest_tp == 2:
-        return "hit_tp2", tp_hit_times[2], setup.rr_tp2
-    if highest_tp == 1:
-        return "hit_tp1", tp_hit_times[1], setup.rr_tp1
+        if not hit_tp1 and ((candle.high >= setup.tp1) if is_long else (candle.low <= setup.tp1)):
+            hit_tp1 = True
+            leg_tp1 = (
+                (setup.tp1 - fill_price) / risk if is_long else (fill_price - setup.tp1) / risk
+            )
+            realized_r += 0.40 * leg_tp1
+            remaining -= 0.40
+            current_sl = fill_price
+
+        if not hit_tp2 and ((candle.high >= setup.tp2) if is_long else (candle.low <= setup.tp2)):
+            hit_tp2 = True
+            leg_tp2 = (
+                (setup.tp2 - fill_price) / risk if is_long else (fill_price - setup.tp2) / risk
+            )
+            realized_r += 0.40 * leg_tp2
+            remaining -= 0.40
+
+        if (candle.high >= setup.tp3) if is_long else (candle.low <= setup.tp3):
+            leg_tp3 = (
+                (setup.tp3 - fill_price) / risk if is_long else (fill_price - setup.tp3) / risk
+            )
+            realized_r += remaining * leg_tp3
+            cost_r = (costs.round_trip_cost_rate * fill_price) / risk
+            return "hit_tp3", candle.close_time, realized_r - cost_r
 
     if len(candles) >= max_bars:
         if not triggered:
             return "expired", candles[-1].close_time, 0.0
         last_close = candles[-1].close
-        realized_r = (
-            (last_close - setup.entry_mid) / risk
-            if is_long
-            else (setup.entry_mid - last_close) / risk
-        )
-        return "expired", candles[-1].close_time, realized_r
+        leg_end = (last_close - fill_price) / risk if is_long else (fill_price - last_close) / risk
+        realized_r += remaining * leg_end
+        cost_r = (costs.round_trip_cost_rate * fill_price) / risk
+        final_outcome = "hit_tp2" if hit_tp2 else ("hit_tp1" if hit_tp1 else "expired")
+        return final_outcome, candles[-1].close_time, realized_r - cost_r
 
     if triggered:
         return "entry_triggered", None, None

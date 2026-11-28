@@ -50,7 +50,10 @@ class StatisticalMetrics(BaseModel):
     parkinson_vol: float | None = None
     garman_klass_vol: float | None = None
     hurst_exponent: float | None = None
+    hurst_se: float | None = None
+    hurst_unreliable: bool = False
     ou_half_life: float | None = None
+    ou_not_stationary: bool = False
 
 
 def _as_1d_float64(values: ArrayLike, name: str) -> NDArray[np.float64]:
@@ -176,19 +179,13 @@ def garman_klass_volatility(
     return math.sqrt(var)
 
 
-def hurst_exponent(
+def hurst_exponent_with_se(
     closes: ArrayLike,
     *,
     max_lag: int = 20,
     min_window: int = 64,
-) -> float | None:
-    """Hurst exponent via the rescaled log-variance of lagged differences on log prices.
-
-    H ~ 0.5 is a random walk, H > 0.5 trending (persistent), H < 0.5 mean-reverting.
-    Estimated by regressing `ln(std(diff_lag))` on `ln(lag)` for lags `2..max_lag`; the
-    slope equals H. Returns `None` when history is shorter than `min_window` or the price
-    path is degenerate (zero variance across all lags).
-    """
+) -> tuple[float | None, float | None, bool]:
+    """Return `(H, se_H, hurst_unreliable)` where `hurst_unreliable <=> 2 * 1.96 * se_H > 0.30`."""
     if max_lag < 2:
         raise ValueError("max_lag must be >= 2")
     if min_window < max_lag + 1:
@@ -196,9 +193,9 @@ def hurst_exponent(
     arr = _as_1d_float64(closes, "closes")
     finite = arr[np.isfinite(arr)]
     if len(finite) < min_window:
-        return None
+        return None, None, False
     if np.any(finite <= 0.0):
-        return None
+        return None, None, False
     log_prices = np.log(finite)
 
     lags = np.arange(2, max_lag + 1)
@@ -214,57 +211,132 @@ def hurst_exponent(
         log_lags.append(math.log(float(lag)))
         log_tau.append(math.log(std))
 
-    if len(log_lags) < 2:
-        return None
+    m = len(log_lags)
+    if m < 2:
+        return None, None, False
 
-    slope, _intercept = np.polyfit(np.asarray(log_lags), np.asarray(log_tau), 1)
+    x = np.asarray(log_lags, dtype=np.float64)
+    y = np.asarray(log_tau, dtype=np.float64)
+    slope, intercept = np.polyfit(x, y, 1)
     h_val = float(slope)
     if not math.isfinite(h_val):
-        return None
-    return min(1.0, max(0.0, h_val))
+        return None, None, False
+    h_clamped = min(1.0, max(0.0, h_val))
+
+    se_h: float | None = None
+    unreliable = False
+    if m > 2:
+        resid = y - (slope * x + intercept)
+        sxx = float(np.sum((x - float(np.mean(x))) ** 2))
+        if sxx > _EPS:
+            s2 = float(np.sum(resid**2)) / float(m - 2)
+            se_val = math.sqrt(max(0.0, s2) / sxx)
+            if math.isfinite(se_val):
+                se_h = se_val
+                unreliable = (2.0 * 1.96 * se_val) > 0.30
+    return h_clamped, se_h, unreliable
 
 
-def ou_half_life(
+def hurst_exponent(
+    closes: ArrayLike,
+    *,
+    max_lag: int = 20,
+    min_window: int = 64,
+) -> float | None:
+    """Hurst exponent via the rescaled log-variance of lagged differences on log prices."""
+    h_val, _se, _unrel = hurst_exponent_with_se(closes, max_lag=max_lag, min_window=min_window)
+    return h_val
+
+
+def mackinnon_adf_critical_value_5pct(n: int) -> float:
+    """MacKinnon (1994/2010) 5% critical value for constant-only, no-trend ADF test."""
+    n_eff = max(10, int(n))
+    return float(-2.86154 - 2.8903 / n_eff - 4.234 / (n_eff**2) - 40.04 / (n_eff**3))
+
+
+def adf_test_constant(series: ArrayLike) -> tuple[float, float, bool]:
+    """Constant-only lag-0 ADF test in NumPy; returns `(t_stat, crit_5pct, is_stationary)`."""
+    y = _as_1d_float64(series, "series")
+    if len(y) < 10 or not np.all(np.isfinite(y)):
+        return 0.0, mackinnon_adf_critical_value_5pct(max(10, len(y))), False
+    y_lag = y[:-1]
+    delta = y[1:] - y_lag
+    n_obs = len(delta)
+    if float(np.var(y_lag)) <= _EPS:
+        return 0.0, mackinnon_adf_critical_value_5pct(n_obs), False
+
+    design = np.column_stack([np.ones(n_obs, dtype=np.float64), y_lag])
+    coeffs, *_ = np.linalg.lstsq(design, delta, rcond=None)
+    resid = delta - design @ coeffs
+    dof = max(1, n_obs - 2)
+    sigma2 = float(np.sum(resid**2)) / float(dof)
+    xtx_inv = np.linalg.pinv(design.T @ design)
+    se_beta = math.sqrt(max(0.0, sigma2 * float(xtx_inv[1, 1])))
+    if se_beta <= _EPS:
+        return 0.0, mackinnon_adf_critical_value_5pct(n_obs), False
+    t_stat = float(coeffs[1]) / se_beta
+    crit = mackinnon_adf_critical_value_5pct(n_obs)
+    return t_stat, crit, bool(math.isfinite(t_stat) and t_stat < crit)
+
+
+def ou_half_life_with_adf(
     closes: ArrayLike,
     *,
     window: int = 120,
-) -> float | None:
-    """Ornstein-Uhlenbeck mean-reversion half-life (in bars) on log prices.
+    require_stationary: bool = True,
+) -> tuple[float | None, bool]:
+    """OU mean-reversion half-life with ADF 5% stationarity gate (PRD v1.7 §4.3).
 
-    Fits `delta_y_t = alpha + beta * y_{t-1} + eps` by OLS over the last `window` log
-    prices; half-life = `-ln(2) / ln(1 + beta)`. Returns `None` when the series is not
-    mean-reverting (`beta >= 0`) or history/variance is insufficient.
+    Returns `(half_life, not_stationary)`. When `require_stationary=True` and ADF fails,
+    returns `(None, True)` with `NOT_STATIONARY`.
     """
     if window < 10:
         raise ValueError("window must be >= 10")
     arr = _as_1d_float64(closes, "closes")
     finite = arr[np.isfinite(arr)]
     if len(finite) < window:
-        return None
+        return None, False
     tail = finite[-window:]
     if np.any(tail <= 0.0):
-        return None
+        return None, False
     y = np.log(tail)
 
     y_lag = y[:-1]
     delta = y[1:] - y_lag
-    if len(y_lag) < 3:
-        return None
-    if float(np.var(y_lag)) <= _EPS:
-        return None
+    if len(y_lag) < 3 or float(np.var(y_lag)) <= _EPS:
+        return None, False
+
+    _t_stat, _crit, is_stat = adf_test_constant(y)
+    if require_stationary and not is_stat:
+        return None, True
 
     design = np.column_stack([np.ones_like(y_lag), y_lag])
     coeffs, *_ = np.linalg.lstsq(design, delta, rcond=None)
     beta = float(coeffs[1])
     if not math.isfinite(beta) or beta >= 0.0:
-        return None
+        return None, not is_stat
     one_plus_beta = 1.0 + beta
     if one_plus_beta <= 0.0 or one_plus_beta >= 1.0:
-        return None
+        return None, not is_stat
     half_life = -math.log(2.0) / math.log(one_plus_beta)
     if not math.isfinite(half_life) or half_life <= 0.0:
-        return None
-    return half_life
+        return None, not is_stat
+    return half_life, not is_stat
+
+
+def ou_half_life(
+    closes: ArrayLike,
+    *,
+    window: int = 120,
+    require_stationary: bool = True,
+) -> float | None:
+    """Ornstein-Uhlenbeck mean-reversion half-life (in bars) gated by 5% ADF stationarity."""
+    hl, _not_stat = ou_half_life_with_adf(
+        closes,
+        window=window,
+        require_stationary=require_stationary,
+    )
+    return hl
 
 
 def compute_statistical_metrics(
@@ -289,10 +361,9 @@ def compute_statistical_metrics(
         if n >= MIN_HISTORY_REALIZED_VOL
         else None
     )
+    bars_per_year = (365.0 * 86_400.0) / candles[0].timeframe.duration.total_seconds()
     rv_cc_annual = (
-        annualize_volatility(rv_cc, bars_per_year=ANNUALIZATION_TRADING_DAYS)
-        if rv_cc is not None
-        else None
+        annualize_volatility(rv_cc, bars_per_year=bars_per_year) if rv_cc is not None else None
     )
     parkinson = (
         parkinson_volatility(highs, lows, window=realized_vol_window)
@@ -304,12 +375,17 @@ def compute_statistical_metrics(
         if n >= MIN_HISTORY_GARMAN_KLASS
         else None
     )
-    hurst = (
-        hurst_exponent(closes, max_lag=hurst_max_lag, min_window=hurst_min_window)
-        if n >= MIN_HISTORY_HURST
-        else None
-    )
-    half_life = ou_half_life(closes, window=ou_window) if n >= MIN_HISTORY_OU_HALF_LIFE else None
+    hurst: float | None = None
+    h_se: float | None = None
+    h_unrel = False
+    if n >= MIN_HISTORY_HURST:
+        hurst, h_se, h_unrel = hurst_exponent_with_se(
+            closes, max_lag=hurst_max_lag, min_window=hurst_min_window
+        )
+    half_life: float | None = None
+    ou_not_stat = False
+    if n >= MIN_HISTORY_OU_HALF_LIFE:
+        half_life, ou_not_stat = ou_half_life_with_adf(closes, window=ou_window)
 
     return StatisticalMetrics(
         realized_vol_cc=rv_cc,
@@ -317,5 +393,8 @@ def compute_statistical_metrics(
         parkinson_vol=parkinson,
         garman_klass_vol=garman_klass,
         hurst_exponent=hurst,
+        hurst_se=h_se,
+        hurst_unreliable=h_unrel,
         ou_half_life=half_life,
+        ou_not_stationary=ou_not_stat,
     )

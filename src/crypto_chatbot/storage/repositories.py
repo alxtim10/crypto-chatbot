@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import Engine, delete, select, update
@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from crypto_chatbot.schemas.analysis import AnalysisSnapshot, TradeSetup
 from crypto_chatbot.schemas.derivatives import (
+    ContractStatsObservation,
     FundingRateObservation,
     LiquidationEvent,
     LiquidationSide,
@@ -32,6 +33,8 @@ from crypto_chatbot.schemas.market import (
 from crypto_chatbot.schemas.ml import MlExperimentReport, ShadowPredictionRecord
 from crypto_chatbot.schemas.news import (
     MIN_ENTITY_MATCH_CONFIDENCE,
+    FearGreedObservation,
+    NewsVoteSnapshot,
     NormalizedNewsArticle,
     SentimentLabel,
     SentimentObservation,
@@ -41,10 +44,14 @@ from crypto_chatbot.schemas.tradingview import (
     TradingViewEventType,
     TradingViewPacket,
 )
+from crypto_chatbot.schemas.whale import NetworkType, WhaleWatchlistEntry
 from crypto_chatbot.storage.models import (
     AnalysisSnapshotRow,
+    ContractStatsRow,
     ConversationRow,
+    FearGreedRow,
     FundingRateRow,
+    GateIngestLedgerRow,
     LiquidationEventRow,
     LlmInteractionRow,
     MarketCandleRow,
@@ -52,6 +59,7 @@ from crypto_chatbot.storage.models import (
     MlExperimentRow,
     ModelPredictionRow,
     NewsArticleRow,
+    NewsVoteSnapshotRow,
     OpenInterestRow,
     OrderBookSnapshotRow,
     SentimentObservationRow,
@@ -59,6 +67,7 @@ from crypto_chatbot.storage.models import (
     TradingViewPacketRow,
     UserPreferenceRow,
     UserRow,
+    WhaleWatchlistRow,
 )
 
 
@@ -96,13 +105,13 @@ class StoredMessage(BaseModel):
 
 
 class LlmInteractionRecord(BaseModel):
-    """Audit record for a single Gemini narration attempt."""
+    """Audit record for a single Gemini narration or routing trace event."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     telegram_user_id: int
     request_id: str
-    snapshot_id: str
+    snapshot_id: str | None = None
     model_id: str
     prompt_version: str
     validation_passed: bool
@@ -110,6 +119,12 @@ class LlmInteractionRecord(BaseModel):
     prompt_tokens: int | None = Field(default=None, ge=0)
     output_tokens: int | None = Field(default=None, ge=0)
     latency_ms: int = Field(ge=0)
+    layer: str | None = None
+    detected_symbol: str | None = None
+    intent: str | None = None
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    fallback_reason: str | None = None
+    guard_violations: tuple[str, ...] = ()
     created_at: UtcDatetime | None = None
 
 
@@ -143,6 +158,7 @@ class TradeSetupRecord(BaseModel):
     snapshot_id: str
     venue: str
     canonical_symbol: str
+    market_type: str | None = None
     timeframe: Timeframe
     as_of: UtcDatetime
     status: str
@@ -238,6 +254,73 @@ class DerivativesRepository(Protocol):
         end_available_time: datetime | None = None,
         limit: int | None = None,
     ) -> tuple[LiquidationEvent, ...]: ...
+
+
+class ContractStatsRepository(Protocol):
+    """Repository interface for Gate.io perpetual contract_stats observations."""
+
+    def save_contract_stats(self, observations: Sequence[ContractStatsObservation]) -> int: ...
+
+    def load_contract_stats(
+        self,
+        *,
+        venue: str,
+        canonical_symbol: str,
+        interval: str = "5m",
+        start_time: datetime | None = None,
+        end_available_time: datetime | None = None,
+        limit: int | None = None,
+    ) -> tuple[ContractStatsObservation, ...]: ...
+
+    def list_contract_stats_times(
+        self,
+        *,
+        venue: str,
+        canonical_symbol: str,
+        interval: str = "5m",
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+    ) -> tuple[datetime, ...]: ...
+
+
+class GateIngestRepository(Protocol):
+    """Repository protocol for checksum-tracked bulk Gate.io archive ingestion (D-04)."""
+
+    def get_ingested_sha256(
+        self,
+        *,
+        dataset: str,
+        contract: str,
+        yyyymm: str,
+    ) -> str | None: ...
+
+    def record_ingested_file(
+        self,
+        *,
+        dataset: str,
+        contract: str,
+        yyyymm: str,
+        sha256: str,
+        byte_size: int,
+        local_path: str,
+        row_count: int,
+        inserted_rows: int,
+        ingested_at: datetime,
+    ) -> None: ...
+
+
+class FearGreedRepository(Protocol):
+    """Repository protocol for daily Fear & Greed Index snapshots (S-02)."""
+
+    def save_observations(self, observations: Sequence[FearGreedObservation]) -> int: ...
+
+    def load_observations(
+        self,
+        *,
+        source: str = "alternative.me",
+        end_available_time: datetime | None = None,
+        limit: int | None = None,
+    ) -> tuple[FearGreedObservation, ...]: ...
 
 
 class SetupLogRepository(Protocol):
@@ -339,6 +422,7 @@ class PostgresMarketRepository:
                 "high": candle.high,
                 "low": candle.low,
                 "close": candle.close,
+                "raw_contracts": candle.raw_contracts,
                 "base_volume": candle.base_volume,
                 "quote_volume": candle.quote_volume,
                 "taker_buy_base_volume": candle.taker_buy_base_volume,
@@ -350,15 +434,43 @@ class PostgresMarketRepository:
             for candle in candles
         ]
 
-        stmt = (
-            insert(MarketCandleRow)
-            .values(rows)
-            .on_conflict_do_nothing(constraint="uq_market_candles_identity")
-            .returning(MarketCandleRow.id)
-        )
+        inserted_total = 0
+        batch_size = 500
         with Session(self._engine) as session, session.begin():
-            inserted_ids = session.scalars(stmt).all()
-            return len(inserted_ids)
+            for idx in range(0, len(rows), batch_size):
+                chunk = rows[idx : idx + batch_size]
+                stmt = (
+                    insert(MarketCandleRow)
+                    .values(chunk)
+                    .on_conflict_do_nothing(constraint="uq_market_candles_identity")
+                    .returning(MarketCandleRow.id)
+                )
+                inserted_total += len(session.scalars(stmt).all())
+        return inserted_total
+
+    def upsert_taker_buy_volumes(self, candles: Sequence[MarketCandle]) -> int:
+        """Update `taker_buy_base_volume` on existing closed candles (D-05)."""
+        eligible = [c for c in candles if c.taker_buy_base_volume is not None]
+        if not eligible:
+            return 0
+        updated = 0
+        with Session(self._engine) as session, session.begin():
+            for candle in eligible:
+                stmt = (
+                    update(MarketCandleRow)
+                    .where(
+                        MarketCandleRow.provider == candle.provider,
+                        MarketCandleRow.venue == candle.venue,
+                        MarketCandleRow.canonical_symbol == candle.canonical_symbol,
+                        MarketCandleRow.market_type == candle.market_type.value,
+                        MarketCandleRow.timeframe == candle.timeframe.value,
+                        MarketCandleRow.open_time == _to_utc(candle.open_time),
+                    )
+                    .values(taker_buy_base_volume=candle.taker_buy_base_volume)
+                )
+                result = session.execute(stmt)
+                updated += int(getattr(result, "rowcount", 0) or 0)
+        return updated
 
     def load_candles(
         self,
@@ -415,6 +527,7 @@ class PostgresMarketRepository:
                 high=row.high,
                 low=row.low,
                 close=row.close,
+                raw_contracts=row.raw_contracts,
                 base_volume=row.base_volume,
                 quote_volume=row.quote_volume,
                 taker_buy_base_volume=row.taker_buy_base_volume,
@@ -533,6 +646,74 @@ class PostgresUserMemoryRepository:
             )
             session.execute(stmt)
 
+    def update_watchlist(
+        self,
+        telegram_user_id: int,
+        symbol: str,
+        *,
+        action: Literal["add", "remove"],
+    ) -> tuple[UserPreferences, bool]:
+        """Atomically add or remove a watchlist symbol under a row lock (`FOR UPDATE`)."""
+        now = datetime.now(UTC)
+        with Session(self._engine) as session, session.begin():
+            self._ensure_user_in_session(session, telegram_user_id)
+            row = session.scalar(
+                select(UserPreferenceRow)
+                .where(UserPreferenceRow.telegram_user_id == telegram_user_id)
+                .with_for_update()
+            )
+            if row is None:
+                defaults = UserPreferences()
+                watchlist = list(defaults.watchlist)
+                if action == "add":
+                    if symbol in watchlist:
+                        return defaults, False
+                    watchlist.append(symbol)
+                    changed = True
+                else:
+                    if symbol not in watchlist:
+                        return defaults, False
+                    watchlist = [s for s in watchlist if s != symbol]
+                    changed = True
+                session.add(
+                    UserPreferenceRow(
+                        telegram_user_id=telegram_user_id,
+                        watchlist=watchlist,
+                        language=defaults.language,
+                        default_timeframe=defaults.default_timeframe.value,
+                        display_currency=defaults.display_currency,
+                        updated_at=now,
+                    )
+                )
+                return defaults.model_copy(update={"watchlist": tuple(watchlist)}), changed
+
+            watchlist = list(row.watchlist)
+            if action == "add":
+                if symbol in watchlist:
+                    changed = False
+                else:
+                    watchlist.append(symbol)
+                    row.watchlist = watchlist
+                    row.updated_at = now
+                    changed = True
+            else:
+                if symbol not in watchlist:
+                    changed = False
+                else:
+                    watchlist = [s for s in watchlist if s != symbol]
+                    row.watchlist = watchlist
+                    row.updated_at = now
+                    changed = True
+            return (
+                UserPreferences(
+                    watchlist=tuple(watchlist),
+                    language=row.language,
+                    default_timeframe=Timeframe(row.default_timeframe),
+                    display_currency=row.display_currency,
+                ),
+                changed,
+            )
+
     def append_message(
         self,
         telegram_user_id: int,
@@ -642,6 +823,12 @@ class PostgresUserMemoryRepository:
                 prompt_tokens=record.prompt_tokens,
                 output_tokens=record.output_tokens,
                 latency_ms=record.latency_ms,
+                layer=record.layer,
+                detected_symbol=record.detected_symbol,
+                intent=record.intent,
+                confidence=record.confidence,
+                fallback_reason=record.fallback_reason,
+                guard_violations=list(record.guard_violations),
                 created_at=ts,
             )
             session.add(row)
@@ -1087,6 +1274,7 @@ def _row_to_setup_record(row: TradeSetupRow) -> TradeSetupRecord:
         snapshot_id=row.snapshot_id,
         venue=row.venue,
         canonical_symbol=row.canonical_symbol,
+        market_type=getattr(row, "market_type", None),
         timeframe=Timeframe(row.timeframe),
         as_of=_to_utc(row.as_of),
         status=row.status,
@@ -1127,6 +1315,7 @@ class PostgresSetupLogRepository:
             "snapshot_id": snapshot.snapshot_id,
             "venue": snapshot.venue,
             "canonical_symbol": snapshot.canonical_symbol,
+            "market_type": snapshot.market_type.value,
             "timeframe": snapshot.timeframe.value,
             "as_of": snapshot.as_of,
             "created_at": datetime.now(UTC),
@@ -1396,6 +1585,21 @@ class NewsRepository(Protocol):
     ) -> tuple[SentimentObservation, ...]: ...
 
 
+@runtime_checkable
+class NewsVoteSnapshotRepository(Protocol):
+    """Append-only persistence & causal queries for `news_vote_snapshots` (S-03)."""
+
+    def save_vote_snapshots(self, snapshots: Sequence[NewsVoteSnapshot]) -> int: ...
+
+    def load_vote_snapshots(
+        self,
+        *,
+        article_id: str,
+        end_snapshot_time: datetime | None = None,
+        limit: int | None = None,
+    ) -> tuple[NewsVoteSnapshot, ...]: ...
+
+
 def _row_to_sentiment_observation(row: SentimentObservationRow) -> SentimentObservation:
     return SentimentObservation(
         observation_id=row.observation_id,
@@ -1523,6 +1727,87 @@ class PostgresNewsRepository:
         if limit is not None:
             db_rows.reverse()
         return tuple(_row_to_sentiment_observation(row) for row in db_rows)
+
+    def save_vote_snapshots(self, snapshots: Sequence[NewsVoteSnapshot]) -> int:
+        items = list(snapshots)
+        if not items:
+            return 0
+        payloads = [
+            {
+                "snapshot_id": snap.snapshot_id,
+                "article_id": snap.article_id,
+                "source_provider": snap.source_provider,
+                "snapshot_time": _to_utc(snap.snapshot_time),
+                "positive_votes": snap.positive_votes,
+                "negative_votes": snap.negative_votes,
+                "important_votes": snap.important_votes,
+                "liked_votes": snap.liked_votes,
+                "disliked_votes": snap.disliked_votes,
+                "lol_votes": snap.lol_votes,
+                "toxic_votes": snap.toxic_votes,
+                "saved_votes": snap.saved_votes,
+                "comments_count": snap.comments_count,
+                "attribution_text": snap.attribution_text,
+                "raw_payload": dict(snap.raw_payload),
+            }
+            for snap in items
+        ]
+        stmt = (
+            insert(NewsVoteSnapshotRow)
+            .values(payloads)
+            .on_conflict_do_nothing()
+            .returning(NewsVoteSnapshotRow.id)
+        )
+        with Session(self._engine) as session, session.begin():
+            inserted_ids = session.scalars(stmt).all()
+            return len(inserted_ids)
+
+    def load_vote_snapshots(
+        self,
+        *,
+        article_id: str,
+        end_snapshot_time: datetime | None = None,
+        limit: int | None = None,
+    ) -> tuple[NewsVoteSnapshot, ...]:
+        stmt = select(NewsVoteSnapshotRow).where(NewsVoteSnapshotRow.article_id == article_id)
+        if end_snapshot_time is not None:
+            stmt = stmt.where(NewsVoteSnapshotRow.snapshot_time <= _to_utc(end_snapshot_time))
+        if limit is not None:
+            if limit < 1:
+                raise ValueError("limit must be >= 1")
+            stmt = stmt.order_by(
+                NewsVoteSnapshotRow.snapshot_time.desc(),
+                NewsVoteSnapshotRow.id.desc(),
+            ).limit(limit)
+        else:
+            stmt = stmt.order_by(
+                NewsVoteSnapshotRow.snapshot_time.asc(),
+                NewsVoteSnapshotRow.id.asc(),
+            )
+        with Session(self._engine) as session:
+            db_rows = list(session.scalars(stmt))
+        if limit is not None:
+            db_rows.reverse()
+        return tuple(
+            NewsVoteSnapshot(
+                snapshot_id=row.snapshot_id,
+                article_id=row.article_id,
+                source_provider=row.source_provider,
+                snapshot_time=_to_utc(row.snapshot_time),
+                positive_votes=row.positive_votes,
+                negative_votes=row.negative_votes,
+                important_votes=row.important_votes,
+                liked_votes=row.liked_votes,
+                disliked_votes=row.disliked_votes,
+                lol_votes=row.lol_votes,
+                toxic_votes=row.toxic_votes,
+                saved_votes=row.saved_votes,
+                comments_count=row.comments_count,
+                attribution_text=row.attribution_text,
+                raw_payload=dict(row.raw_payload),
+            )
+            for row in db_rows
+        )
 
 
 class MlExperimentRepository(Protocol):
@@ -1780,3 +2065,389 @@ class PostgresModelPredictionRepository:
         )
         with Session(self._engine) as session, session.begin():
             return bool(session.scalars(stmt).all())
+
+
+_EMPTY_WHALE_SENTINEL = "__EMPTY_WATCHLIST__"
+
+
+class PostgresWhaleWatchlistRepository:
+    """Synchronous PostgreSQL persistence for user whale watchlists (`whale_watchlists`)."""
+
+    def __init__(self, engine: Engine) -> None:
+        self._engine = engine
+
+    def get_user_entries(self, user_id: int) -> tuple[WhaleWatchlistEntry, ...] | None:
+        """Return saved entries for user_id, or None if the user has never customized defaults."""
+        stmt = (
+            select(WhaleWatchlistRow)
+            .where(WhaleWatchlistRow.telegram_user_id == user_id)
+            .order_by(WhaleWatchlistRow.id.asc())
+        )
+        with Session(self._engine) as session:
+            rows = list(session.scalars(stmt))
+        if not rows:
+            return None
+        return tuple(
+            WhaleWatchlistEntry(
+                address=row.address,
+                network=NetworkType(row.network),
+                label=row.label,
+                added_at=_to_utc(row.added_at),
+            )
+            for row in rows
+            if row.active and row.address != _EMPTY_WHALE_SENTINEL
+        )
+
+    def replace_user_entries(
+        self,
+        user_id: int,
+        entries: Sequence[WhaleWatchlistEntry],
+    ) -> None:
+        """Persist the full ordered watchlist snapshot for user_id atomically."""
+        now = datetime.now(UTC)
+        with Session(self._engine) as session, session.begin():
+            PostgresUserMemoryRepository._ensure_user_in_session(session, user_id)
+            session.execute(
+                update(WhaleWatchlistRow)
+                .where(WhaleWatchlistRow.telegram_user_id == user_id)
+                .values(active=False)
+            )
+            if not entries:
+                existing_count = len(
+                    session.scalars(
+                        select(WhaleWatchlistRow.id).where(
+                            WhaleWatchlistRow.telegram_user_id == user_id
+                        )
+                    ).all()
+                )
+                if existing_count == 0:
+                    sentinel = (
+                        insert(WhaleWatchlistRow)
+                        .values(
+                            telegram_user_id=user_id,
+                            address=_EMPTY_WHALE_SENTINEL,
+                            network=NetworkType.EVM.value,
+                            label="",
+                            added_at=now,
+                            active=False,
+                        )
+                        .on_conflict_do_nothing(index_elements=["telegram_user_id", "address"])
+                    )
+                    session.execute(sentinel)
+                return
+
+            for entry in entries:
+                stmt = (
+                    insert(WhaleWatchlistRow)
+                    .values(
+                        telegram_user_id=user_id,
+                        address=entry.address,
+                        network=entry.network.value,
+                        label=entry.label,
+                        added_at=_to_utc(entry.added_at),
+                        active=True,
+                    )
+                    .on_conflict_do_update(
+                        index_elements=["telegram_user_id", "address"],
+                        set_={
+                            "network": entry.network.value,
+                            "label": entry.label,
+                            "added_at": _to_utc(entry.added_at),
+                            "active": True,
+                        },
+                    )
+                )
+                session.execute(stmt)
+
+
+class PostgresContractStatsRepository:
+    """Synchronous PostgreSQL append-only repository for Gate contract_stats snapshots."""
+
+    _INSERT_BATCH_SIZE = 500
+
+    def __init__(self, engine: Engine) -> None:
+        self._engine = engine
+
+    def save_contract_stats(self, observations: Sequence[ContractStatsObservation]) -> int:
+        if not observations:
+            return 0
+        rows = [
+            {
+                "venue": obs.venue,
+                "canonical_symbol": obs.canonical_symbol,
+                "provider_symbol": obs.provider_symbol,
+                "interval": obs.interval,
+                "observed_time": _to_utc(obs.observed_time),
+                "received_time": _to_utc(obs.received_time),
+                "available_time": _to_utc(obs.available_time),
+                "lsr_taker": obs.lsr_taker,
+                "lsr_account": obs.lsr_account,
+                "top_lsr_account": obs.top_lsr_account,
+                "top_lsr_size": obs.top_lsr_size,
+                "long_liq_usd": obs.long_liq_usd,
+                "short_liq_usd": obs.short_liq_usd,
+                "open_interest": obs.open_interest,
+                "open_interest_usd": obs.open_interest_usd,
+                "mark_price": obs.mark_price,
+                "last_funding_rate": obs.last_funding_rate,
+                "long_users": obs.long_users,
+                "short_users": obs.short_users,
+                "quality_flags": [flag.value for flag in obs.quality_flags],
+                "raw_payload": obs.raw_payload,
+            }
+            for obs in observations
+        ]
+        inserted_total = 0
+        with Session(self._engine) as session, session.begin():
+            for idx in range(0, len(rows), self._INSERT_BATCH_SIZE):
+                chunk = rows[idx : idx + self._INSERT_BATCH_SIZE]
+                stmt = (
+                    insert(ContractStatsRow)
+                    .values(chunk)
+                    .on_conflict_do_nothing(constraint="uq_contract_stats_identity")
+                    .returning(ContractStatsRow.id)
+                )
+                inserted_total += len(session.scalars(stmt).all())
+        return inserted_total
+
+    def upsert_taker_buy_volumes(self, candles: Sequence[MarketCandle]) -> int:
+        """Update `taker_buy_base_volume` on existing closed candles (D-05)."""
+        eligible = [c for c in candles if c.taker_buy_base_volume is not None]
+        if not eligible:
+            return 0
+        updated = 0
+        with Session(self._engine) as session, session.begin():
+            for candle in eligible:
+                stmt = (
+                    update(MarketCandleRow)
+                    .where(
+                        MarketCandleRow.provider == candle.provider,
+                        MarketCandleRow.venue == candle.venue,
+                        MarketCandleRow.canonical_symbol == candle.canonical_symbol,
+                        MarketCandleRow.market_type == candle.market_type.value,
+                        MarketCandleRow.timeframe == candle.timeframe.value,
+                        MarketCandleRow.open_time == _to_utc(candle.open_time),
+                    )
+                    .values(taker_buy_base_volume=candle.taker_buy_base_volume)
+                )
+                result = session.execute(stmt)
+                updated += int(getattr(result, "rowcount", 0) or 0)
+        return updated
+
+    def load_contract_stats(
+        self,
+        *,
+        venue: str,
+        canonical_symbol: str,
+        interval: str = "5m",
+        start_time: datetime | None = None,
+        end_available_time: datetime | None = None,
+        limit: int | None = None,
+    ) -> tuple[ContractStatsObservation, ...]:
+        stmt = select(ContractStatsRow).where(
+            ContractStatsRow.venue == venue,
+            ContractStatsRow.canonical_symbol == canonical_symbol,
+            ContractStatsRow.interval == interval,
+        )
+        if start_time is not None:
+            stmt = stmt.where(ContractStatsRow.observed_time >= _to_utc(start_time))
+        if end_available_time is not None:
+            stmt = stmt.where(ContractStatsRow.available_time <= _to_utc(end_available_time))
+        if limit is not None:
+            if limit < 1:
+                raise ValueError("limit must be >= 1")
+            stmt = stmt.order_by(ContractStatsRow.observed_time.desc()).limit(limit)
+        else:
+            stmt = stmt.order_by(ContractStatsRow.observed_time.asc())
+        with Session(self._engine) as session:
+            db_rows = list(session.scalars(stmt))
+        if limit is not None:
+            db_rows.reverse()
+        return tuple(
+            ContractStatsObservation(
+                venue=row.venue,
+                canonical_symbol=row.canonical_symbol,
+                provider_symbol=row.provider_symbol,
+                interval=row.interval,  # type: ignore[arg-type]
+                observed_time=_to_utc(row.observed_time),
+                received_time=_to_utc(row.received_time),
+                available_time=_to_utc(row.available_time),
+                lsr_taker=row.lsr_taker,
+                lsr_account=row.lsr_account,
+                top_lsr_account=row.top_lsr_account,
+                top_lsr_size=row.top_lsr_size,
+                long_liq_usd=row.long_liq_usd,
+                short_liq_usd=row.short_liq_usd,
+                open_interest=row.open_interest,
+                open_interest_usd=row.open_interest_usd,
+                mark_price=row.mark_price,
+                last_funding_rate=row.last_funding_rate,
+                long_users=row.long_users,
+                short_users=row.short_users,
+                quality_flags=tuple(QualityFlag(flag) for flag in row.quality_flags),
+                raw_payload=dict(row.raw_payload),
+            )
+            for row in db_rows
+        )
+
+    def list_contract_stats_times(
+        self,
+        *,
+        venue: str,
+        canonical_symbol: str,
+        interval: str = "5m",
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+    ) -> tuple[datetime, ...]:
+        stmt = (
+            select(ContractStatsRow.observed_time)
+            .where(
+                ContractStatsRow.venue == venue,
+                ContractStatsRow.canonical_symbol == canonical_symbol,
+                ContractStatsRow.interval == interval,
+            )
+            .order_by(ContractStatsRow.observed_time.asc())
+        )
+        if start_time is not None:
+            stmt = stmt.where(ContractStatsRow.observed_time >= _to_utc(start_time))
+        if end_time is not None:
+            stmt = stmt.where(ContractStatsRow.observed_time <= _to_utc(end_time))
+        with Session(self._engine) as session:
+            return tuple(_to_utc(ts) for ts in session.scalars(stmt).all())
+
+
+class PostgresGateIngestRepository:
+    """PostgreSQL checksum ledger repository for idempotent bulk archive ingestion."""
+
+    def __init__(self, engine: Engine) -> None:
+        self._engine = engine
+
+    def get_ingested_sha256(
+        self,
+        *,
+        dataset: str,
+        contract: str,
+        yyyymm: str,
+    ) -> str | None:
+        stmt = select(GateIngestLedgerRow.sha256).where(
+            GateIngestLedgerRow.dataset == dataset,
+            GateIngestLedgerRow.contract == contract,
+            GateIngestLedgerRow.yyyymm == yyyymm,
+        )
+        with Session(self._engine) as session:
+            return session.scalar(stmt)
+
+    def record_ingested_file(
+        self,
+        *,
+        dataset: str,
+        contract: str,
+        yyyymm: str,
+        sha256: str,
+        byte_size: int,
+        local_path: str,
+        row_count: int,
+        inserted_rows: int,
+        ingested_at: datetime,
+    ) -> None:
+        stmt = (
+            insert(GateIngestLedgerRow)
+            .values(
+                dataset=dataset,
+                contract=contract,
+                yyyymm=yyyymm,
+                sha256=sha256,
+                byte_size=byte_size,
+                local_path=local_path,
+                row_count=row_count,
+                inserted_rows=inserted_rows,
+                ingested_at=_to_utc(ingested_at),
+            )
+            .on_conflict_do_update(
+                constraint="uq_gate_ingest_file",
+                set_={
+                    "sha256": sha256,
+                    "byte_size": byte_size,
+                    "local_path": local_path,
+                    "row_count": row_count,
+                    "inserted_rows": inserted_rows,
+                    "ingested_at": _to_utc(ingested_at),
+                },
+            )
+        )
+        with Session(self._engine) as session, session.begin():
+            session.execute(stmt)
+
+
+class PostgresFearGreedRepository:
+    """Synchronous PostgreSQL repository for Alternative.me Fear & Greed observations."""
+
+    _INSERT_BATCH_SIZE = 500
+
+    def __init__(self, engine: Engine) -> None:
+        self._engine = engine
+
+    def save_observations(self, observations: Sequence[FearGreedObservation]) -> int:
+        if not observations:
+            return 0
+        rows = [
+            {
+                "source": obs.source,
+                "observed_time": _to_utc(obs.observed_time),
+                "received_time": _to_utc(obs.received_time),
+                "available_time": _to_utc(obs.available_time),
+                "value": obs.value,
+                "classification": obs.classification,
+                "normalized_score": obs.normalized_score,
+                "is_backfilled": obs.is_backfilled,
+                "raw_payload": obs.raw_payload,
+            }
+            for obs in observations
+        ]
+        inserted_total = 0
+        with Session(self._engine) as session, session.begin():
+            for idx in range(0, len(rows), self._INSERT_BATCH_SIZE):
+                chunk = rows[idx : idx + self._INSERT_BATCH_SIZE]
+                stmt = (
+                    insert(FearGreedRow)
+                    .values(chunk)
+                    .on_conflict_do_nothing(constraint="uq_fear_greed_source_time")
+                    .returning(FearGreedRow.id)
+                )
+                inserted_total += len(session.scalars(stmt).all())
+        return inserted_total
+
+    def load_observations(
+        self,
+        *,
+        source: str = "alternative.me",
+        end_available_time: datetime | None = None,
+        limit: int | None = None,
+    ) -> tuple[FearGreedObservation, ...]:
+        stmt = select(FearGreedRow).where(FearGreedRow.source == source)
+        if end_available_time is not None:
+            stmt = stmt.where(FearGreedRow.available_time <= _to_utc(end_available_time))
+        if limit is not None:
+            if limit < 1:
+                raise ValueError("limit must be >= 1")
+            stmt = stmt.order_by(FearGreedRow.observed_time.desc()).limit(limit)
+        else:
+            stmt = stmt.order_by(FearGreedRow.observed_time.asc())
+        with Session(self._engine) as session:
+            db_rows = list(session.scalars(stmt))
+        if limit is not None:
+            db_rows.reverse()
+        return tuple(
+            FearGreedObservation(
+                source=row.source,
+                observed_time=_to_utc(row.observed_time),
+                received_time=_to_utc(row.received_time),
+                available_time=_to_utc(row.available_time),
+                value=row.value,
+                classification=row.classification,
+                normalized_score=row.normalized_score,
+                is_backfilled=row.is_backfilled,
+                raw_payload=dict(row.raw_payload),
+            )
+            for row in db_rows
+        )

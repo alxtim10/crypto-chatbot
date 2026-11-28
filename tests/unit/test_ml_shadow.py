@@ -151,7 +151,12 @@ def test_production_and_training_feature_parity() -> None:
     assert prod_row.regime == target_row.regime
     assert prod_row.features.keys() == target_row.features.keys()
     for fname, train_val in target_row.features.items():
-        assert abs(prod_row.features[fname] - train_val) <= 1e-12
+        prod_val = prod_row.features[fname]
+        if train_val is None:
+            assert prod_val is None
+        else:
+            assert prod_val is not None
+            assert abs(prod_val - train_val) <= 1e-12
 
 
 def test_artifact_and_shadow_engine_probability_parity() -> None:
@@ -447,9 +452,13 @@ def test_settlement_and_monitoring_alerts() -> None:
         )
         for i in range(6)
     ]
-    bad_report = compute_shadow_monitoring_report(bad_records, min_settled=5)
+    bad_report = compute_shadow_monitoring_report(
+        bad_records,
+        min_settled=5,
+        min_settled_ece=5,
+    )
     assert bad_report.is_healthy is False
-    assert "brier_above_threshold" in bad_report.alerts
+    assert "bss_below_zero" in bad_report.alerts
     assert "calibration_ece_above_threshold" in bad_report.alerts
     assert "feature_drift_rate_high" in bad_report.alerts
 
@@ -466,6 +475,10 @@ def test_settlement_and_monitoring_alerts() -> None:
         )
         for i in range(6)
     ]
-    good_report = compute_shadow_monitoring_report(good_records, min_settled=5)
+    good_report = compute_shadow_monitoring_report(
+        good_records,
+        min_settled=5,
+        reference_base_rate=0.5,
+    )
     assert good_report.is_healthy is True
     assert good_report.alerts == ()

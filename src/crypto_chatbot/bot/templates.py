@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import html
+import re
 from datetime import UTC, datetime, timedelta, timezone
+from typing import Literal
 
 from crypto_chatbot.schemas.analysis import (
     AnalysisSnapshot,
@@ -16,7 +18,11 @@ from crypto_chatbot.schemas.analysis import (
     SetupBias,
     SetupStatus,
 )
-from crypto_chatbot.schemas.market import QualityStatus, Timeframe
+from crypto_chatbot.schemas.market import (
+    QualityStatus,
+    Timeframe,
+    format_trading_style_label,
+)
 from crypto_chatbot.storage.repositories import (
     ForgetResult,
     StoredMessage,
@@ -218,6 +224,132 @@ def _append_ml_prediction_lines(
     for note in pred.limitations:
         lines.append(f"- Keterbatasan model: {_esc(note, html_mode)}")
     lines.append(f"- Peringatan: {_esc(pred.non_guarantee_notice, html_mode)}")
+
+
+def _append_positioning_lines(
+    lines: list[str],
+    snapshot: AnalysisSnapshot,
+    *,
+    html_mode: bool,
+) -> None:
+    pos = snapshot.positioning
+    if pos is None:
+        return
+    lines.append("")
+    lines.append(
+        _bold(
+            f"Panel Positioning Derivatif ({pos.parity_mode} — {pos.venue.upper()})",
+            html_mode,
+        )
+    )
+    if pos.status == "UNAVAILABLE":
+        lines.append(
+            _esc(
+                f"- Status: UNAVAILABLE ({pos.note or 'belum ada histori contract_stats'})",
+                html_mode,
+            )
+        )
+        return
+    parts: list[str] = [f"Status: {pos.status}"]
+    if pos.top_lsr_account is not None:
+        top_txt = f"Top L/S: {format_indonesian_number(pos.top_lsr_account, 2)}"
+        if pos.top_lsr_account_pct_30d is not None and pos.top_lsr_account_z_30d is not None:
+            pct = format_indonesian_number(pos.top_lsr_account_pct_30d, 1)
+            z = format_indonesian_number(pos.top_lsr_account_z_30d, 2, signed=True)
+            top_txt += f" (P{pct} / z={z})"
+        parts.append(top_txt)
+    if pos.lsr_taker is not None:
+        tkr_txt = f"Taker L/S: {format_indonesian_number(pos.lsr_taker, 2)}"
+        if pos.lsr_taker_pct_30d is not None and pos.lsr_taker_z_30d is not None:
+            pct = format_indonesian_number(pos.lsr_taker_pct_30d, 1)
+            z = format_indonesian_number(pos.lsr_taker_z_30d, 2, signed=True)
+            tkr_txt += f" (P{pct} / z={z})"
+        parts.append(tkr_txt)
+    if pos.oi_24h_delta_pct is not None:
+        parts.append(f"OI 24h: {format_indonesian_number(pos.oi_24h_delta_pct, 2, signed=True)}%")
+    if pos.liq_skew_24h is not None:
+        parts.append(f"Liq skew: {format_indonesian_number(pos.liq_skew_24h, 2, signed=True)}")
+    lines.append(_esc("- " + " | ".join(parts), html_mode))
+    if pos.note:
+        lines.append(_esc(f"- Catatan: {pos.note}", html_mode))
+
+
+def _append_composite_sentiment_panel(
+    lines: list[str],
+    snapshot: AnalysisSnapshot,
+    *,
+    html_mode: bool,
+) -> None:
+    """Render unified S-04 Sentimen panel with BACKTESTED / CONTEXT_ONLY / FORWARD_ONLY tags."""
+    has_funding = snapshot.derivatives is not None and snapshot.derivatives.funding_rate is not None
+    has_pos = snapshot.positioning is not None
+    has_fg = snapshot.fear_greed is not None
+    has_news = snapshot.sentiment is not None
+    if not (has_funding or has_pos or has_fg or has_news):
+        return
+
+    lines.append("")
+    lines.append(_bold("Panel Sentimen (Komposit Multi-Sumber — Bukan Probabilitas)", html_mode))
+
+    # 1. Positioning: BACKTESTED (funding 8h D-07) + FORWARD_ONLY (contract_stats S-01)
+    if (
+        has_funding
+        and snapshot.derivatives is not None
+        and snapshot.derivatives.funding_rate is not None
+    ):
+        fr_pct = format_indonesian_number(snapshot.derivatives.funding_rate * 100.0, 4, signed=True)
+        lines.append(_esc(f"- Positioning Funding 8h [BACKTESTED]: {fr_pct}%", html_mode))
+    if snapshot.positioning is not None:
+        pos = snapshot.positioning
+        pos_tag = pos.parity_mode
+        if pos.status == "UNAVAILABLE":
+            lines.append(_esc(f"- Positioning Derivatif [{pos_tag}]: UNAVAILABLE", html_mode))
+        else:
+            p_parts = [f"status={pos.status}"]
+            if pos.top_lsr_account is not None:
+                p_parts.append(f"Top L/S={format_indonesian_number(pos.top_lsr_account, 2)}")
+            if pos.lsr_taker is not None:
+                p_parts.append(f"Taker L/S={format_indonesian_number(pos.lsr_taker, 2)}")
+            if pos.oi_24h_delta_pct is not None:
+                p_parts.append(
+                    f"OI 24h={format_indonesian_number(pos.oi_24h_delta_pct, 2, signed=True)}%"
+                )
+            lines.append(
+                _esc(f"- Positioning Derivatif [{pos_tag}]: " + " | ".join(p_parts), html_mode)
+            )
+    else:
+        lines.append(_esc("- Positioning Derivatif [FORWARD_ONLY]: UNAVAILABLE", html_mode))
+
+    # 2. Fear & Greed Index: CONTEXT_ONLY + Alternative.me attribution (S-02 / S-04)
+    if snapshot.fear_greed is not None:
+        fg = snapshot.fear_greed
+        lines.append(
+            _esc(
+                f"- Fear & Greed [CONTEXT_ONLY]: {fg.value}/100 ({fg.classification}) — "
+                "Sumber: Alternative.me Crypto Fear & Greed Index "
+                "(konteks rezim saja, bukan pemicu entry)",
+                html_mode,
+            )
+        )
+    else:
+        lines.append(_esc("- Fear & Greed [CONTEXT_ONLY]: UNAVAILABLE", html_mode))
+
+    # 3. News tone & count: FORWARD_ONLY (S-03 / S-04)
+    if snapshot.sentiment is not None:
+        sent = snapshot.sentiment
+        lbl_map = {"positive": "Positif", "negative": "Negatif", "neutral": "Netral"}
+        dom = lbl_map.get(sent.dominant_label.value, sent.dominant_label.value)
+        sc = format_indonesian_number(sent.net_sentiment_score, 2, signed=True)
+        lines.append(
+            _esc(
+                f"- Berita {sent.window_hours}h [FORWARD_ONLY]: {dom} | skor={sc} "
+                f"| artikel={sent.article_count} "
+                f"(+{sent.positive_count}/-{sent.negative_count}/={sent.neutral_count})",
+                html_mode,
+            )
+        )
+    else:
+        lines.append(_esc("- Berita 24h [FORWARD_ONLY]: UNAVAILABLE", html_mode))
 
 
 def render_deterministic_snapshot(
@@ -464,6 +596,11 @@ def render_deterministic_snapshot(
         if snapshot.sentiment is not None:
             _append_sentiment_lines(lines, snapshot, html_mode=html_mode, max_sources=3)
 
+        if snapshot.positioning is not None:
+            _append_positioning_lines(lines, snapshot, html_mode=html_mode)
+
+        _append_composite_sentiment_panel(lines, snapshot, html_mode=html_mode)
+
         if snapshot.prediction_markets is not None and snapshot.prediction_markets.observations:
             pm = snapshot.prediction_markets
             lines.append("")
@@ -529,10 +666,14 @@ def render_deterministic_snapshot(
                     sl_dist_str = format_indonesian_number(setup.stop_loss_distance_pct, 2)
                     lines.append(f"- Jarak Stop Loss: {sl_dist_str}%")
                 if setup.max_theoretical_leverage is not None:
+                    mmr_tag = " [MMR_ASSUMED]" if setup.mmr_assumed else ""
                     lines.append(
-                        f"- Batas leverage teoretis referensi: {setup.max_theoretical_leverage}x "
-                        f"(berdasarkan jarak likuidasi 80% buffer)"
+                        f"- Batas leverage teoretis referensi: {setup.max_theoretical_leverage}x"
+                        f"{mmr_tag} (berdasarkan jarak SL + biaya + MMR)"
                     )
+                if setup.net_rr_blend is not None:
+                    blend_str = format_indonesian_number(setup.net_rr_blend, 2)
+                    lines.append(f"- Net R:R Blend (40/40/20, report-only): 1:{blend_str}")
 
         if snapshot.factors:
             lines.append("")
@@ -778,9 +919,33 @@ def render_compact_snapshot(
             macro_parts.append(btc_info)
         lines.append(_esc("Konteks Makro & Posisi: " + " | ".join(macro_parts), html_mode))
 
+    if snapshot.positioning is not None:
+        pos = snapshot.positioning
+        pos_parts: list[str] = [f"Status: {pos.status}"]
+        if pos.top_lsr_account is not None:
+            top_tok = format_indonesian_number(pos.top_lsr_account, 2)
+            if pos.top_lsr_account_pct_30d is not None:
+                top_tok += f" (P{format_indonesian_number(pos.top_lsr_account_pct_30d, 0)})"
+            pos_parts.append(f"Top L/S: {top_tok}")
+        if pos.lsr_taker is not None:
+            pos_parts.append(f"Taker: {format_indonesian_number(pos.lsr_taker, 2)}")
+        if pos.oi_24h_delta_pct is not None:
+            pos_parts.append(
+                f"OI 24h: {format_indonesian_number(pos.oi_24h_delta_pct, 1, signed=True)}%"
+            )
+        lines.append(
+            _esc(
+                f"Positioning ({pos.parity_mode}): " + " | ".join(pos_parts),
+                html_mode,
+            )
+        )
+
+    _append_composite_sentiment_panel(lines, snapshot, html_mode=html_mode)
+
     if len(snapshot.mtf_overview) >= 2:
+        tf_chain = " → ".join(ov.timeframe.value for ov in snapshot.mtf_overview)
         lines.append("")
-        lines.append(_bold("Alur Top-Down Multi-Timeframe (1d → 4h → 1h → 15m)", html_mode))
+        lines.append(_bold(f"Alur Top-Down Multi-Timeframe ({tf_chain})", html_mode))
         dz_map = {
             DealingZone.DISCOUNT: "Discount",
             DealingZone.EQUILIBRIUM: "Equilibrium",
@@ -813,6 +978,12 @@ def render_compact_snapshot(
     # Skenario Setup (Deterministik)
     lines.append("")
     lines.append(_bold("Skenario Setup (Deterministik — Bukan Probabilitas)", html_mode))
+    lines.append(
+        _esc(
+            f"• Gaya / Mode: {format_trading_style_label(snapshot.timeframe)}",
+            html_mode,
+        )
+    )
     setup = snapshot.trade_setup
     sh_htf = _fmt_fact(by_label.get("High dealing range")) or _fmt_fact(
         by_label.get("Swing high terkonfirmasi")
@@ -918,7 +1089,16 @@ def render_compact_snapshot(
     if setup is not None and setup.risk_notes:
         lines.append(f"• Risiko: {_esc(setup.risk_notes[0], html_mode)}")
     elif snapshot.derivatives is not None:
-        lines.append("• Risiko: Data derivatif hanya berasal dari satu venue (Binance).")
+        deriv_venue = (
+            snapshot.derivatives.funding_venue
+            or snapshot.derivatives.open_interest_venue
+            or snapshot.derivatives.orderbook_venue
+            or snapshot.venue
+        ).capitalize()
+        lines.append(
+            "• Risiko: Data derivatif hanya berasal dari satu venue "
+            f"({_esc(deriv_venue, html_mode)})."
+        )
 
     _append_ml_prediction_lines(lines, snapshot, html_mode=html_mode)
 
@@ -984,17 +1164,32 @@ def render_start_message() -> str:
         "<b>Selamat datang di Crypto Research Assistant</b>",
         (
             "Bot ini adalah asisten riset dan edukasi pasar kripto berbasis data candle "
-            "tertutup Binance spot dan perhitungan indikator deterministik."
+            "tertutup futures perpetual &amp; spot serta perhitungan indikator deterministik."
         ),
         "",
         "<b>Cakupan Analisis:</b>",
-        "- Simbol spot Binance /USDT (mis. BTC, ETH, SOL, DOGE, SUI, PEPE, dll.)",
-        "- Timeframe: 15m, 1h, 4h, 1d (dengan refinement entry 15m untuk analisis 1h/4h/1d)",
+        "- Simbol futures perpetual /USDT:USDT (mis. BTC, ETH, SOL, DOGE, SUI, PEPE, VVV, dll.)",
+        "- Unified Multi-Timeframe (1d → 4h → 1h → 15m → 5m) berjalan otomatis dalam 1 setup",
         "",
-        "<b>Perintah Utama:</b>",
-        "- /analyze BTC 4h — ringkasan key points + Entry/SL/TP1-3 kondisional",
-        "- /analyze SUI 15m — analisis langsung timeframe 15 menit (dengan filter HTF)",
-        "- /analyze BTC 4h detail — rincian seluruh metrik dan fakta backend",
+        "<b>Cara Pakai (Chat Natural atau Perintah):</b>",
+        '- Ketik santai: <i>"coba analisa btc sekarang"</i> (default: mode Swing 4h)',
+        (
+            "- Pilih gaya trading: sebut <b>scalp</b> (15m), <b>intraday</b> (1h), "
+            'atau <b>swing</b> (4h) — misal <i>"analisa sol buat scalp"</i>'
+        ),
+        (
+            '- Pindai koin: <i>"ada token yang bisa disetup buat scalp gak?"</i> '
+            "atau /scan [scalp|intraday|swing]"
+        ),
+        (
+            '- Screener 15m: <i>"screening top gainers dan top losers dong"</i> '
+            "atau /screen [long|short]"
+        ),
+        (
+            "- /analyze BTC [scalp|intraday|swing|15m|1h|4h|1d] — "
+            "ringkasan key points + Entry/SL/TP1-3"
+        ),
+        "- /pine BTC [scalp|intraday|swing] — export TradingView Pine Script v6",
         "- /compare BTC ETH 1d — perbandingan deskriptif antar koin",
         "- /watchlist — lihat atau kelola daftar pantau eksplisit",
         "- /memory — lihat preferensi dan batas memori percakapan",
@@ -1014,15 +1209,31 @@ def render_help_message() -> str:
     lines = [
         "<b>Panduan Perintah</b>",
         (
-            "- /analyze &lt;SIMBOL&gt; [15m|1h|4h|1d] [detail] — contoh: "
-            "/analyze DOGE 4h atau /analyze SUI 15m"
+            "- /analyze &lt;SIMBOL&gt; [scalp|intraday|swing|15m|1h|4h|1d] [detail] — contoh: "
+            "/analyze DOGE swing atau /analyze SUI scalp"
         ),
         (
-            "- /compare &lt;SIMBOL1&gt; &lt;SIMBOL2&gt; [SIMBOL3] [15m|1h|4h|1d] "
-            "— contoh: /compare BTC ETH 1d"
+            "- /compare &lt;SIMBOL1&gt; &lt;SIMBOL2&gt; [SIMBOL3] "
+            "[scalp|intraday|swing|15m|1h|4h|1d] — contoh: /compare BTC ETH swing"
+        ),
+        (
+            "- /pine &lt;SIMBOL&gt; [scalp|intraday|swing|15m|1h|4h|1d] — "
+            "export TradingView Pine Script v6 untuk Entry, SL, TP, S/R, dan zona SMC"
+        ),
+        (
+            "- /scan [scalp|intraday|swing|15m|1h|4h|1d] — "
+            "pindai watchlist &amp; basket futures untuk cari setup READY"
+        ),
+        (
+            "- /screen [long|short|all] [min_vol_juta] — "
+            "screener Top Gainers/Losers (Vol 24j >= $5M) + momentum Engulfing/Marubozu 15m"
+        ),
+        (
+            "- /whale [SIMBOL|alamat|add|remove|list] — "
+            "pantau posisi perpetual whale (Hyperliquid) &amp; pelacak dompet on-chain / aliran CEX"
         ),
         "- /watchlist — tampilkan daftar pantau",
-        "- /watchlist add &lt;SIMBOL&gt; — tambah pair spot /USDT ke daftar pantau",
+        "- /watchlist add &lt;SIMBOL&gt; — tambah pair futures /USDT:USDT ke daftar pantau",
         "- /watchlist remove &lt;SIMBOL&gt; — hapus dari daftar pantau",
         "- /memory — periksa preferensi eksplisit dan pesan tersimpan (maksimal 20 pesan)",
         "- /forget — hapus seluruh preferensi dan memori percakapan Anda",
@@ -1095,3 +1306,212 @@ def render_forget_message(result: ForgetResult, *, html_mode: bool = True) -> st
         "Data pasar publik dan snapshot anonim tidak terpengaruh.",
     ]
     return "\n".join(lines)
+
+
+def render_smalltalk_reply(subtype: Literal["greeting", "thanks", "ack"]) -> str:
+    """Render concise deterministic Indonesian reply for greetings, thanks, and acks."""
+    if subtype == "thanks":
+        return (
+            "Sama-sama! Jika butuh cek koin lain, tanya istilah trading, atau pindai setup, "
+            "kabari saja."
+        )
+    if subtype == "ack":
+        return "Siap! Kabari saja kalau ingin cek koin atau diskusi konsep trading."
+    return (
+        "Halo! Saya asisten riset & edukasi futures kripto. "
+        "Tanya konsep trading (mis. 'apa itu RSI 70?'), cek koin (mis. 'analisa BTC 4h'), "
+        "atau ketik /help."
+    )
+
+
+_EDU_GLOSSARY: tuple[tuple[re.Pattern[str], str, str], ...] = (
+    (
+        re.compile(r"\brsi\b", re.IGNORECASE),
+        "RSI (Relative Strength Index)",
+        "Mengukur kecepatan momentum harga (skala 0-100). Di atas 70 sering dianggap jenuh beli "
+        "(overbought) dan di bawah 30 jenuh jual (oversold), namun pada tren kuat RSI bisa "
+        "bertahan di area ekstrem cukup lama.",
+    ),
+    (
+        re.compile(r"\bema\b", re.IGNORECASE),
+        "EMA (Exponential Moving Average)",
+        "Rata-rata bergerak dengan bobot lebih besar pada penutupan terbaru. EMA 20 lebih "
+        "responsif terhadap momentum pendek, sedangkan EMA 200 membantu membaca arah tren makro.",
+    ),
+    (
+        re.compile(r"\bmacd\b", re.IGNORECASE),
+        "MACD",
+        "Mengukur selisih dua EMA beserta garis sinyal dan histogramnya untuk membaca perubahan "
+        "momentum serta potensi divergensi.",
+    ),
+    (
+        re.compile(r"\bfunding(?:\s+rate)?\b", re.IGNORECASE),
+        "Funding Rate (Perpetual)",
+        "Biaya periodik (umumnya tiap 8 jam) antar pemegang posisi long dan short agar harga "
+        "kontrak perpetual tetap dekat dengan harga indeks spot.",
+    ),
+    (
+        re.compile(r"\bspot\b", re.IGNORECASE),
+        "Spot vs Perpetual Futures",
+        "Pasar spot memperdagangkan aset dasar secara langsung tanpa leverage, sedangkan perpetual "
+        "futures memperdagangkan kontrak derivatif dengan margin, leverage, dan funding rate.",
+    ),
+    (
+        re.compile(r"\b(?:bos|choch)\b", re.IGNORECASE),
+        "BOS & CHoCH (Market Structure)",
+        "BOS (Break of Structure) menandakan kelanjutan struktur tren saat swing utama tertembus; "
+        "CHoCH (Change of Character) memberi indikasi awal potensi perubahan arah tren.",
+    ),
+    (
+        re.compile(r"\blong\b.*\bshort\b|\bshort\b.*\blong\b", re.IGNORECASE),
+        "Posisi Long vs Short",
+        "Long bertujuan memperoleh selisih saat harga naik, sedangkan Short bertujuan memperoleh "
+        "selisih saat harga turun pada kontrak derivatif/futures.",
+    ),
+    (
+        re.compile(r"\brisk[\s/]*reward\b|\br:r\b", re.IGNORECASE),
+        "Risk / Reward (R:R)",
+        "Perbandingan jarak risiko ke Stop Loss terhadap jarak potensi target Take Profit "
+        "(mis. 1:2 berarti potensi target 2x jarak risiko).",
+    ),
+    (
+        re.compile(r"\ball[\s-]+in\b", re.IGNORECASE),
+        "Risiko All-In",
+        "Menaruh seluruh modal pada satu posisi memperbesar risiko likuidasi atau drawdown tajam. "
+        "Pembatasan ukuran risiko per transaksi membantu ketahanan modal.",
+    ),
+    (
+        re.compile(r"\bleverage\b", re.IGNORECASE),
+        "Leverage",
+        "Pengganda ukuran posisi terhadap margin jaminan. Leverage yang lebih tinggi mempersempit "
+        "jarak ke harga likuidasi.",
+    ),
+    (
+        re.compile(r"\b(?:isolated|cross)\s*margin\b", re.IGNORECASE),
+        "Isolated vs Cross Margin",
+        "Isolated membatasi risiko kerugian pada margin posisi tertentu saja, sedangkan Cross "
+        "menggunakan seluruh saldo margin futures yang tersedia.",
+    ),
+    (
+        re.compile(r"\bfvg\b", re.IGNORECASE),
+        "FVG (Fair Value Gap)",
+        "Celah ketidakseimbangan harga pada rangkaian 3 candle yang sering dipantau sebagai zona "
+        "reaksi pullback.",
+    ),
+    (
+        re.compile(r"\border\s*block\b", re.IGNORECASE),
+        "Order Block",
+        "Area candle berlawanan terakhir sebelum pergerakan impulsif kuat yang kerap dijadikan "
+        "referensi zona minat harga historis.",
+    ),
+    (
+        re.compile(r"\bdxy\b", re.IGNORECASE),
+        "US Dollar Index (DXY)",
+        "Indeks kekuatan dolar AS terhadap sekeranjang mata uang utama. Penguatan DXY sering "
+        "menjadi konteks tekanan bagi aset berisiko seperti kripto.",
+    ),
+    (
+        re.compile(r"\bliquidation\b|\blikuidasi\b", re.IGNORECASE),
+        "Liquidation Price",
+        "Level harga saat margin tidak lagi cukup menahan kerugian posisi sehingga bursa menutup "
+        "posisi secara paksa.",
+    ),
+    (
+        re.compile(r"\bdca\b", re.IGNORECASE),
+        "DCA (Dollar-Cost Averaging)",
+        "Metode masuk bertahap secara berkala dengan nominal terencana untuk meratakan harga "
+        "akuisisi.",
+    ),
+    (
+        re.compile(r"\b(?:fomo|fud)\b", re.IGNORECASE),
+        "FOMO & FUD",
+        "FOMO adalah dorongan masuk terburu-buru karena takut ketinggalan gerak harga; FUD adalah "
+        "narasi ketakutan/ketidakpastian yang memicu keputusan emosional.",
+    ),
+    (
+        re.compile(r"\bpsikologi\b|\bloss\b", re.IGNORECASE),
+        "Psikologi & Kontrol Loss",
+        "Pengendalian emosi saat loss bertumpu pada ukuran risiko terukur, kepatuhan pada Stop "
+        "Loss, dan jeda sejenak untuk menghindari revenge trading.",
+    ),
+    (
+        re.compile(r"\b(?:ath|atl)\b", re.IGNORECASE),
+        "ATH & ATL",
+        "ATH (All-Time High) adalah rekor harga tertinggi sepanjang masa; ATL (All-Time Low) "
+        "adalah rekor harga terendah sepanjang masa.",
+    ),
+    (
+        re.compile(r"\bsupport\b|\bresistance\b", re.IGNORECASE),
+        "Support & Resistance",
+        "Support adalah area minat beli historis yang menahan penurunan; Resistance adalah area "
+        "minat jual historis yang menahan kenaikan.",
+    ),
+    (
+        re.compile(r"\bcandle\b|\b5m\b|\b15m\b", re.IGNORECASE),
+        "Candle & Timeframe",
+        "Setiap candle merangkum harga Open, High, Low, Close pada satu rentang waktu "
+        "(mis. 5m mikro, 15m scalp, 1h intraday, 4h swing).",
+    ),
+)
+
+
+def render_context_fallback(
+    category: str,
+    *,
+    question: str = "",
+    active_symbol: str | None = None,
+) -> str:
+    """Render context-specific Indonesian fallback guidance for each non-analysis category."""
+    if category == "smalltalk":
+        return (
+            "Halo! Lagi santai memantau pasar nih. Kalau mau tanya istilah trading, cek "
+            "kondisi market, atau analisa koin tertentu, langsung ketik saja."
+        )
+    if category == "edu_qa":
+        matches: list[tuple[str, str]] = []
+        for pattern, title, desc in _EDU_GLOSSARY:
+            if pattern.search(question):
+                matches.append((title, desc))
+            if len(matches) >= 2:
+                break
+        if matches:
+            lines = ["<b>Ringkasan Glosarium (Mode Deterministik)</b>"]
+            for title, desc in matches:
+                lines.append(
+                    f"• <b>{html.escape(title, quote=False)}</b>: {html.escape(desc, quote=False)}"
+                )
+            lines.append("")
+            lines.append(
+                "<i>Catatan: Layanan penjelasan AI interaktif sedang sibuk/mencapai batas kuota "
+                "saat ini.</i>"
+            )
+            return "\n".join(lines)
+        return (
+            "Layanan penjelasan AI untuk pertanyaan edukasi sedang sibuk atau mencapai batas "
+            "kuota saat ini. Silakan ulangi beberapa saat lagi atau ketik /help."
+        )
+    if category == "followup_expired":
+        return (
+            "Konteks koin sebelumnya sudah berakhir (lebih dari 15 menit atau topik sudah "
+            "berpindah). Sebutkan kembali nama koin yang ingin dicek (mis. 'analisa BTC 1h') "
+            "untuk data terbaru."
+        )
+    if category == "followup_active" and active_symbol:
+        base = active_symbol.split("/")[0]
+        return (
+            f"Layanan penjelasan lanjutan AI sedang sibuk saat ini. Untuk pembaruan data "
+            f"{base}, ketik 'cek {base}' atau '/analyze {base} detail'."
+        )
+    if category == "out_of_scope_non_crypto":
+        return (
+            "Bot ini khusus untuk riset dan edukasi pasar perpetual futures kripto (/USDT:USDT), "
+            "sehingga tidak melayani topik di luar kripto seperti saham atau pertanyaan umum "
+            "lainnya. Ketik /help untuk melihat daftar fitur."
+        )
+    return (
+        "Pesan belum dapat dipahami. Anda bisa mencoba contoh berikut:\n"
+        "• 'analisa BTC 4h' — analisis teknikal & setup koin\n"
+        "• 'apa itu RSI 70?' — pertanyaan edukasi trading\n"
+        "• 'ada setup apa hari ini?' — pindai peluang futures\n"
+        "Atau ketik /help untuk panduan lengkap."
+    )

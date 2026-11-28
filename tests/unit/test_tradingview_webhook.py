@@ -408,3 +408,32 @@ async def test_webhook_http_server_accepts_valid_and_rejects_bad_requests() -> N
         assert d3["accepted"] is False
     finally:
         await server.stop()
+
+
+def test_webhook_redacts_query_secret_in_logs_and_bounds_seen_keys(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    processor = TradingViewWebhookProcessor(
+        shared_secret=SecretStr(WEBHOOK_SECRET),
+        clock=lambda: ANCHOR_NOW,
+    )
+    allowed_ip = TRADINGVIEW_PUBLISHED_WEBHOOK_IPS[0]
+    secret_val = "topsecret_query_val_999"
+
+    with caplog.at_level(logging.WARNING):
+        res = processor.process_request(
+            _body(_sample_payload()),
+            source_ip=allowed_ip,
+            query_string=f"secret={secret_val}&foo=bar",
+        )
+    assert res.status_code == 400
+    assert res.reason == "query_secret_not_allowed"
+    assert secret_val not in caplog.text
+    assert "secret" in caplog.text
+
+    processor._max_seen_keys = 3
+    for k in ("k1", "k2", "k3", "k4"):
+        processor._remember_key(k)
+    assert len(processor._seen_keys) == 3
+    assert "k1" not in processor._seen_keys
+    assert "k4" in processor._seen_keys

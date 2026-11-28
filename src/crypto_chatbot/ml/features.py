@@ -53,6 +53,7 @@ FEATURE_FAMILIES: dict[FeatureFamily, tuple[str, ...]] = {
         "adx_14_norm",
         "di_diff_norm",
         "rvol_20",
+        "rvol_missing",
     ),
     FeatureFamily.STRUCTURE_PIVOT: (
         "dist_to_sh_atr",
@@ -66,16 +67,20 @@ FEATURE_FAMILIES: dict[FeatureFamily, tuple[str, ...]] = {
         "sentiment_net_score",
         "sentiment_mean_conf",
         "sentiment_article_count_log",
+        "sentiment_missing",
     ),
     FeatureFamily.ORDERFLOW: (
         "taker_buy_ratio",
-        "cvd_zscore_20",
+        "cvd_ratio_20",
+        "cvd_z_100",
+        "orderflow_missing",
     ),
 }
 
 ALL_FEATURE_NAMES: tuple[str, ...] = (
     *FEATURE_FAMILIES[FeatureFamily.TECHNICAL],
     *FEATURE_FAMILIES[FeatureFamily.STRUCTURE_PIVOT],
+    *FEATURE_FAMILIES[FeatureFamily.ORDERFLOW],
     *FEATURE_FAMILIES[FeatureFamily.SENTIMENT],
 )
 
@@ -152,6 +157,7 @@ def _compute_causal_feature_rows(
     confirmed_pivots: list[StructureEvent] = []
     fb_cursor = 0
     confirmed_fbs: list[StructureEvent] = []
+    cvd_ratio_history: list[float] = []
 
     rows: list[FeatureRow] = []
     for idx in range(len(candles)):
@@ -192,7 +198,9 @@ def _compute_causal_feature_rows(
         ema20 = float(ema_20_s[idx])
         ema50 = float(ema_50_s[idx])
         atr_val = float(atr_s[idx])
-        rvol_val = float(rvol_s[idx]) if math.isfinite(float(rvol_s[idx])) else 1.0
+        rvol_finite = math.isfinite(float(rvol_s[idx]))
+        rvol_val: float | None = float(rvol_s[idx]) if rvol_finite else None
+        rvol_missing = 0.0 if rvol_finite else 1.0
 
         tech = TechnicalMetrics(
             last_close=c_price,
@@ -235,9 +243,10 @@ def _compute_causal_feature_rows(
             else 0.0
         )
 
-        sent_score = 0.0
-        sent_conf = 0.0
-        sent_count_log = 0.0
+        sent_score: float | None = None
+        sent_conf: float | None = None
+        sent_count_log: float | None = None
+        sentiment_missing = 1.0
         row_avail: datetime = bar_time
         if sentiment_observations:
             sent = aggregate_sentiment(
@@ -250,10 +259,11 @@ def _compute_causal_feature_rows(
                 sent_score = sent.net_sentiment_score
                 sent_conf = sent.mean_confidence
                 sent_count_log = math.log1p(float(sent.article_count))
+                sentiment_missing = 0.0
                 if sent.latest_available_time is not None:
                     row_avail = max(row_avail, sent.latest_available_time)
 
-        feat_dict: dict[str, float] = {
+        feat_dict: dict[str, float | None] = {
             "ret_1": float(ret_1_s[idx]),
             "ret_6": float(ret_6_s[idx]),
             "ret_20": float(ret_20_s[idx]),
@@ -265,6 +275,7 @@ def _compute_causal_feature_rows(
             "adx_14_norm": float(adx_s[idx]) / 100.0,
             "di_diff_norm": (float(pdi_s[idx]) - float(mdi_s[idx])) / 100.0,
             "rvol_20": rvol_val,
+            "rvol_missing": rvol_missing,
             "dist_to_sh_atr": float(max(-10.0, min(10.0, dist_sh))),
             "dist_to_sl_atr": float(max(-10.0, min(10.0, dist_sl))),
             "structure_bullish": 1.0 if struct is MarketStructure.BULLISH else 0.0,
@@ -274,26 +285,41 @@ def _compute_causal_feature_rows(
             "sentiment_net_score": sent_score,
             "sentiment_mean_conf": sent_conf,
             "sentiment_article_count_log": sent_count_log,
+            "sentiment_missing": sentiment_missing,
         }
 
-        # Order flow features
-        tbr = (
-            candle.taker_buy_base_volume / candle.base_volume
-            if (candle.taker_buy_base_volume is not None and candle.base_volume > 0.0)
-            else 0.5
-        )
-        cvd_window_start = max(0, idx - 19)
-        c_sub = candles[cvd_window_start : idx + 1]
-        sum_delta = 0.0
-        sum_vol = 0.0
-        for sc in c_sub:
-            if sc.taker_buy_base_volume is not None:
-                sum_delta += (2.0 * sc.taker_buy_base_volume) - sc.base_volume
-                sum_vol += sc.base_volume
-        cvd_ratio = sum_delta / sum_vol if sum_vol > 0.0 else 0.0
+        # Order flow features (no silent constant fills; missing flag + None for in-fold median)
+        if candle.taker_buy_base_volume is not None and candle.base_volume > 0.0:
+            tbr: float | None = float(candle.taker_buy_base_volume / candle.base_volume)
+            cvd_window_start = max(0, idx - 19)
+            c_sub = candles[cvd_window_start : idx + 1]
+            sum_delta = 0.0
+            sum_vol = 0.0
+            for sc in c_sub:
+                if sc.taker_buy_base_volume is not None:
+                    sum_delta += (2.0 * sc.taker_buy_base_volume) - sc.base_volume
+                    sum_vol += sc.base_volume
+            cvd_ratio: float | None = (sum_delta / sum_vol) if sum_vol > 0.0 else None
+            orderflow_missing = 0.0 if cvd_ratio is not None else 1.0
+        else:
+            tbr = None
+            cvd_ratio = None
+            orderflow_missing = 1.0
 
-        feat_dict["taker_buy_ratio"] = float(tbr)
-        feat_dict["cvd_zscore_20"] = float(max(-3.0, min(3.0, cvd_ratio)))
+        cvd_z_100: float | None = None
+        if cvd_ratio is not None:
+            cvd_ratio_history.append(cvd_ratio)
+            if len(cvd_ratio_history) >= 20:
+                tail = np.asarray(cvd_ratio_history[-100:], dtype=np.float64)
+                mu100 = float(np.mean(tail))
+                sd100 = float(np.std(tail, ddof=1))
+                if sd100 > 1e-12:
+                    cvd_z_100 = float(max(-3.0, min(3.0, (cvd_ratio - mu100) / sd100)))
+
+        feat_dict["taker_buy_ratio"] = tbr
+        feat_dict["cvd_ratio_20"] = cvd_ratio
+        feat_dict["cvd_z_100"] = cvd_z_100
+        feat_dict["orderflow_missing"] = orderflow_missing
 
         if include_target_horizon:
             target_candle = candles[idx + horizon_bars]
@@ -342,13 +368,44 @@ def build_point_in_time_dataset(
             "t": row.prediction_time.isoformat(),
             "le": row.label_end_time.isoformat(),
             "y": row.label,
-            "f": {k: round(v, 10) for k, v in sorted(row.features.items())},
+            "f": {
+                k: (None if v is None else round(v, 10)) for k, v in sorted(row.features.items())
+            },
         }
         for row in rows
     ]
     encoded = json.dumps(digest_items, sort_keys=True, separators=(",", ":"), allow_nan=False)
     dataset_sha256 = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
     return tuple(rows), dataset_sha256
+
+
+def select_available_feature_families(
+    train_rows: Sequence[FeatureRow],
+    candidate_families: Sequence[FeatureFamily],
+    *,
+    max_missing_rate: float = 0.50,
+) -> tuple[tuple[str, ...], tuple[FeatureFamily, ...]]:
+    """Auto-exclude feature families whose missing rate exceeds `max_missing_rate` in train."""
+    if not train_rows:
+        return (), tuple(candidate_families)
+    kept_features: list[str] = []
+    dropped_families: list[FeatureFamily] = []
+    n = len(train_rows)
+    for fam in candidate_families:
+        names = FEATURE_FAMILIES[fam]
+        value_cols = [name for name in names if not name.endswith("_missing")]
+        if not value_cols:
+            kept_features.extend(names)
+            continue
+        missing_cells = sum(
+            1 for r in train_rows for col in value_cols if r.features.get(col) is None
+        )
+        missing_rate = missing_cells / float(n * len(value_cols))
+        if missing_rate > max_missing_rate:
+            dropped_families.append(fam)
+        else:
+            kept_features.extend(names)
+    return tuple(kept_features), tuple(dropped_families)
 
 
 def extract_latest_production_features(

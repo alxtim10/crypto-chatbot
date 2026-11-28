@@ -7,12 +7,28 @@ from enum import StrEnum
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from crypto_chatbot.market_data.symbols import resolve_default_perp_symbol
-from crypto_chatbot.schemas.market import Timeframe
+from crypto_chatbot.schemas.market import (
+    PRIMARY_TIMEFRAMES,
+    TRADING_STYLE_ALIASES,
+    Timeframe,
+)
 
 
 def _normalize_timeframe(value: object) -> object:
     if isinstance(value, str):
-        return value.strip().lower()
+        cleaned = value.strip().lower()
+        alias_tf = TRADING_STYLE_ALIASES.get(cleaned)
+        if alias_tf is not None:
+            return alias_tf.value
+        return cleaned
+    return value
+
+
+def _require_primary_tf(value: Timeframe) -> Timeframe:
+    if value not in PRIMARY_TIMEFRAMES:
+        ordered = sorted(PRIMARY_TIMEFRAMES, key=lambda t: t.duration)
+        supported = ", ".join(tf.value for tf in ordered)
+        raise ValueError(f"timeframe must be a primary analysis timeframe ({supported})")
     return value
 
 
@@ -34,6 +50,11 @@ class AnalyzeCommandArgs(BaseModel):
     @classmethod
     def _validate_timeframe(cls, value: object) -> object:
         return _normalize_timeframe(value)
+
+    @field_validator("timeframe", mode="after")
+    @classmethod
+    def _require_primary_timeframe(cls, value: Timeframe) -> Timeframe:
+        return _require_primary_tf(value)
 
 
 class CompareCommandArgs(BaseModel):
@@ -60,6 +81,11 @@ class CompareCommandArgs(BaseModel):
     @classmethod
     def _validate_timeframe(cls, value: object) -> object:
         return _normalize_timeframe(value)
+
+    @field_validator("timeframe", mode="after")
+    @classmethod
+    def _require_primary_timeframe(cls, value: Timeframe) -> Timeframe:
+        return _require_primary_tf(value)
 
 
 class WatchlistAction(StrEnum):
@@ -97,3 +123,49 @@ class WatchlistCommandArgs(BaseModel):
         if self.action in (WatchlistAction.ADD, WatchlistAction.REMOVE) and self.symbol is None:
             raise ValueError(f"{self.action.value} action requires a symbol")
         return self
+
+
+class WhaleAction(StrEnum):
+    OVERVIEW = "overview"
+    WALLET = "wallet"
+    ADD = "add"
+    REMOVE = "remove"
+    LIST = "list"
+
+
+class WhaleCommandArgs(BaseModel):
+    """Arguments for the /whale command and whale tracker CLI."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    action: WhaleAction = WhaleAction.OVERVIEW
+    symbol: str | None = None
+    address: str | None = None
+    label: str | None = None
+
+    @field_validator("action", mode="before")
+    @classmethod
+    def _normalize_action(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.strip().lower()
+        return value
+
+    @field_validator("symbol", mode="before")
+    @classmethod
+    def _normalize_symbol(cls, value: object) -> str | None:
+        if value is None or not isinstance(value, str) or not value.strip():
+            return None
+        # Clean ticker e.g. "BTC/USDT:USDT" -> "BTC", "BTC" -> "BTC"
+        raw = value.strip().upper()
+        if "/" in raw:
+            raw = raw.split("/")[0]
+        elif raw.endswith("USDT") and len(raw) > 4:
+            raw = raw[:-4]
+        return raw
+
+    @field_validator("address", mode="before")
+    @classmethod
+    def _normalize_address(cls, value: object) -> str | None:
+        if value is None or not isinstance(value, str) or not value.strip():
+            return None
+        return value.strip()

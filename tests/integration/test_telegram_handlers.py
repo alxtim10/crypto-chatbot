@@ -301,7 +301,10 @@ async def test_old_numbers_from_memory_cannot_pass_output_guard() -> None:
             "fact_ids": ["F1", "F6"],
         }
     )
-    bot, repo, _ = _build_bot_stack(allowed_ids=(111,), gemini_texts=[poisoned_reply])
+    bot, repo, _ = _build_bot_stack(
+        allowed_ids=(111,),
+        gemini_texts=[poisoned_reply, poisoned_reply],
+    )
 
     chunks = await bot.handle_analyze(111, ["BTC", "4h"])
     full = "\n".join(chunks)
@@ -312,13 +315,15 @@ async def test_old_numbers_from_memory_cannot_pass_output_guard() -> None:
 
 
 @pytest.mark.asyncio
-async def test_ptb_command_and_followup_handlers_end_to_end() -> None:
+async def test_ptb_command_and_followup_handlers_end_to_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     bot, _, _ = _build_bot_stack(allowed_ids=(111,))
     app = ApplicationBuilder().token("123456:ABCdefGHIjklMNOpqrsTUVwxyz0123456789").build()
     register_handlers(app, bot)
 
     handlers = app.handlers[0]
-    assert len(handlers) == 9
+    assert len(handlers) == 15
 
     replies: list[tuple[str, Any]] = []
 
@@ -347,7 +352,7 @@ async def test_ptb_command_and_followup_handlers_end_to_end() -> None:
         assert all(len(chunk) <= TELEGRAM_MAX_MESSAGE_LENGTH for chunk, _ in replies)
         return [chunk for chunk, _ in replies]
 
-    # 0=start..6=forget, 7=unknown, 8=text
+    # 0=start..4=pine, 5=scan, 6=screen, 7=whale, 8=watchlist..11=unknown, 12=text
     start_out = "\n".join(await invoke(0, "/start"))
     assert "Selamat datang" in start_out
 
@@ -355,7 +360,17 @@ async def test_ptb_command_and_followup_handlers_end_to_end() -> None:
     assert "BTC/USDT:USDT (4h)" in analyze_out
     assert "65.577,38 USDT" in analyze_out
 
-    followup_out = "\n".join(await invoke(8, "bandingkan momentumnya dengan ETH"))
+    pine_out = "\n".join(await invoke(4, "/pine BTC 4h", ["BTC", "4h"]))
+    assert "TradingView Pine Script v6" in pine_out
+    assert "//@version=6" in pine_out
+
+    scan_out = "\n".join(await invoke(5, "/scan BTC", ["BTC"]))
+    assert "Pemindai Setup Futures" in scan_out
+
+    whale_out = "\n".join(await invoke(7, "/whale BTC", ["BTC"]))
+    assert "WHALE PERP TRACKER" in whale_out
+
+    followup_out = "\n".join(await invoke(14, "bandingkan momentumnya dengan ETH"))
     assert "Perbandingan Deskriptif (BTC/USDT:USDT, ETH/USDT:USDT - 4h)" in followup_out
     assert "BTC/USDT:USDT (4h)" in followup_out
     assert "ETH/USDT:USDT (4h)" in followup_out
@@ -366,8 +381,29 @@ async def test_ptb_command_and_followup_handlers_end_to_end() -> None:
     bad_cmd_out = "\n".join(await invoke(2, "/analyze BTC 5m", ["BTC", "5m"]))
     assert "tidak didukung" in bad_cmd_out.lower()
 
-    unknown_out = "\n".join(await invoke(7, "/tidakada"))
+    track_out = "\n".join(await invoke(12, "/track"))
+    assert "Forward Evaluation Ledger" in track_out
+
+    unknown_out = "\n".join(await invoke(13, "/tidakada"))
     assert "tidak dikenali" in unknown_out.lower()
+
+    # /screen nan / inf rejected cleanly instead of NaN propagation
+    nan_out = "\n".join(await invoke(6, "/screen nan", ["nan"]))
+    assert "valid" in nan_out.lower()
+    inf_out = "\n".join(await invoke(6, "/screen inf", ["inf"]))
+    assert "valid" in inf_out.lower()
+
+    # Natural-language screen ValueError is caught cleanly instead of crashing text handler
+    import crypto_chatbot.bot.handlers as handlers_mod
+
+    async def _boom_screener(*args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        raise ValueError("Ticker screener sementara gagal & timeout")
+
+    monkeypatch.setattr(handlers_mod, "screen_momentum_movers", _boom_screener)
+    nl_screen_out = "\n".join(await invoke(14, "tolong screening top gainers"))
+    assert "gagal" in nl_screen_out.lower()
+    assert "&amp;" in nl_screen_out
 
 
 def test_secret_redacting_filter_strips_tokens_keys_and_db_passwords() -> None:

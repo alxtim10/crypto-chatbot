@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
 from crypto_chatbot import cli
 from crypto_chatbot.bot.access import AccessController
-from crypto_chatbot.ops.backup import to_libpq_url
+from crypto_chatbot.ops.backup import (
+    dump_postgres_database,
+    restore_postgres_database,
+    to_libpq_url,
+)
 from crypto_chatbot.ops.logging import SecretRedactingFilter
 from crypto_chatbot.ops.metrics import check_database_health
 
@@ -119,3 +124,38 @@ def test_cli_health_check_output(
     payload = json.loads(capsys.readouterr().out)
     assert payload["config_ok"] is True
     assert payload["db_healthy"] is True
+
+
+def test_backup_and_restore_pass_password_via_env_not_argv(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[list[str], dict[str, str] | None]] = []
+    dump_path = tmp_path / "out.dump"
+
+    def fake_run(cmd: list[str], **kwargs: object) -> MagicMock:
+        env = kwargs.get("env")
+        assert isinstance(env, dict) or env is None
+        calls.append((list(cmd), dict(env) if isinstance(env, dict) else None))
+        if "--file" in cmd:
+            dump_path.write_bytes(b"PGDMP")
+        res = MagicMock()
+        res.returncode = 0
+        res.stderr = ""
+        return res
+
+    monkeypatch.setattr("crypto_chatbot.ops.backup._require_tool", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr("crypto_chatbot.ops.backup.subprocess.run", fake_run)
+
+    secret_pw = "UltraSecretDbPw!987"
+    db_url = f"postgresql+psycopg://app_user:{secret_pw}@db.internal:5432/crypto_db?sslmode=require"
+
+    dump_postgres_database(db_url, dump_path)
+    restore_postgres_database(db_url, dump_path)
+
+    assert len(calls) == 2
+    for cmd, env in calls:
+        assert all(secret_pw not in arg for arg in cmd)
+        assert "--username" in cmd
+        assert env is not None
+        assert env["PGPASSWORD"] == secret_pw

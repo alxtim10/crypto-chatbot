@@ -294,14 +294,20 @@ class _PtbHarness:
                 "help": 1,
                 "analyze": 2,
                 "compare": 3,
-                "watchlist": 4,
-                "memory": 5,
-                "forget": 6,
+                "pine": 4,
+                "scan": 5,
+                "screen": 6,
+                "whale": 7,
+                "watchlist": 8,
+                "memory": 9,
+                "forget": 10,
+                "screener": 11,
+                "track": 12,
             }
-            idx = cmd_map.get(cmd, 7)
+            idx = cmd_map.get(cmd, 13)
             ctx: Any = SimpleNamespace(args=args)
         else:
-            idx = 8
+            idx = 14
             ctx = SimpleNamespace(args=[])
 
         await self._handlers[idx].callback(update, ctx)
@@ -349,6 +355,7 @@ def _build_stack(
         analysis_service=analysis_service,
         narrator=narrator,
         memory=memory,
+        clock=lambda: clock_now,
     )
     return _PtbHarness(bot_service), client, transport, repo
 

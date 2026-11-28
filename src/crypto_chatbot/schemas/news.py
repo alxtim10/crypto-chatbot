@@ -10,7 +10,10 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from crypto_chatbot.schemas.market import FiniteFloat, UtcDatetime
 
 SENTIMENT_MODEL_VERSION = "crypto-lexicon-v1.0.0"
+SENTIMENT_SCORER_ID = "crypto-lexicon"
 MIN_ENTITY_MATCH_CONFIDENCE = 0.65
+
+ScorerClass = Literal["lexicon_deterministic", "llm"]
 
 
 class SentimentLabel(StrEnum):
@@ -94,6 +97,11 @@ class SentimentObservation(BaseModel):
     is_probabilistic: Literal[False] = False
     published_time: UtcDatetime
     available_time: UtcDatetime
+    scored_at: UtcDatetime | None = None
+    scorer_id: str = Field(default=SENTIMENT_SCORER_ID, min_length=1)
+    scorer_version: str = Field(default=SENTIMENT_MODEL_VERSION, min_length=1)
+    scorer_class: ScorerClass = "lexicon_deterministic"
+    is_backfilled: bool = False
 
     @model_validator(mode="after")
     def _validate_observation(self) -> SentimentObservation:
@@ -101,6 +109,8 @@ class SentimentObservation(BaseModel):
             raise ValueError("canonical_url must start with http:// or https://")
         if self.available_time < self.published_time:
             raise ValueError("available_time cannot be earlier than published_time")
+        if self.is_backfilled and self.scorer_class == "llm":
+            raise ValueError("LLM-based sentiment scores cannot be backfilled (PRD v1.7 §6.2)")
         return self
 
 
@@ -160,5 +170,50 @@ class SentimentMetrics(BaseModel):
     mean_confidence: FiniteFloat = Field(ge=0.0, le=1.0)
     dominant_label: SentimentLabel
     latest_available_time: UtcDatetime | None = None
+    sentiment_backfilled: bool = False
     buckets: tuple[SentimentBucket, ...] = ()
     sources: tuple[NewsSourceLink, ...] = ()
+
+
+class FearGreedObservation(BaseModel):
+    """Daily Alternative.me Crypto Fear & Greed Index observation (S-02)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    source: str = Field(default="alternative.me", min_length=1)
+    observed_time: UtcDatetime
+    received_time: UtcDatetime
+    available_time: UtcDatetime
+    value: int = Field(ge=0, le=100)
+    classification: str = Field(min_length=1)
+    normalized_score: FiniteFloat = Field(ge=-1.0, le=1.0)
+    is_backfilled: bool = False
+    raw_payload: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _validate_times(self) -> FearGreedObservation:
+        if self.available_time < self.observed_time:
+            raise ValueError("available_time cannot precede observed_time")
+        return self
+
+
+class NewsVoteSnapshot(BaseModel):
+    """Append-only point-in-time vote/engagement snapshot for a tracked news article (S-03)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    snapshot_id: str = Field(min_length=12, max_length=64)
+    article_id: str = Field(min_length=16, max_length=64)
+    source_provider: str = Field(min_length=1)
+    snapshot_time: UtcDatetime
+    positive_votes: int = Field(default=0, ge=0)
+    negative_votes: int = Field(default=0, ge=0)
+    important_votes: int = Field(default=0, ge=0)
+    liked_votes: int = Field(default=0, ge=0)
+    disliked_votes: int = Field(default=0, ge=0)
+    lol_votes: int = Field(default=0, ge=0)
+    toxic_votes: int = Field(default=0, ge=0)
+    saved_votes: int = Field(default=0, ge=0)
+    comments_count: int = Field(default=0, ge=0)
+    attribution_text: str = Field(min_length=1)
+    raw_payload: dict[str, Any] = Field(default_factory=dict)

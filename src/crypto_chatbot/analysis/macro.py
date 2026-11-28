@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import math
+from bisect import bisect_right
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import Literal
 
 import numpy as np
@@ -29,7 +30,65 @@ from crypto_chatbot.schemas.macro import (
     MacroBenchmarkContext,
     PositioningRegime,
 )
-from crypto_chatbot.schemas.market import MarketCandle
+from crypto_chatbot.schemas.market import MarketCandle, Timeframe
+
+
+def correlation_critical_value(n: int, *, alpha: float = 0.05) -> float:
+    """Two-sided 5% Pearson correlation critical value `r_crit(n, 0.05)` (PRD v1.7 §4.3).
+
+    Uses exact `r_crit = t_{1-alpha/2, df} / sqrt(df + t^2)` where `df = n - 2`.
+    Gives ~0.4438 at n=20 and ~0.2542 at n=60.
+    """
+    if n <= 2:
+        return 1.0
+    df = float(n - 2)
+    # Two-sided 95% (z = 1.95996398454) Cornish-Fisher expansion for Student-t quantile
+    z = 1.959963984540054 if alpha <= 0.05 else 1.6448536269514722
+    g1 = (z**3 + z) / (4.0 * df)
+    g2 = (5.0 * z**5 + 16.0 * z**3 + 3.0 * z) / (96.0 * df**2)
+    g3 = (3.0 * z**7 + 19.0 * z**5 + 17.0 * z**3 - 15.0 * z) / (384.0 * df**3)
+    t_crit = z + g1 + g2 + g3
+    return float(t_crit / math.sqrt(df + t_crit * t_crit))
+
+
+def asof_join_macro_candles(
+    target_candles: Sequence[MarketCandle],
+    macro_candles: Sequence[MarketCandle],
+    *,
+    max_staleness: timedelta | None = None,
+) -> tuple[list[tuple[MarketCandle, MarketCandle]], int]:
+    """Backward point-in-time as-of join between crypto candles and macro candles (PRD §3.3).
+
+    For each crypto candle `t`, picks the latest macro candle with `available_time <= close_time_t`
+    within `max_staleness` (default: 72h for 1d covering weekends, else `2 * timeframe.duration`).
+    Returns `(joined_pairs, stale_excluded_count)`.
+    """
+    if not target_candles or not macro_candles:
+        return [], 0
+    sorted_target = sorted(target_candles, key=lambda c: c.close_time)
+    sorted_macro = sorted(macro_candles, key=lambda c: c.available_time)
+    macro_times = [c.available_time.astimezone(UTC) for c in sorted_macro]
+
+    tf = sorted_target[0].timeframe
+    staleness_limit = max_staleness or (
+        timedelta(hours=72) if tf is Timeframe.D1 else tf.duration * 2
+    )
+
+    joined: list[tuple[MarketCandle, MarketCandle]] = []
+    stale_count = 0
+    for tc in sorted_target:
+        tc_time = tc.close_time.astimezone(UTC)
+        pos = bisect_right(macro_times, tc_time) - 1
+        if pos < 0:
+            stale_count += 1
+            continue
+        mc = sorted_macro[pos]
+        age = tc_time - macro_times[pos]
+        if age > staleness_limit:
+            stale_count += 1
+            continue
+        joined.append((tc, mc))
+    return joined, stale_count
 
 
 def classify_positioning_regime(
@@ -147,6 +206,7 @@ def build_macro_benchmark_context(
     btc_candles: Sequence[MarketCandle] | None = None,
     derivatives: DerivativesMetrics | None = None,
     order_flow: OrderFlowMetrics | None = None,
+    dxy_corr_window: int = 20,
 ) -> MacroBenchmarkContext:
     """Build complete, causal MacroBenchmarkContext respecting point-in-time constraints."""
     # Filter target candles strictly up to as_of
@@ -214,25 +274,32 @@ def build_macro_benchmark_context(
                 elif dxy_ema_20 < dxy_ema_50:
                     trend = "bearish"
 
-            # Align target returns and DXY returns by latest close_time sequence
+            # Backward as-of join (handles FX weekend gaps, PRD v1.7 §3.3)
             corr_dxy: float | None = None
-            min_len = min(len(valid_targets), len(valid_dxy))
-            if min_len >= 4:
-                t_slice = [c.close for c in valid_targets[-min_len:]]
-                d_slice = [c.close for c in valid_dxy[-min_len:]]
-                t_rets = [t_slice[i] / t_slice[i - 1] - 1.0 for i in range(1, len(t_slice))]
-                d_rets = [d_slice[i] / d_slice[i - 1] - 1.0 for i in range(1, len(d_slice))]
-                corr_dxy = compute_rolling_correlation(t_rets, d_rets, window=20)
+            n_corr_obs = 0
+            joined_dxy, _stale_dxy = asof_join_macro_candles(valid_targets, valid_dxy)
+            aligned_t_dxy = [tc.close for tc, _mc in joined_dxy]
+            aligned_d = [mc.close for _tc, mc in joined_dxy]
+            if len(aligned_t_dxy) >= 4:
+                t_rets = [
+                    aligned_t_dxy[i] / aligned_t_dxy[i - 1] - 1.0
+                    for i in range(1, len(aligned_t_dxy))
+                ]
+                d_rets = [aligned_d[i] / aligned_d[i - 1] - 1.0 for i in range(1, len(aligned_d))]
+                n_corr_obs = min(len(t_rets), dxy_corr_window)
+                corr_dxy = compute_rolling_correlation(t_rets, d_rets, window=dxy_corr_window)
 
+            r_crit = correlation_critical_value(n_corr_obs) if n_corr_obs > 2 else 1.0
             macro_impact: Literal["headwind", "tailwind", "neutral"] = "neutral"
-            if trend == "bullish" and corr_dxy is not None and corr_dxy < -0.2:
-                macro_impact = "headwind"
-            elif (trend == "bearish" and corr_dxy is not None and corr_dxy < -0.2) or (
-                trend == "bullish" and corr_dxy is not None and corr_dxy > 0.2
-            ):
-                macro_impact = "tailwind"
-            elif trend == "bearish" and corr_dxy is not None and corr_dxy > 0.2:
-                macro_impact = "headwind"
+            if corr_dxy is not None and abs(corr_dxy) >= r_crit:
+                if trend == "bullish" and corr_dxy < 0.0:
+                    macro_impact = "headwind"
+                elif (trend == "bearish" and corr_dxy < 0.0) or (
+                    trend == "bullish" and corr_dxy > 0.0
+                ):
+                    macro_impact = "tailwind"
+                elif trend == "bearish" and corr_dxy > 0.0:
+                    macro_impact = "headwind"
 
             is_closed = is_dxy_market_closed(as_of)
 

@@ -64,6 +64,7 @@ class MarketCandleRow(Base):
     high: Mapped[float] = mapped_column(Double, nullable=False)
     low: Mapped[float] = mapped_column(Double, nullable=False)
     close: Mapped[float] = mapped_column(Double, nullable=False)
+    raw_contracts: Mapped[float | None] = mapped_column(Double, nullable=True)
     base_volume: Mapped[float] = mapped_column(Double, nullable=False)
     quote_volume: Mapped[float | None] = mapped_column(Double, nullable=True)
     taker_buy_base_volume: Mapped[float | None] = mapped_column(Double, nullable=True)
@@ -193,7 +194,7 @@ class LlmInteractionRow(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     telegram_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
     request_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
-    snapshot_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    snapshot_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     model_id: Mapped[str] = mapped_column(String(128), nullable=False)
     prompt_version: Mapped[str] = mapped_column(String(32), nullable=False)
     validation_passed: Mapped[bool] = mapped_column(Boolean, nullable=False)
@@ -201,6 +202,12 @@ class LlmInteractionRow(Base):
     prompt_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     latency_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    layer: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    detected_symbol: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    intent: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    confidence: Mapped[float | None] = mapped_column(Double, nullable=True)
+    fallback_reason: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    guard_violations: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -400,6 +407,7 @@ class TradeSetupRow(Base):
     snapshot_id: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
     venue: Mapped[str] = mapped_column(String(64), nullable=False)
     canonical_symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    market_type: Mapped[str] = mapped_column(String(16), nullable=False, default="spot")
     timeframe: Mapped[str] = mapped_column(String(16), nullable=False)
     as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(
@@ -425,6 +433,10 @@ class TradeSetupRow(Base):
     outcome_status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
     settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     realized_r: Mapped[float | None] = mapped_column(Double, nullable=True)
+    params_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    forward_only_guards_fired: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list
+    )
 
 
 class TradingViewPacketRow(Base):
@@ -533,6 +545,15 @@ class SentimentObservationRow(Base):
     is_probabilistic: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     published_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     available_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    scored_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    scorer_id: Mapped[str] = mapped_column(String(64), nullable=False, default="crypto-lexicon")
+    scorer_version: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="crypto-lexicon-v1.0.0"
+    )
+    scorer_class: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="lexicon_deterministic"
+    )
+    is_backfilled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
 
 class MlExperimentRow(Base):
@@ -605,3 +626,183 @@ class ModelPredictionRow(Base):
     realized_return: Mapped[float | None] = mapped_column(Double, nullable=True)
     realized_label: Mapped[int | None] = mapped_column(Integer, nullable=True)
     settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class WhaleWatchlistRow(Base):
+    """Per-user whale wallet watchlist (`whale_watchlists`)."""
+
+    __tablename__ = "whale_watchlists"
+    __table_args__ = (
+        UniqueConstraint("telegram_user_id", "address", name="uq_whale_watchlist_user_addr"),
+        Index("ix_whale_watchlists_user", "telegram_user_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    telegram_user_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("users.telegram_user_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    address: Mapped[str] = mapped_column(String(128), nullable=False)
+    network: Mapped[str] = mapped_column(String(16), nullable=False)
+    label: Mapped[str] = mapped_column(String(128), nullable=False)
+    added_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+
+class TrialRow(Base):
+    """Registered historical backtest / ML experiment trial (`trials`, PRD v1.7 §8.2)."""
+
+    __tablename__ = "trials"
+    __table_args__ = (Index("ix_trials_family_freq", "family", "obs_frequency"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trial_id: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    family: Mapped[str] = mapped_column(String(64), nullable=False)
+    variant_params_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    params_sha256: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    data_window: Mapped[str] = mapped_column(String(128), nullable=False)
+    symbols: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
+    timeframe: Mapped[str] = mapped_column(String(16), nullable=False)
+    obs_frequency: Mapped[str] = mapped_column(String(32), nullable=False)
+    sr_per_obs: Mapped[float | None] = mapped_column(Double, nullable=True)
+    n_obs: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    git_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+
+class ScreenerUniverseSnapshotRow(Base):
+    """Daily point-in-time screener universe snapshot (`screener_universe_snapshots`, T-30)."""
+
+    __tablename__ = "screener_universe_snapshots"
+    __table_args__ = (
+        UniqueConstraint("snapshot_date_utc", "venue", name="uq_screener_snapshot_day_venue"),
+        Index("ix_screener_snapshot_lookup", "venue", "snapshot_date_utc"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    snapshot_date_utc: Mapped[str] = mapped_column(String(16), nullable=False)
+    venue: Mapped[str] = mapped_column(String(64), nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    min_volume_usd: Mapped[float] = mapped_column(Double, nullable=False)
+    total_pairs_seen: Mapped[int] = mapped_column(Integer, nullable=False)
+    liquid_pairs_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    top_gainers_json: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, nullable=False, default=list
+    )
+    top_losers_json: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, nullable=False, default=list
+    )
+
+
+class ContractStatsRow(Base):
+    """Append-only Gate.io perpetual contract_stats history (`contract_stats_observations`)."""
+
+    __tablename__ = "contract_stats_observations"
+    __table_args__ = (
+        UniqueConstraint(
+            "venue",
+            "canonical_symbol",
+            "interval",
+            "observed_time",
+            name="uq_contract_stats_identity",
+        ),
+        Index(
+            "ix_contract_stats_lookup",
+            "venue",
+            "canonical_symbol",
+            "interval",
+            "available_time",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    venue: Mapped[str] = mapped_column(String(64), nullable=False)
+    canonical_symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    provider_symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    interval: Mapped[str] = mapped_column(String(16), nullable=False)
+    observed_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    received_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    available_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    lsr_taker: Mapped[float | None] = mapped_column(Double, nullable=True)
+    lsr_account: Mapped[float | None] = mapped_column(Double, nullable=True)
+    top_lsr_account: Mapped[float | None] = mapped_column(Double, nullable=True)
+    top_lsr_size: Mapped[float | None] = mapped_column(Double, nullable=True)
+    long_liq_usd: Mapped[float | None] = mapped_column(Double, nullable=True)
+    short_liq_usd: Mapped[float | None] = mapped_column(Double, nullable=True)
+    open_interest: Mapped[float | None] = mapped_column(Double, nullable=True)
+    open_interest_usd: Mapped[float | None] = mapped_column(Double, nullable=True)
+    mark_price: Mapped[float | None] = mapped_column(Double, nullable=True)
+    last_funding_rate: Mapped[float | None] = mapped_column(Double, nullable=True)
+    long_users: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    short_users: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    quality_flags: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    raw_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+
+
+class GateIngestLedgerRow(Base):
+    """Idempotent checksum ledger for `download.gatedata.org` bulk archive files (D-04)."""
+
+    __tablename__ = "gate_ingest_ledger"
+    __table_args__ = (
+        UniqueConstraint("dataset", "contract", "yyyymm", name="uq_gate_ingest_file"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    dataset: Mapped[str] = mapped_column(String(64), nullable=False)
+    contract: Mapped[str] = mapped_column(String(64), nullable=False)
+    yyyymm: Mapped[str] = mapped_column(String(6), nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    local_path: Mapped[str] = mapped_column(Text, nullable=False)
+    row_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    inserted_rows: Mapped[int] = mapped_column(Integer, nullable=False)
+    ingested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class FearGreedRow(Base):
+    """Idempotent daily Crypto Fear & Greed Index observations (`fear_greed_observations`, S-02)."""
+
+    __tablename__ = "fear_greed_observations"
+    __table_args__ = (
+        UniqueConstraint("source", "observed_time", name="uq_fear_greed_source_time"),
+        Index("ix_fear_greed_available", "source", "available_time"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    source: Mapped[str] = mapped_column(String(64), nullable=False)
+    observed_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    received_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    available_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    value: Mapped[int] = mapped_column(Integer, nullable=False)
+    classification: Mapped[str] = mapped_column(String(64), nullable=False)
+    normalized_score: Mapped[float] = mapped_column(Double, nullable=False)
+    is_backfilled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    raw_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+
+
+class NewsVoteSnapshotRow(Base):
+    """Append-only point-in-time vote & engagement snapshots (`news_vote_snapshots`, S-03)."""
+
+    __tablename__ = "news_vote_snapshots"
+    __table_args__ = (
+        UniqueConstraint("snapshot_id", name="uq_news_vote_snapshot_id"),
+        Index("ix_news_vote_snapshots_lookup", "article_id", "snapshot_time"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    snapshot_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    article_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    snapshot_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    positive_votes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    negative_votes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    important_votes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    liked_votes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    disliked_votes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    lol_votes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    toxic_votes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    saved_votes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    comments_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    attribution_text: Mapped[str] = mapped_column(Text, nullable=False)
+    raw_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)

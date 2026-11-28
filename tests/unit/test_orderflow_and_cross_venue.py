@@ -266,7 +266,8 @@ def test_orderflow_feature_extraction_causal() -> None:
     )
     feature_row = extract_latest_production_features(candles, config=config)
     assert "taker_buy_ratio" in feature_row.features
-    assert "cvd_zscore_20" in feature_row.features
+    assert "cvd_ratio_20" in feature_row.features
+    assert "cvd_z_100" in feature_row.features
     assert pytest.approx(feature_row.features["taker_buy_ratio"], abs=1e-4) == 0.65
 
 

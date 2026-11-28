@@ -9,6 +9,7 @@ from typing import Any
 from telegram.ext import Application, ApplicationBuilder
 
 from crypto_chatbot.analysis.service import AnalysisService
+from crypto_chatbot.analysis.whale_tracker import WhaleWatchlistManager
 from crypto_chatbot.bot.access import AccessController
 from crypto_chatbot.bot.handlers import (
     BotService,
@@ -25,18 +26,31 @@ from crypto_chatbot.llm.gemini import (
     GoogleGenAiTransport,
 )
 from crypto_chatbot.market_data.bybit_derivatives import BybitDerivativesProvider
-from crypto_chatbot.market_data.ccxt_provider import CcxtMarketDataProvider
-from crypto_chatbot.market_data.derivatives_provider import CcxtDerivativesLiquidityProvider
+from crypto_chatbot.market_data.fallback_provider import (
+    FallbackMarketDataProvider,
+    build_futures_providers,
+)
+from crypto_chatbot.market_data.gate_contract_stats import (
+    ContractStatsRecorder,
+    ContractStatsScheduler,
+    GateContractStatsClient,
+)
+from crypto_chatbot.market_data.gate_risk_tiers import GateRiskTiersClient
+from crypto_chatbot.market_data.gate_ws_candles import GateWsCandlesRunner
 from crypto_chatbot.market_data.macro_provider import DxyMarketDataProvider
 from crypto_chatbot.memory.service import MemoryService
+from crypto_chatbot.schemas.market import Timeframe
 from crypto_chatbot.storage.database import create_db_engine, init_db
 from crypto_chatbot.storage.repositories import (
+    PostgresContractStatsRepository,
     PostgresDerivativesRepository,
+    PostgresFearGreedRepository,
     PostgresMarketRepository,
     PostgresNewsRepository,
     PostgresSetupLogRepository,
     PostgresTradingViewRepository,
     PostgresUserMemoryRepository,
+    PostgresWhaleWatchlistRepository,
 )
 
 
@@ -73,10 +87,26 @@ def build_telegram_application(
     tradingview_repo = PostgresTradingViewRepository(engine)
     news_repo = PostgresNewsRepository(engine)
     memory_repo = PostgresUserMemoryRepository(engine)
-    provider = CcxtMarketDataProvider(exchange_id=settings.futures_exchange)
-    derivatives_provider = CcxtDerivativesLiquidityProvider(exchange_id=settings.futures_exchange)
-    bybit_provider = BybitDerivativesProvider() if settings.futures_exchange == "binance" else None
+    contract_stats_repo = PostgresContractStatsRepository(engine)
+    fear_greed_repo = PostgresFearGreedRepository(engine)
+    provider, derivatives_provider = build_futures_providers(
+        settings.futures_exchange_chain,
+        cooldown_minutes=settings.venue_cooldown_min,
+        gate_direct_candles=settings.gate_direct_candles,
+    )
+    bybit_provider = (
+        BybitDerivativesProvider() if "binance" in settings.futures_exchange_chain else None
+    )
     dxy_provider = DxyMarketDataProvider()
+    risk_tiers_client = (
+        GateRiskTiersClient(
+            health_cache=(
+                provider.health_cache if isinstance(provider, FallbackMarketDataProvider) else None
+            )
+        )
+        if "gate" in settings.futures_exchange_chain
+        else None
+    )
     analysis_service = AnalysisService(
         provider=provider,
         repository=market_repo,
@@ -87,6 +117,11 @@ def build_telegram_application(
         tradingview_repository=tradingview_repo,
         news_repository=news_repo,
         dxy_provider=dxy_provider,
+        contract_stats_repository=contract_stats_repo,
+        fear_greed_repository=fear_greed_repo,
+        risk_tiers_client=risk_tiers_client,
+        resample_from=Timeframe(settings.resample_from) if settings.resample_from else None,
+        cache_ttl_seconds=45.0,
     )
 
     transport = GoogleGenAiTransport(
@@ -109,17 +144,59 @@ def build_telegram_application(
         settings.allowed_telegram_user_ids,
         rate_limit_per_minute=settings.rate_limit_per_minute,
     )
+    whale_watchlist = WhaleWatchlistManager(
+        store=PostgresWhaleWatchlistRepository(engine),
+    )
     bot_service = BotService(
         access=access_controller,
         analysis_service=analysis_service,
         narrator=narrator,
         memory=memory_service,
+        whale_watchlist=whale_watchlist,
     )
+
+    contract_stats_scheduler: ContractStatsScheduler | None = None
+    contract_stats_client: GateContractStatsClient | None = None
+    if settings.gate_contract_stats_enabled:
+        contract_stats_client = GateContractStatsClient()
+        contract_stats_recorder = ContractStatsRecorder(
+            client=contract_stats_client,
+            repository=contract_stats_repo,
+        )
+        contract_stats_scheduler = ContractStatsScheduler(
+            contract_stats_recorder,
+            interval_seconds=settings.gate_contract_stats_interval_seconds,
+            backfill_days=settings.gate_contract_stats_backfill_days,
+        )
+
+    ws_candles_runner: GateWsCandlesRunner | None = None
+    if settings.gate_ws_enabled and "gate" in settings.futures_exchange_chain:
+        ws_candles_runner = GateWsCandlesRunner(
+            symbols=settings.gate_ws_symbols,
+            timeframes=settings.gate_ws_timeframes,
+            repository=market_repo,
+        )
+
+    async def on_startup(app: Application[Any, Any, Any, Any, Any, Any]) -> None:
+        del app
+        if contract_stats_scheduler is not None:
+            contract_stats_scheduler.start()
+        if ws_candles_runner is not None:
+            ws_candles_runner.start()
 
     async def on_shutdown(app: Application[Any, Any, Any, Any, Any, Any]) -> None:
         del app
+        if ws_candles_runner is not None:
+            await ws_candles_runner.stop()
+        if contract_stats_scheduler is not None:
+            await contract_stats_scheduler.stop()
+        if contract_stats_client is not None:
+            await contract_stats_client.close()
+        if risk_tiers_client is not None:
+            await risk_tiers_client.close()
         await provider.close()
         await derivatives_provider.close()
+        await dxy_provider.close()
         if bybit_provider is not None:
             await bybit_provider.close()
         engine.dispose()
@@ -127,6 +204,7 @@ def build_telegram_application(
     application = (
         ApplicationBuilder()
         .token(settings.telegram_bot_token.get_secret_value())
+        .post_init(on_startup)
         .post_shutdown(on_shutdown)
         .build()
     )

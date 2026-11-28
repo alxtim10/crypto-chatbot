@@ -2,13 +2,32 @@
 
 from __future__ import annotations
 
+import logging
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 
 from pydantic import BaseModel, ConfigDict
 
-from crypto_chatbot.schemas.analysis import AnalysisSnapshot
+from crypto_chatbot.schemas.analysis import AnalysisSnapshot, FactStatus, SetupBias, SetupStatus
 from crypto_chatbot.schemas.llm import LlmAnalysisNarration
+
+logger = logging.getLogger(__name__)
+
+_BULLISH_BIAS_RE = re.compile(r"\b(?:bullish|long)\b", re.IGNORECASE)
+_BEARISH_BIAS_RE = re.compile(r"\b(?:bearish|short)\b", re.IGNORECASE)
+
+
+def check_directional_consistency(
+    text: str,
+    bias: SetupBias | None,
+) -> tuple[str, ...]:
+    """Check whether directional bias words in `text` contradict `bias` (PRD v1.7 §2.3, T-31)."""
+    if bias is SetupBias.SHORT and _BULLISH_BIAS_RE.search(text):
+        return ("directional_inconsistency:contradicts_short",)
+    if bias is SetupBias.LONG and _BEARISH_BIAS_RE.search(text):
+        return ("directional_inconsistency:contradicts_long",)
+    return ()
+
 
 _BRACED_TOKEN_RE = re.compile(r"\{([^}]*)\}")
 _VALID_FACT_BODY_RE = re.compile(r"^F[1-9][0-9]*$")
@@ -25,7 +44,14 @@ OVERCONFIDENCE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "pasti",
         re.compile(
-            r"(?<!\btidak\s)(?<!\bbelum\s)(?<!\btak\s)(?<!\bbukan\s)\bpasti\b",
+            r"\bpasti\s+(?:naik|turun|untung|cuan|profit|terbang|tembus|menang|aman|balik\s+modal|hit\s+tp\d?)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "100% claim",
+        re.compile(
+            r"\b100%\s*(?:profit|cuan|untung|aman|akurat|menang|win|berhasil|pasti)\b",
             re.IGNORECASE,
         ),
     ),
@@ -34,6 +60,7 @@ OVERCONFIDENCE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("garansi", re.compile(r"\bgaransi\b", re.IGNORECASE)),
     ("tanpa risiko", re.compile(r"\btanpa\s+risiko\b", re.IGNORECASE)),
     ("bebas risiko", re.compile(r"\bbebas\s+risiko\b", re.IGNORECASE)),
+    ("tidak ada risiko", re.compile(r"\btidak\s+ada\s+risiko\b", re.IGNORECASE)),
     ("wajib beli", re.compile(r"\bwajib\s+beli\b", re.IGNORECASE)),
     ("wajib jual", re.compile(r"\bwajib\s+jual\b", re.IGNORECASE)),
     ("beli sekarang", re.compile(r"\bbeli\s+sekarang\b", re.IGNORECASE)),
@@ -48,6 +75,39 @@ OVERCONFIDENCE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("sure win", re.compile(r"\bsure\s+win\b", re.IGNORECASE)),
     ("to the moon", re.compile(r"\bto\s+the\s+moon\b", re.IGNORECASE)),
 )
+
+_CLAUSE_SPLIT_RE = re.compile(r"[.!?;:,\n]+")
+_CLAIM_NEGATOR_RE = re.compile(
+    r"\b(?:tidak|tak|belum|bukan|bukanlah|jangan|hindari|dilarang|tanpa|berharap|never|not|no|avoid)\b",
+    re.IGNORECASE,
+)
+_RISK_NEGATOR_RE = re.compile(
+    r"\b(?:tidak|tak|bukan|bukanlah|belum|tidaklah|not|never)\b",
+    re.IGNORECASE,
+)
+_RISK_TERMS = frozenset({"tanpa risiko", "bebas risiko", "risk-free"})
+
+
+def _find_overconfidence_hits(text: str) -> list[str]:
+    """Detect positive overconfidence/guarantee claims while allowing negated disclaimers."""
+    hits: list[str] = []
+    for clause in _CLAUSE_SPLIT_RE.split(text):
+        clause_norm = " ".join(clause.split())
+        if not clause_norm:
+            continue
+        for term, pattern in OVERCONFIDENCE_PATTERNS:
+            match = pattern.search(clause_norm)
+            if match is None:
+                continue
+            if term == "tidak ada risiko":
+                hits.append("overconfidence_lexicon:tanpa risiko")
+                continue
+            prefix = clause_norm[: match.start()]
+            negator = _RISK_NEGATOR_RE if term in _RISK_TERMS else _CLAIM_NEGATOR_RE
+            if negator.search(prefix) is not None:
+                continue
+            hits.append(f"overconfidence_lexicon:{term}")
+    return hits
 
 
 class GuardResult(BaseModel):
@@ -145,9 +205,15 @@ def _build_allowlist_patterns(
     return tuple(patterns)
 
 
-def _strip_valid_placeholders(text: str, known_fact_ids: set[str]) -> tuple[str, bool]:
-    """Validate brace syntax and replace known `{F<n>}` placeholders with spaces."""
+def _strip_valid_placeholders(
+    text: str,
+    known_fact_ids: set[str],
+    none_fact_ids: set[str] | None = None,
+) -> tuple[str, bool, list[str]]:
+    """Validate brace syntax and replace known non-NONE `{F<n>}` placeholders with spaces."""
     bad = False
+    none_refs: list[str] = []
+    blocked = none_fact_ids or set()
 
     def _replace(match: re.Match[str]) -> str:
         nonlocal bad
@@ -155,12 +221,31 @@ def _strip_valid_placeholders(text: str, known_fact_ids: set[str]) -> tuple[str,
         if not _VALID_FACT_BODY_RE.match(token) or token not in known_fact_ids:
             bad = True
             return match.group(0)
+        if token in blocked:
+            none_refs.append(token)
+            return match.group(0)
         return " "
 
     stripped = _BRACED_TOKEN_RE.sub(_replace, text)
     if "{" in stripped or "}" in stripped:
         bad = True
-    return stripped, bad
+    return stripped, bad, none_refs
+
+
+def log_guard_violations(
+    reasons: Sequence[str],
+    *,
+    model_version: str,
+    attempt: int = 1,
+) -> None:
+    """Log every guard violation with `violation_type` and `model_version` (PRD v1.7 §2.3)."""
+    for reason in reasons:
+        logger.warning(
+            "llm_guard_violation violation_type=%s model_version=%s attempt=%d",
+            reason,
+            model_version,
+            attempt,
+        )
 
 
 def validate_narration(
@@ -170,10 +255,13 @@ def validate_narration(
     """Validate structured LLM narration strictly against backend `AnalysisSnapshot` facts."""
     reasons: list[str] = []
     known_fact_ids = {fact.fact_id for fact in snapshot.facts}
+    none_fact_ids = {fact.fact_id for fact in snapshot.facts if fact.status is FactStatus.NONE}
 
     for fid in narration.fact_ids:
         if fid not in known_fact_ids:
             reasons.append(f"unknown_fact_id:{fid}")
+        elif fid in none_fact_ids:
+            reasons.append(f"fact_status_none:{fid}")
 
     base_ticker = snapshot.canonical_symbol.split("/")[0]
     allowed_symbols: list[str] = [snapshot.canonical_symbol, snapshot.provider_symbol, base_ticker]
@@ -204,7 +292,11 @@ def validate_narration(
     ]
 
     for text in text_fields:
-        scrubbed, bad_braces = _strip_valid_placeholders(text, known_fact_ids)
+        scrubbed, bad_braces, none_refs = _strip_valid_placeholders(
+            text, known_fact_ids, none_fact_ids
+        )
+        for fid in none_refs:
+            reasons.append(f"fact_status_none:{fid}")
         if bad_braces:
             reasons.append("malformed_or_unknown_placeholder")
 
@@ -214,9 +306,7 @@ def validate_narration(
             reasons.append("raw_digit_detected")
 
         normalized = " ".join(text.split())
-        for term, pattern in OVERCONFIDENCE_PATTERNS:
-            if pattern.search(normalized):
-                reasons.append(f"overconfidence_lexicon:{term}")
+        reasons.extend(_find_overconfidence_hits(normalized))
 
         if _URL_RE.search(text):
             reasons.append("url_not_allowed")
@@ -227,6 +317,58 @@ def validate_narration(
         for pair in _PAIR_MENTION_RE.findall(text.upper()):
             if pair not in allowed_pairs:
                 reasons.append("unsupported_symbol_mentioned")
+
+    if (
+        snapshot.trade_setup is not None
+        and snapshot.trade_setup.status is SetupStatus.READY
+        and snapshot.trade_setup.bias in (SetupBias.LONG, SetupBias.SHORT)
+    ):
+        reasons.extend(check_directional_consistency(narration.summary, snapshot.trade_setup.bias))
+
+    unique_reasons = tuple(dict.fromkeys(reasons))
+    return GuardResult(is_valid=not unique_reasons, reasons=unique_reasons)
+
+
+_QA_UNSAFE_ADVICE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "direct_execution_instruction",
+        re.compile(
+            r"\b(?:eksekusi\s+order|open\s+(?:long|short)\s+sekarang|"
+            r"masuk\s+(?:long|short)\s+sekarang|taruh\s+\d+%\s+modal|"
+            r"alokasikan\s+\d+%)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "fabricated_live_price",
+        re.compile(
+            r"\bharga\s+(?:saat\s+ini|sekarang|live|terkini)\s+"
+            r"(?:adalah|berada\s+di|sekitar)\s+\$?\d",
+            re.IGNORECASE,
+        ),
+    ),
+)
+
+
+def validate_conversational_answer(text: str) -> GuardResult:
+    """Validate free-form conversational QA answers against safety and compliance rules."""
+    cleaned = text.strip()
+    if not cleaned:
+        return GuardResult(is_valid=False, reasons=("empty_response",))
+
+    reasons: list[str] = []
+    normalized = " ".join(cleaned.split())
+    reasons.extend(_find_overconfidence_hits(normalized))
+
+    for label, pattern in _QA_UNSAFE_ADVICE_PATTERNS:
+        if pattern.search(normalized):
+            reasons.append(label)
+
+    if _URL_RE.search(cleaned):
+        reasons.append("url_not_allowed")
+
+    if any(secret_re.search(cleaned) for secret_re in _SECRET_PATTERNS):
+        reasons.append("secret_pattern_detected")
 
     unique_reasons = tuple(dict.fromkeys(reasons))
     return GuardResult(is_valid=not unique_reasons, reasons=unique_reasons)

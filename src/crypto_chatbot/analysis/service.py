@@ -6,8 +6,10 @@ import asyncio
 import hashlib
 import itertools
 import json
+import time
+from collections import OrderedDict
 from collections.abc import Mapping, Sequence
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from crypto_chatbot.analysis.cross_venue import compute_cross_venue_derivatives
@@ -25,6 +27,7 @@ from crypto_chatbot.analysis.indicators import (
 )
 from crypto_chatbot.analysis.macro import build_macro_benchmark_context
 from crypto_chatbot.analysis.orderflow import compute_closed_candle_orderflow
+from crypto_chatbot.analysis.positioning import compute_positioning_panel
 from crypto_chatbot.analysis.regimes import classify_regime, classify_volatility_regime
 from crypto_chatbot.analysis.setup import SETUP_PARAMETERS, build_trade_setup
 from crypto_chatbot.analysis.smc import analyze_smc
@@ -38,15 +41,24 @@ from crypto_chatbot.market_data.base import (
     DEFAULT_CANDLE_LIMIT,
     MIN_FULL_HISTORY_CANDLES,
     DerivativesLiquidityProvider,
+    FuturesTickerBatch,
+    FuturesTickerProvider,
+    HistoryMarketDataProvider,
     MarketDataProvider,
     OhlcvBatch,
 )
 from crypto_chatbot.market_data.bybit_derivatives import BybitDerivativesProvider
+from crypto_chatbot.market_data.fallback_provider import (
+    FallbackDerivativesLiquidityProvider,
+    FallbackMarketDataProvider,
+)
+from crypto_chatbot.market_data.gate_risk_tiers import GateRiskTiersClient
 from crypto_chatbot.market_data.macro_provider import DxyMarketDataProvider
 from crypto_chatbot.market_data.quality import (
     determine_quality_status,
     is_candle_stale,
 )
+from crypto_chatbot.market_data.resampling import resample_candles
 from crypto_chatbot.market_data.symbols import resolve_default_perp_symbol
 from crypto_chatbot.market_data.tradingview import compare_packet_with_exchange_candles
 from crypto_chatbot.ml.shadow import ShadowInferenceEngine
@@ -56,6 +68,7 @@ from crypto_chatbot.schemas.analysis import (
     DerivativesMetrics,
     Fact,
     InputRange,
+    PositioningPanel,
     Regime,
     SetupStatus,
     SmcSummary,
@@ -72,6 +85,7 @@ from crypto_chatbot.schemas.derivatives import (
 )
 from crypto_chatbot.schemas.macro import MacroBenchmarkContext
 from crypto_chatbot.schemas.market import (
+    MULTI_STYLE_SCAN_TIMEFRAMES,
     MarketCandle,
     MarketType,
     ProviderMetadata,
@@ -79,10 +93,12 @@ from crypto_chatbot.schemas.market import (
     QualityStatus,
     Timeframe,
 )
-from crypto_chatbot.schemas.news import SentimentMetrics, SentimentObservation
+from crypto_chatbot.schemas.news import FearGreedObservation, SentimentMetrics, SentimentObservation
 from crypto_chatbot.schemas.tradingview import TradingViewMetrics, TradingViewPacket
 from crypto_chatbot.storage.repositories import (
+    ContractStatsRepository,
     DerivativesRepository,
+    FearGreedRepository,
     MarketRepository,
     ModelPredictionRepository,
     NewsRepository,
@@ -1028,7 +1044,7 @@ def _build_mtf_overview(
         Regime.TRANSITIONAL: "Transisi",
     }
     overviews: list[TimeframeOverview] = []
-    for tf in (Timeframe.D1, Timeframe.H4, Timeframe.H1, Timeframe.M15):
+    for tf in (Timeframe.D1, Timeframe.H4, Timeframe.H1, Timeframe.M15, Timeframe.M5):
         seq = by_tf.get(tf)
         if not seq:
             continue
@@ -1124,7 +1140,8 @@ def _build_limitations(
             "tidak disajikan sebagai kondisi terkini."
         )
     notes.append(
-        f"Sumber data terbatas pada spot {batch.metadata.venue} untuk {batch.canonical_symbol}."
+        f"Sumber data terbatas pada {batch.metadata.market_type.value} {batch.metadata.venue} "
+        f"untuk {batch.canonical_symbol}."
     )
     notes.append(
         "Output indikator dan daftar faktor adalah pengukuran deskriptif, bukan probabilitas "
@@ -1209,6 +1226,10 @@ def build_analysis_snapshot(
     dxy_candles: Sequence[MarketCandle] | None = None,
     btc_candles: Sequence[MarketCandle] | None = None,
     macro_context: MacroBenchmarkContext | None = None,
+    positioning: PositioningPanel | None = None,
+    fear_greed: FearGreedObservation | None = None,
+    maintenance_margin_rate: float | None = None,
+    venue_max_leverage: float | None = None,
 ) -> AnalysisSnapshot:
     """Assemble a complete deterministic `AnalysisSnapshot` from spot and optional inputs."""
     if batch.has_provider_error or not batch.candles:
@@ -1243,6 +1264,7 @@ def build_analysis_snapshot(
     mtf_hashes: dict[str, str] = {}
     dropped_mtf: list[Timeframe] = []
     ltf_15m_candles: tuple[MarketCandle, ...] | None = None
+    micro_5m_candles: tuple[MarketCandle, ...] | None = None
     htf_candles_by_tf: dict[Timeframe, tuple[MarketCandle, ...]] = {}
 
     if mtf_batches is not None:
@@ -1265,6 +1287,8 @@ def build_analysis_snapshot(
                     htf_candles_by_tf[tf] = mtf_batch.candles
             elif tf is Timeframe.M15 and batch.timeframe is not Timeframe.M15:
                 ltf_15m_candles = mtf_batch.candles
+            elif tf is Timeframe.M5 and batch.timeframe is not Timeframe.M5:
+                micro_5m_candles = mtf_batch.candles
 
     ind_result = compute_technical_metrics(
         batch.candles,
@@ -1414,10 +1438,13 @@ def build_analysis_snapshot(
         sentiment=sent_metrics,
         primary_timeframe=batch.timeframe,
         ltf_candles=ltf_15m_candles,
+        micro_candles=micro_5m_candles,
         htf_candles_by_tf=htf_candles_by_tf or None,
         as_of=as_of,
         use_available_time=use_available_time,
         macro_context=macro_context,
+        maintenance_margin_rate=maintenance_margin_rate,
+        venue_max_leverage=venue_max_leverage,
     )
     source = f"{batch.metadata.venue}:{batch.canonical_symbol}:{batch.timeframe.value}"
     facts, fact_ids_by_key = _build_facts(
@@ -1508,6 +1535,8 @@ def build_analysis_snapshot(
         order_flow=actual_order_flow,
         cross_venue_derivatives=cross_venue_derivatives,
         macro_context=macro_context,
+        positioning=positioning,
+        fear_greed=fear_greed,
         facts=facts,
         regime=regime,
         market_structure=structure.market_structure,
@@ -1584,6 +1613,13 @@ class AnalysisService:
         shadow_engine: ShadowInferenceEngine | None = None,
         prediction_repository: ModelPredictionRepository | None = None,
         dxy_provider: DxyMarketDataProvider | None = None,
+        contract_stats_repository: ContractStatsRepository | None = None,
+        fear_greed_repository: FearGreedRepository | None = None,
+        risk_tiers_client: GateRiskTiersClient | None = None,
+        default_position_notional_usdt: float = 1_000.0,
+        resample_from: Timeframe | None = None,
+        cache_ttl_seconds: float = 0.0,
+        cache_max_entries: int = 256,
     ) -> None:
         self._provider = provider
         self._repository = repository
@@ -1596,16 +1632,322 @@ class AnalysisService:
         self._shadow_engine = shadow_engine
         self._prediction_repository = prediction_repository
         self._dxy_provider = dxy_provider
+        self._contract_stats_repository = contract_stats_repository
+        self._fear_greed_repository = fear_greed_repository
+        self._risk_tiers_client = risk_tiers_client
+        self._default_position_notional_usdt = max(0.0, float(default_position_notional_usdt))
+        self._resample_from = resample_from
+        self._cache_ttl_seconds = max(0.0, float(cache_ttl_seconds))
+        self._cache_max_entries = max(1, int(cache_max_entries))
+        self._ohlcv_cache: OrderedDict[tuple[str, Timeframe, int], tuple[float, OhlcvBatch]] = (
+            OrderedDict()
+        )
 
-    async def _fetch_optional_ltf_15m(self, canonical_symbol: str) -> OhlcvBatch | None:
-        try:
-            return await self._provider.get_closed_ohlcv(
-                canonical_symbol,
-                Timeframe.M15,
-                limit=200,
+    async def _fetch_closed_ohlcv(
+        self,
+        symbol: str,
+        timeframe: Timeframe,
+        limit: int,
+    ) -> OhlcvBatch:
+        key = (symbol, timeframe, limit)
+        if self._cache_ttl_seconds > 0.0:
+            cached = self._ohlcv_cache.get(key)
+            if cached is not None:
+                ts, cached_batch = cached
+                if (time.monotonic() - ts) < self._cache_ttl_seconds:
+                    self._ohlcv_cache.move_to_end(key)
+                    return cached_batch
+                self._ohlcv_cache.pop(key, None)
+
+        batch = await self._provider.get_closed_ohlcv(symbol, timeframe, limit=limit)
+        if self._cache_ttl_seconds > 0.0 and not batch.has_provider_error and batch.candles:
+            self._ohlcv_cache[key] = (time.monotonic(), batch)
+            self._ohlcv_cache.move_to_end(key)
+            if len(self._ohlcv_cache) > self._cache_max_entries:
+                self._ohlcv_cache.popitem(last=False)
+        return batch
+
+    async def get_futures_tickers(self) -> FuturesTickerBatch:
+        """Fetch exchange-wide 24h futures tickers if the market provider supports it."""
+        if isinstance(self._provider, FuturesTickerProvider):
+            return await self._provider.get_futures_tickers()
+        return FuturesTickerBatch(
+            venue="unknown",
+            received_time=datetime.now(UTC),
+            quality_flags=(QualityFlag.PROVIDER_ERROR,),
+            error_message="Market provider does not support exchange-wide futures tickers.",
+        )
+
+    async def get_closed_ohlcv(
+        self,
+        symbol: str,
+        timeframe: Timeframe,
+        *,
+        limit: int = 100,
+    ) -> OhlcvBatch:
+        """Fetch normalized closed candles for one symbol/timeframe via active provider."""
+        return await self._fetch_closed_ohlcv(symbol, timeframe, limit)
+
+    def _can_resample(self, target: Timeframe) -> bool:
+        if self._resample_from is None:
+            return False
+        base_secs = int(self._resample_from.duration.total_seconds())
+        target_secs = int(target.duration.total_seconds())
+        return target_secs > base_secs and target_secs % base_secs == 0
+
+    async def _resolve_maintenance_margin(
+        self,
+        canonical_symbol: str,
+        *,
+        pinned_venue: str | None,
+    ) -> tuple[float | None, float | None]:
+        if self._risk_tiers_client is None:
+            return None, None
+        if pinned_venue is not None and pinned_venue not in {"gate", "gateio"}:
+            return None, None
+        return await self._risk_tiers_client.get_mmr_for_symbol(
+            canonical_symbol,
+            notional_usdt=self._default_position_notional_usdt,
+        )
+
+    async def _fetch_timeframe_bundle(
+        self,
+        canonical_symbol: str,
+        requests: Sequence[tuple[Timeframe, int]],
+    ) -> tuple[dict[Timeframe, OhlcvBatch], MarketDataProvider, str | None]:
+        """Fetch a coherent set of timeframes from one pinned venue, resampling when configured."""
+        dedup_limits: dict[Timeframe, int] = {}
+        for tf, req_limit in requests:
+            dedup_limits[tf] = max(dedup_limits.get(tf, 0), max(1, req_limit))
+
+        resample_reqs: list[tuple[Timeframe, int]] = []
+        fetch_limits: dict[Timeframe, int] = {}
+        base_tf = self._resample_from
+        for tf, req_limit in dedup_limits.items():
+            if base_tf is not None and self._can_resample(tf):
+                resample_reqs.append((tf, req_limit))
+                ratio = int(tf.duration.total_seconds()) // int(base_tf.duration.total_seconds())
+                needed_base = req_limit * ratio + ratio
+                fetch_limits[base_tf] = max(fetch_limits.get(base_tf, 0), needed_base)
+            else:
+                fetch_limits[tf] = max(fetch_limits.get(tf, 0), req_limit)
+
+        pinned_provider: MarketDataProvider = self._provider
+        pinned_venue: str | None = None
+        if isinstance(self._provider, FallbackMarketDataProvider):
+            bundle_requests = [(canonical_symbol, tf, lim) for tf, lim in fetch_limits.items()]
+            bundle = await self._provider.get_closed_ohlcv_bundle(bundle_requests)
+            if bundle.provider is not None:
+                pinned_provider = bundle.provider
+                pinned_venue = bundle.venue
+            batches = {tf: bundle.batches[(canonical_symbol, tf)] for tf in fetch_limits}
+            if (
+                base_tf is not None
+                and base_tf in batches
+                and fetch_limits[base_tf] > 999
+                and len(batches[base_tf].candles) < fetch_limits[base_tf]
+                and isinstance(pinned_provider, HistoryMarketDataProvider)
+            ):
+                batches[base_tf] = await pinned_provider.get_closed_ohlcv_history(
+                    canonical_symbol,
+                    base_tf,
+                    limit=fetch_limits[base_tf],
+                )
+        else:
+            ordered_reqs = list(fetch_limits.items())
+
+            async def _fetch_one(tf: Timeframe, lim: int) -> OhlcvBatch:
+                if lim > 999 and isinstance(self._provider, HistoryMarketDataProvider):
+                    return await self._provider.get_closed_ohlcv_history(
+                        canonical_symbol, tf, limit=lim
+                    )
+                return await self._fetch_closed_ohlcv(canonical_symbol, tf, lim)
+
+            results = await asyncio.gather(*(_fetch_one(tf, lim) for tf, lim in ordered_reqs))
+            batches = dict(zip((tf for tf, _ in ordered_reqs), results, strict=True))
+
+        if resample_reqs and base_tf is not None:
+            base_batch = batches[base_tf]
+            for target_tf, req_limit in resample_reqs:
+                if base_batch.candles and not base_batch.has_provider_error:
+                    synthesized = resample_candles(
+                        base_batch.candles,
+                        target_timeframe=target_tf,
+                        as_of=base_batch.candles[-1].close_time,
+                    )
+                    if len(synthesized.candles) > req_limit:
+                        synthesized = synthesized.model_copy(
+                            update={"candles": synthesized.candles[-req_limit:]}
+                        )
+                    batches[target_tf] = synthesized
+                else:
+                    batches[target_tf] = OhlcvBatch(
+                        metadata=base_batch.metadata,
+                        canonical_symbol=base_batch.canonical_symbol,
+                        provider_symbol=base_batch.provider_symbol,
+                        timeframe=target_tf,
+                        received_time=base_batch.received_time,
+                        candles=(),
+                        quality_flags=base_batch.quality_flags or (QualityFlag.PROVIDER_ERROR,),
+                        error_message=base_batch.error_message,
+                    )
+
+        return batches, pinned_provider, pinned_venue
+
+    async def analyze_multi_style(
+        self,
+        symbol: str,
+        timeframes: Sequence[Timeframe] = MULTI_STYLE_SCAN_TIMEFRAMES,
+        *,
+        limit: int = DEFAULT_CANDLE_LIMIT,
+        include_derivatives: bool = True,
+    ) -> dict[Timeframe, AnalysisSnapshot]:
+        """Evaluate multiple trading-style timeframes concurrently with a single data fetch."""
+        requested_tfs = tuple(dict.fromkeys(timeframes))
+        if not requested_tfs:
+            return {}
+
+        mapping = resolve_default_perp_symbol(symbol)
+        base_core = (Timeframe.M15, Timeframe.H1, Timeframe.H4, Timeframe.D1)
+        core_tfs: list[Timeframe] = list(base_core)
+        for tf in requested_tfs:
+            if tf not in core_tfs:
+                core_tfs.append(tf)
+
+        def _fetch_limit(tf: Timeframe) -> int:
+            if tf is Timeframe.M15:
+                return max(limit, 200)
+            if tf in requested_tfs or tf in (Timeframe.H1, Timeframe.H4):
+                return limit
+            return 100
+
+        core_requests = [(tf, _fetch_limit(tf)) for tf in core_tfs]
+        batches, pinned_provider, pinned_venue = await self._fetch_timeframe_bundle(
+            mapping.canonical_symbol,
+            core_requests,
+        )
+
+        effective_symbol = mapping.canonical_symbol
+        effective_base = mapping.base
+        any_requested_ok = False
+        for tf in requested_tfs:
+            batch = batches.get(tf)
+            if (
+                batch is not None
+                and bool(batch.candles)
+                and determine_quality_status(len(batch.candles), batch.quality_flags)
+                is not QualityStatus.INSUFFICIENT_DATA
+            ):
+                if not any_requested_ok:
+                    effective_symbol = batch.canonical_symbol
+                    effective_base = batch.metadata.base_unit
+                    if pinned_venue is None:
+                        pinned_venue = batch.metadata.venue
+                any_requested_ok = True
+
+        deriv_source: DerivativesLiquidityProvider | None = self._derivatives_provider
+        if isinstance(deriv_source, FallbackDerivativesLiquidityProvider) and pinned_venue:
+            deriv_source = deriv_source.provider_for_venue(pinned_venue) or deriv_source
+
+        derivatives_context: DerivativesContext | None = None
+        cross_venue: CrossVenueDerivativesSummary | None = None
+        if any_requested_ok:
+            if Timeframe.M5 not in batches:
+                m5_batch = await self._fetch_optional_ltf(
+                    effective_symbol,
+                    Timeframe.M5,
+                    limit=150,
+                    provider=pinned_provider,
+                )
+                if m5_batch is not None:
+                    batches[Timeframe.M5] = m5_batch
+
+            if deriv_source is not None and include_derivatives:
+                oi_tf = max(
+                    requested_tfs,
+                    key=lambda t: (
+                        Timeframe.M5,
+                        Timeframe.M15,
+                        Timeframe.H1,
+                        Timeframe.H4,
+                        Timeframe.D1,
+                    ).index(t),
+                )
+                funding_batch, oi_batch, ob_batch, liq_batch = await asyncio.gather(
+                    deriv_source.get_funding_rate(effective_base),
+                    deriv_source.get_open_interest(effective_base, oi_tf),
+                    deriv_source.get_order_book(
+                        effective_symbol,
+                        market_type=mapping.market_type,
+                    ),
+                    deriv_source.get_liquidations(effective_base),
+                )
+                derivatives_context = DerivativesContext(
+                    funding=funding_batch,
+                    open_interest=oi_batch,
+                    order_book=ob_batch,
+                    liquidations=liq_batch,
+                )
+
+            if self._bybit_provider is not None and include_derivatives:
+                try:
+                    bybit_funding = await self._bybit_provider.get_funding_rate(effective_base)
+                    bybit_context = (
+                        DerivativesContext(funding=bybit_funding)
+                        if bybit_funding.observation is not None
+                        else None
+                    )
+                    cross_venue = compute_cross_venue_derivatives(
+                        derivatives_context,
+                        bybit_context,
+                    )
+                except Exception:
+                    cross_venue = None
+
+        mmr_rate: float | None = None
+        venue_max_lev: float | None = None
+        if any_requested_ok:
+            mmr_rate, venue_max_lev = await self._resolve_maintenance_margin(
+                effective_symbol,
+                pinned_venue=pinned_venue,
             )
+
+        snapshots: dict[Timeframe, AnalysisSnapshot] = {}
+        for tf in requested_tfs:
+            primary = batches[tf]
+            mtf_batches = {k: v for k, v in batches.items() if k is not tf}
+            snapshots[tf] = build_analysis_snapshot(
+                primary,
+                mtf_batches=mtf_batches,
+                derivatives_context=derivatives_context,
+                cross_venue_derivatives=cross_venue,
+                maintenance_margin_rate=mmr_rate,
+                venue_max_leverage=venue_max_lev,
+            )
+        return snapshots
+
+    async def _fetch_optional_ltf(
+        self,
+        canonical_symbol: str,
+        tf: Timeframe,
+        *,
+        limit: int = 200,
+        provider: MarketDataProvider | None = None,
+    ) -> OhlcvBatch | None:
+        try:
+            if provider is not None and provider is not self._provider:
+                batch = await provider.get_closed_ohlcv(canonical_symbol, tf, limit=limit)
+            else:
+                batch = await self._fetch_closed_ohlcv(
+                    canonical_symbol,
+                    tf,
+                    limit,
+                )
         except KeyError:
             return None
+        if batch.has_provider_error or not batch.candles:
+            return None
+        return batch
 
     async def analyze(
         self,
@@ -1619,10 +1961,22 @@ class AnalysisService:
     ) -> AnalysisSnapshot:
         """Fetch market data, build an `AnalysisSnapshot`, and optionally persist it."""
         mapping = resolve_default_perp_symbol(symbol)
-        primary = await self._provider.get_closed_ohlcv(
+        other_tfs = (
+            [tf for tf in (Timeframe.H1, Timeframe.H4, Timeframe.D1) if tf is not timeframe]
+            if include_mtf
+            else []
+        )
+        bundle_requests: list[tuple[Timeframe, int]] = [
+            (timeframe, limit),
+            *((tf, 100) for tf in other_tfs),
+        ]
+        batches, pinned_provider, pinned_venue = await self._fetch_timeframe_bundle(
             mapping.canonical_symbol,
-            timeframe,
-            limit=limit,
+            bundle_requests,
+        )
+        primary = batches[timeframe]
+        mtf_batches: dict[Timeframe, OhlcvBatch] | None = (
+            {tf: batches[tf] for tf in other_tfs} if include_mtf else None
         )
 
         primary_ok = (
@@ -1633,35 +1987,80 @@ class AnalysisService:
 
         effective_symbol = primary.canonical_symbol if primary_ok else mapping.canonical_symbol
         effective_base = primary.metadata.base_unit if primary_ok else mapping.base
+        if primary_ok and pinned_venue is None:
+            pinned_venue = primary.metadata.venue
 
-        mtf_batches: dict[Timeframe, OhlcvBatch] | None = None
         if include_mtf and primary_ok:
-            other_tfs = [
-                tf for tf in (Timeframe.H1, Timeframe.H4, Timeframe.D1) if tf is not timeframe
-            ]
-            fetched = await asyncio.gather(
-                *(
-                    self._provider.get_closed_ohlcv(effective_symbol, tf, limit=100)
-                    for tf in other_tfs
-                )
-            )
-            mtf_batches = dict(zip(other_tfs, fetched, strict=True))
+            if mtf_batches is None:  # pragma: no cover
+                mtf_batches = {}
+            optional_tasks: list[tuple[Timeframe, Any]] = []
             if timeframe is not Timeframe.M15:
-                m15_batch = await self._fetch_optional_ltf_15m(effective_symbol)
-                if m15_batch is not None:
-                    mtf_batches[Timeframe.M15] = m15_batch
+                optional_tasks.append(
+                    (
+                        Timeframe.M15,
+                        self._fetch_optional_ltf(
+                            effective_symbol,
+                            Timeframe.M15,
+                            limit=200,
+                            provider=pinned_provider,
+                        ),
+                    )
+                )
+            if timeframe is not Timeframe.M5:
+                optional_tasks.append(
+                    (
+                        Timeframe.M5,
+                        self._fetch_optional_ltf(
+                            effective_symbol,
+                            Timeframe.M5,
+                            limit=150,
+                            provider=pinned_provider,
+                        ),
+                    )
+                )
+            if optional_tasks:
+                optional_results = await asyncio.gather(*(coro for _, coro in optional_tasks))
+                for (opt_tf, _), opt_batch in zip(optional_tasks, optional_results, strict=True):
+                    if opt_batch is not None:
+                        mtf_batches[opt_tf] = opt_batch
+
+        deriv_source = self._derivatives_provider
+        if isinstance(deriv_source, FallbackDerivativesLiquidityProvider) and pinned_venue:
+            deriv_source = deriv_source.provider_for_venue(pinned_venue) or deriv_source
 
         derivatives_context: DerivativesContext | None = None
-        if self._derivatives_provider is not None and include_derivatives and primary_ok:
+        if deriv_source is not None and include_derivatives and primary_ok:
             funding_batch, oi_batch, ob_batch, liq_batch = await asyncio.gather(
-                self._derivatives_provider.get_funding_rate(effective_base),
-                self._derivatives_provider.get_open_interest(effective_base, timeframe),
-                self._derivatives_provider.get_order_book(
+                deriv_source.get_funding_rate(effective_base),
+                deriv_source.get_open_interest(effective_base, timeframe),
+                deriv_source.get_order_book(
                     effective_symbol,
                     market_type=mapping.market_type,
                 ),
-                self._derivatives_provider.get_liquidations(effective_base),
+                deriv_source.get_liquidations(effective_base),
             )
+            if (
+                (funding_batch.observation is None or funding_batch.has_provider_error)
+                and self._derivatives_repository is not None
+                and primary.candles
+            ):
+                cached_funding = self._derivatives_repository.load_funding_observations(
+                    venue=primary.metadata.venue,
+                    canonical_symbol=effective_symbol,
+                    end_available_time=primary.candles[-1].close_time,
+                    limit=1,
+                )
+                if cached_funding:
+                    funding_batch = funding_batch.model_copy(
+                        update={
+                            "observation": cached_funding[-1],
+                            "quality_flags": tuple(
+                                f
+                                for f in funding_batch.quality_flags
+                                if f is not QualityFlag.PROVIDER_ERROR
+                            ),
+                        }
+                    )
             derivatives_context = DerivativesContext(
                 funding=funding_batch,
                 open_interest=oi_batch,
@@ -1672,7 +2071,7 @@ class AnalysisService:
         cross_venue: CrossVenueDerivativesSummary | None = None
         if self._bybit_provider is not None and include_derivatives and primary_ok:
             try:
-                bybit_funding = await self._bybit_provider.get_funding_rate(mapping.base)
+                bybit_funding = await self._bybit_provider.get_funding_rate(effective_base)
                 bybit_context = (
                     DerivativesContext(funding=bybit_funding)
                     if bybit_funding.observation is not None
@@ -1715,15 +2114,66 @@ class AnalysisService:
         btc_candles: tuple[MarketCandle, ...] | None = None
         if "BTC" not in mapping.canonical_symbol.upper() and primary_ok:
             try:
-                btc_batch = await self._provider.get_closed_ohlcv(
-                    "BTC/USDT:USDT",
-                    timeframe,
-                    limit=limit,
-                )
+                if self._can_resample(timeframe):
+                    btc_batches, _, _ = await self._fetch_timeframe_bundle(
+                        "BTC/USDT:USDT",
+                        [(timeframe, limit)],
+                    )
+                    btc_batch = btc_batches[timeframe]
+                else:
+                    btc_batch = await pinned_provider.get_closed_ohlcv(
+                        "BTC/USDT:USDT",
+                        timeframe,
+                        limit=limit,
+                    )
                 if btc_batch.candles:
                     btc_candles = btc_batch.candles
             except Exception:
                 btc_candles = None
+
+        positioning_panel: PositioningPanel | None = None
+        if self._contract_stats_repository is not None and primary_ok and primary.candles:
+            primary_as_of = primary.candles[-1].close_time
+            win_start = primary_as_of - timedelta(days=30)
+            stats_obs = self._contract_stats_repository.load_contract_stats(
+                venue="gateio",
+                canonical_symbol=mapping.canonical_symbol,
+                interval="5m",
+                start_time=win_start,
+                end_available_time=primary_as_of,
+            )
+            if not stats_obs:
+                stats_obs = self._contract_stats_repository.load_contract_stats(
+                    venue="gate",
+                    canonical_symbol=mapping.canonical_symbol,
+                    interval="5m",
+                    start_time=win_start,
+                    end_available_time=primary_as_of,
+                )
+            positioning_panel = compute_positioning_panel(
+                stats_obs,
+                canonical_symbol=mapping.canonical_symbol,
+                as_of=primary_as_of,
+                use_available_time=True,
+            )
+
+        fear_greed_obs: FearGreedObservation | None = None
+        if self._fear_greed_repository is not None and primary_ok and primary.candles:
+            fg_rows = self._fear_greed_repository.load_observations(
+                source="alternative.me",
+                end_available_time=primary.candles[-1].close_time,
+                limit=1,
+            )
+            if fg_rows:
+                fear_greed_obs = fg_rows[-1]
+
+        mmr_rate: float | None = None
+        venue_max_lev: float | None = None
+        if primary_ok:
+            mmr_rate, venue_max_lev = await self._resolve_maintenance_margin(
+                effective_symbol,
+                pinned_venue=pinned_venue or primary.metadata.venue,
+            )
 
         snapshot = build_analysis_snapshot(
             primary,
@@ -1734,6 +2184,10 @@ class AnalysisService:
             cross_venue_derivatives=cross_venue,
             dxy_candles=dxy_candles,
             btc_candles=btc_candles,
+            positioning=positioning_panel,
+            fear_greed=fear_greed_obs,
+            maintenance_margin_rate=mmr_rate,
+            venue_max_leverage=venue_max_lev,
         )
 
         if self._shadow_engine is not None:

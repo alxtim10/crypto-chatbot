@@ -13,10 +13,12 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from crypto_chatbot.schemas.news import (
     MIN_ENTITY_MATCH_CONFIDENCE,
     SENTIMENT_MODEL_VERSION,
+    SENTIMENT_SCORER_ID,
     EntityMatch,
     NewsSourceLink,
     NormalizedNewsArticle,
     RawNewsItem,
+    ScorerClass,
     SentimentBucket,
     SentimentLabel,
     SentimentMetrics,
@@ -506,18 +508,29 @@ def build_sentiment_observations(
     articles: Sequence[NormalizedNewsArticle],
     *,
     min_entity_confidence: float = MIN_ENTITY_MATCH_CONFIDENCE,
+    scored_at: datetime | None = None,
+    scorer_id: str = SENTIMENT_SCORER_ID,
+    scorer_version: str = SENTIMENT_MODEL_VERSION,
+    scorer_class: ScorerClass = "lexicon_deterministic",
+    is_backfilled: bool = False,
 ) -> tuple[SentimentObservation, ...]:
-    """Score normalized articles and emit causal observations per high-confidence entity."""
+    """Score normalized articles and emit causal observations per high-confidence entity.
+
+    Raises `ValueError` if `is_backfilled=True` with `scorer_class='llm'` (PRD v1.7 §6.2).
+    """
+    if is_backfilled and scorer_class == "llm":
+        raise ValueError("LLM-based sentiment scores must never be backfilled (PRD v1.7 §6.2)")
     observations: list[SentimentObservation] = []
     for article in articles:
         qualifying = [e for e in article.affected_entities if e.confidence >= min_entity_confidence]
         if not qualifying:
             continue
         label, score, confidence = classify_article_sentiment(article.title, article.summary)
+        eff_scored_at = (
+            scored_at.astimezone(UTC) if scored_at is not None else article.available_time
+        )
         for entity in qualifying:
-            raw_obs_key = (
-                f"{article.article_id}|{entity.canonical_symbol}|{SENTIMENT_MODEL_VERSION}"
-            )
+            raw_obs_key = f"{article.article_id}|{entity.canonical_symbol}|{scorer_version}"
             obs_id = "sent-" + hashlib.sha256(raw_obs_key.encode("utf-8")).hexdigest()[:24]
             observations.append(
                 SentimentObservation(
@@ -532,13 +545,37 @@ def build_sentiment_observations(
                     sentiment_label=label,
                     sentiment_score=score,
                     sentiment_confidence=confidence,
-                    model_version=SENTIMENT_MODEL_VERSION,
+                    model_version=scorer_version,
                     is_probabilistic=False,
                     published_time=article.published_time,
                     available_time=article.available_time,
+                    scored_at=eff_scored_at,
+                    scorer_id=scorer_id,
+                    scorer_version=scorer_version,
+                    scorer_class=scorer_class,
+                    is_backfilled=is_backfilled,
                 )
             )
     return tuple(observations)
+
+
+def is_sentiment_observation_eligible(
+    obs: SentimentObservation,
+    as_of: datetime,
+    *,
+    allow_lexicon_backfill: bool = True,
+) -> bool:
+    """Return True iff `obs` satisfies PRD v1.7 §6.2 point-in-time eligibility at `as_of`."""
+    as_of_utc = as_of.astimezone(UTC)
+    avail = obs.available_time.astimezone(UTC)
+    if avail > as_of_utc:
+        return False
+    eff_scored = (obs.scored_at or obs.available_time).astimezone(UTC)
+    if eff_scored <= as_of_utc:
+        return True
+    return bool(
+        allow_lexicon_backfill and obs.scorer_class == "lexicon_deterministic" and obs.is_backfilled
+    )
 
 
 def aggregate_sentiment(
@@ -549,6 +586,7 @@ def aggregate_sentiment(
     window_hours: int = 24,
     bucket_hours: int = 4,
     min_entity_confidence: float = MIN_ENTITY_MATCH_CONFIDENCE,
+    allow_lexicon_backfill: bool = True,
 ) -> SentimentMetrics | None:
     """Aggregate causal sentiment observations strictly inside `(as_of - window, as_of]`."""
     as_of_utc = as_of.astimezone(UTC)
@@ -562,6 +600,12 @@ def aggregate_sentiment(
             continue
         avail = obs.available_time.astimezone(UTC)
         if avail <= window_start or avail > as_of_utc:
+            continue
+        if not is_sentiment_observation_eligible(
+            obs,
+            as_of_utc,
+            allow_lexicon_backfill=allow_lexicon_backfill,
+        ):
             continue
         prev = by_article.get(obs.article_id)
         if prev is None or obs.sentiment_confidence > prev.sentiment_confidence:
@@ -638,6 +682,7 @@ def aggregate_sentiment(
     )
 
     latest_avail = max(o.available_time.astimezone(UTC) for o in filtered)
+    has_backfilled = any(o.is_backfilled for o in filtered)
     return SentimentMetrics(
         canonical_symbol=canonical_symbol,
         window_hours=window_hours,
@@ -652,6 +697,7 @@ def aggregate_sentiment(
         mean_confidence=mean_conf,
         dominant_label=dominant,
         latest_available_time=latest_avail,
+        sentiment_backfilled=has_backfilled,
         buckets=tuple(buckets),
         sources=sources,
     )

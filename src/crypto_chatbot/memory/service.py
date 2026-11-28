@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import Literal, Protocol, runtime_checkable
 
 from crypto_chatbot.llm.gemini import NarrationOutcome
 from crypto_chatbot.llm.guard import validate_narration
+from crypto_chatbot.llm.prompts import PROMPT_VERSION
 from crypto_chatbot.market_data.symbols import resolve_default_perp_symbol
 from crypto_chatbot.schemas.analysis import AnalysisSnapshot
-from crypto_chatbot.schemas.llm import LlmAnalysisNarration
+from crypto_chatbot.schemas.llm import LlmAnalysisNarration, RoutingTrace
 from crypto_chatbot.storage.repositories import (
     ForgetResult,
     LlmInteractionRecord,
@@ -19,6 +21,17 @@ from crypto_chatbot.storage.repositories import (
 
 MAX_RECENT_MESSAGES = 20
 MAX_STORED_USER_MESSAGE_CHARS = 1000
+
+
+@runtime_checkable
+class _AtomicWatchlistRepo(Protocol):
+    def update_watchlist(
+        self,
+        telegram_user_id: int,
+        symbol: str,
+        *,
+        action: Literal["add", "remove"],
+    ) -> tuple[UserPreferences, bool]: ...
 
 
 class MemoryService:
@@ -48,6 +61,8 @@ class MemoryService:
     def add_to_watchlist(self, user_id: int, raw_symbol: str) -> tuple[UserPreferences, bool]:
         """Add an MVP perpetual symbol to user's explicit watchlist idempotently."""
         canonical = resolve_default_perp_symbol(raw_symbol).canonical_symbol
+        if isinstance(self._repository, _AtomicWatchlistRepo):
+            return self._repository.update_watchlist(user_id, canonical, action="add")
         prefs = self._repository.get_preferences(user_id)
         if canonical in prefs.watchlist:
             return prefs, False
@@ -58,6 +73,8 @@ class MemoryService:
     def remove_from_watchlist(self, user_id: int, raw_symbol: str) -> tuple[UserPreferences, bool]:
         """Remove an MVP perpetual symbol from user's watchlist if present."""
         canonical = resolve_default_perp_symbol(raw_symbol).canonical_symbol
+        if isinstance(self._repository, _AtomicWatchlistRepo):
+            return self._repository.update_watchlist(user_id, canonical, action="remove")
         prefs = self._repository.get_preferences(user_id)
         if canonical not in prefs.watchlist:
             return prefs, False
@@ -73,6 +90,17 @@ class MemoryService:
         return self._repository.append_message(
             user_id,
             role="user",
+            content=trimmed,
+            snapshot_id=None,
+            max_messages=self._max_messages,
+        )
+
+    def record_assistant_text(self, user_id: int, text: str) -> StoredMessage:
+        """Persist a bounded assistant Q&A/scan summary turn without snapshot attachment."""
+        trimmed = text.strip()[:MAX_STORED_USER_MESSAGE_CHARS]
+        return self._repository.append_message(
+            user_id,
+            role="assistant",
             content=trimmed,
             snapshot_id=None,
             max_messages=self._max_messages,
@@ -155,6 +183,7 @@ class MemoryService:
         user_id: int,
         request_id: str,
         outcome: NarrationOutcome,
+        routing_trace: RoutingTrace | None = None,
     ) -> None:
         self._repository.record_llm_interaction(
             LlmInteractionRecord(
@@ -168,6 +197,55 @@ class MemoryService:
                 prompt_tokens=outcome.prompt_tokens,
                 output_tokens=outcome.output_tokens,
                 latency_ms=outcome.latency_ms,
+                layer=routing_trace.layer if routing_trace is not None else None,
+                detected_symbol=(
+                    routing_trace.detected_symbol if routing_trace is not None else None
+                ),
+                intent=routing_trace.intent if routing_trace is not None else None,
+                confidence=routing_trace.confidence if routing_trace is not None else None,
+                fallback_reason=(
+                    routing_trace.fallback_reason if routing_trace is not None else None
+                ),
+                guard_violations=(
+                    routing_trace.guard_violations if routing_trace is not None else ()
+                ),
+            )
+        )
+
+    def record_routing_trace(
+        self,
+        *,
+        user_id: int,
+        request_id: str,
+        trace: RoutingTrace,
+        model_id: str = "deterministic",
+        prompt_version: str = PROMPT_VERSION,
+        validation_passed: bool = True,
+        rejection_reasons: tuple[str, ...] = (),
+        latency_ms: int = 0,
+        prompt_tokens: int | None = None,
+        output_tokens: int | None = None,
+        snapshot_id: str | None = None,
+    ) -> None:
+        """Persist PII-free routing trace telemetry in `llm_interactions`."""
+        self._repository.record_llm_interaction(
+            LlmInteractionRecord(
+                telegram_user_id=user_id,
+                request_id=request_id,
+                snapshot_id=snapshot_id,
+                model_id=model_id,
+                prompt_version=prompt_version,
+                validation_passed=validation_passed,
+                rejection_reasons=rejection_reasons,
+                prompt_tokens=prompt_tokens,
+                output_tokens=output_tokens,
+                latency_ms=latency_ms,
+                layer=trace.layer,
+                detected_symbol=trace.detected_symbol,
+                intent=trace.intent,
+                confidence=trace.confidence,
+                fallback_reason=trace.fallback_reason,
+                guard_violations=trace.guard_violations,
             )
         )
 

@@ -19,6 +19,7 @@ from crypto_chatbot.ml.features import (
     ALL_FEATURE_NAMES,
     FEATURE_FAMILIES,
     build_point_in_time_dataset,
+    select_available_feature_families,
 )
 from crypto_chatbot.ml.models import CalibratedLogisticPipeline, NaiveBaseRateModel
 from crypto_chatbot.ml.validation import (
@@ -46,7 +47,13 @@ def _extract_matrix(
     feature_names: Sequence[str],
 ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
     x = np.array(
-        [[row.features[name] for name in feature_names] for row in rows],
+        [
+            [
+                np.nan if row.features.get(name) is None else float(row.features[name] or 0.0)
+                for name in feature_names
+            ]
+            for row in rows
+        ],
         dtype=np.float64,
     )
     y = np.array([row.label for row in rows], dtype=np.float64)
@@ -147,12 +154,31 @@ def _evaluate_walk_forward(
     return summary, tuple(fold_results), tuple(oof_rows), p_model_arr, p_naive_arr
 
 
+def _resolve_active_ml_features(
+    dev_rows: Sequence[FeatureRow],
+    *,
+    has_sentiment: bool,
+) -> tuple[tuple[str, ...], bool]:
+    """Select active feature names cleanly without silently retaining all-missing families."""
+    candidates: list[FeatureFamily] = [
+        FeatureFamily.TECHNICAL,
+        FeatureFamily.STRUCTURE_PIVOT,
+        FeatureFamily.ORDERFLOW,
+    ]
+    if has_sentiment:
+        candidates.append(FeatureFamily.SENTIMENT)
+    selected, excluded = select_available_feature_families(dev_rows, candidates)
+    has_orderflow = FeatureFamily.ORDERFLOW not in excluded
+    return selected, has_orderflow
+
+
 def _run_ablations(
     dev_rows: Sequence[FeatureRow],
     splits: Sequence[PurgedSplit],
     *,
     config: MlExperimentConfig,
     has_sentiment: bool,
+    has_orderflow: bool = False,
 ) -> tuple[AblationResult, ...]:
     ablation_specs: list[tuple[str, tuple[str, ...]]] = [
         ("technical", FEATURE_FAMILIES[FeatureFamily.TECHNICAL]),
@@ -164,8 +190,28 @@ def _run_ablations(
             ),
         ),
     ]
+    if has_orderflow:
+        ablation_specs.append(
+            (
+                "technical+structure_pivot+orderflow",
+                (
+                    *FEATURE_FAMILIES[FeatureFamily.TECHNICAL],
+                    *FEATURE_FAMILIES[FeatureFamily.STRUCTURE_PIVOT],
+                    *FEATURE_FAMILIES[FeatureFamily.ORDERFLOW],
+                ),
+            )
+        )
     if has_sentiment:
-        ablation_specs.append(("all_families", ALL_FEATURE_NAMES))
+        sentiment_combo = (
+            ALL_FEATURE_NAMES
+            if has_orderflow
+            else (
+                *FEATURE_FAMILIES[FeatureFamily.TECHNICAL],
+                *FEATURE_FAMILIES[FeatureFamily.STRUCTURE_PIVOT],
+                *FEATURE_FAMILIES[FeatureFamily.SENTIMENT],
+            )
+        )
+        ablation_specs.append(("all_families", sentiment_combo))
 
     results: list[AblationResult] = []
     for name, feat_names in ablation_specs:
@@ -206,13 +252,9 @@ def evaluate_feature_rows_experiment(
         embargo_bars=config.embargo_bars,
     )
 
-    active_features = (
-        ALL_FEATURE_NAMES
-        if has_sentiment
-        else (
-            *FEATURE_FAMILIES[FeatureFamily.TECHNICAL],
-            *FEATURE_FAMILIES[FeatureFamily.STRUCTURE_PIVOT],
-        )
+    active_features, has_orderflow = _resolve_active_ml_features(
+        dev_rows,
+        has_sentiment=has_sentiment,
     )
     oof_summary, fold_metrics, oof_rows, oof_p_model, oof_p_naive = _evaluate_walk_forward(
         dev_rows,
@@ -232,6 +274,7 @@ def evaluate_feature_rows_experiment(
         splits,
         config=config,
         has_sentiment=has_sentiment,
+        has_orderflow=has_orderflow,
     )
 
     # Final model fit strictly on `dev_rows`, evaluated once on untouched `holdout_rows`.
@@ -316,9 +359,7 @@ def run_offline_experiment(
         use_available_time=use_available_time,
     )
     has_sentiment = bool(sentiment_observations) and any(
-        abs(r.features["sentiment_net_score"]) > 0.0
-        or r.features["sentiment_article_count_log"] > 0.0
-        for r in rows
+        r.features.get("sentiment_missing") == 0.0 for r in rows
     )
     return evaluate_feature_rows_experiment(
         rows,
@@ -345,9 +386,7 @@ def build_model_artifact(
         use_available_time=use_available_time,
     )
     has_sentiment = bool(sentiment_observations) and any(
-        abs(r.features["sentiment_net_score"]) > 0.0
-        or r.features["sentiment_article_count_log"] > 0.0
-        for r in rows
+        r.features.get("sentiment_missing") == 0.0 for r in rows
     )
     report = evaluate_feature_rows_experiment(
         rows,
@@ -361,13 +400,9 @@ def build_model_artifact(
         holdout_fraction=config.holdout_fraction,
         embargo_bars=config.embargo_bars,
     )
-    active_features = (
-        ALL_FEATURE_NAMES
-        if has_sentiment
-        else (
-            *FEATURE_FAMILIES[FeatureFamily.TECHNICAL],
-            *FEATURE_FAMILIES[FeatureFamily.STRUCTURE_PIVOT],
-        )
+    active_features, _ = _resolve_active_ml_features(
+        dev_rows,
+        has_sentiment=has_sentiment,
     )
     x_dev, y_dev, _ = _extract_matrix(dev_rows, active_features)
     final_pipeline = CalibratedLogisticPipeline(
@@ -410,6 +445,7 @@ def build_model_artifact(
         bias=float(final_pipeline.model.bias_),
         platt_a=float(final_pipeline.calibrator.a),
         platt_b=float(final_pipeline.calibrator.b),
+        base_rate=float(final_pipeline.base_rate_),
         seen_regimes=seen_regimes,
         accepted=report.accepted,
         created_at=report.created_at,

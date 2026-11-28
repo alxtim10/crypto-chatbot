@@ -3,20 +3,29 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import time
 from collections.abc import Callable, Sequence
 from datetime import UTC, date, datetime
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 
-from crypto_chatbot.llm.guard import validate_narration
+from crypto_chatbot.llm.guard import (
+    log_guard_violations,
+    validate_conversational_answer,
+    validate_narration,
+)
 from crypto_chatbot.llm.prompts import (
     ANALYSIS_SYSTEM_PROMPT,
+    CONVERSATIONAL_QA_SYSTEM_PROMPT,
+    INTENT_CLASSIFIER_SYSTEM_PROMPT,
     PROMPT_VERSION,
     build_narration_user_payload,
+    sanitize_untrusted_text,
 )
 from crypto_chatbot.schemas.analysis import AnalysisSnapshot
 from crypto_chatbot.schemas.llm import (
@@ -25,6 +34,8 @@ from crypto_chatbot.schemas.llm import (
     NarrationStatus,
 )
 from crypto_chatbot.schemas.market import QualityStatus
+
+logger = logging.getLogger(__name__)
 
 
 class RawGeminiOutput(BaseModel):
@@ -151,6 +162,66 @@ class DailyQuotaTracker:
         return True, None
 
 
+class NlpIntentClassification(BaseModel):
+    """Structured Layer-2 intent classification extracted from casual chat."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    intent: Literal[
+        "analyze",
+        "analyze_detail",
+        "compare",
+        "pine",
+        "scan",
+        "screen",
+        "whale",
+        "chat_qa",
+        "unsupported",
+    ]
+    symbols: tuple[str, ...] = ()
+    timeframe: Literal["15m", "1h", "4h", "1d", "scalp", "scalping", "intraday", "swing"] | None = (
+        None
+    )
+    screen_side: Literal["all", "long", "short"] | None = None
+    whale_action: Literal["overview", "wallet", "add", "remove", "list"] | None = None
+    whale_address: str | None = None
+
+
+class ConversationalAnswer(BaseModel):
+    """Structured answer for educational or contextual research Q&A."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    answer: str = Field(min_length=1, max_length=2500)
+
+
+class IntentClassificationOutcome(BaseModel):
+    """Diagnostic wrapper around `NlpIntentClassification` for routing trace logging."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    classification: NlpIntentClassification | None = None
+    failure_reason: str | None = None
+    model_id: str
+    latency_ms: int = Field(ge=0)
+    prompt_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
+
+
+class ConversationalQaOutcome(BaseModel):
+    """Diagnostic wrapper around `ConversationalAnswer` for routing trace logging."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    answer: str | None = None
+    failure_reason: str | None = None
+    guard_violations: tuple[str, ...] = ()
+    model_id: str
+    latency_ms: int = Field(ge=0)
+    prompt_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
+
+
 class NarrationOutcome(BaseModel):
     """Full audit outcome of narrating an `AnalysisSnapshot` with Gemini."""
 
@@ -178,6 +249,7 @@ class GeminiNarrator:
         max_output_tokens: int = 1024,
         temperature: float = 0.2,
         quota_tracker: DailyQuotaTracker | None = None,
+        max_guard_retries: int = 1,
     ) -> None:
         if not model.strip():
             raise ValueError("model must not be blank")
@@ -185,12 +257,15 @@ class GeminiNarrator:
             raise ValueError("timeout_seconds must be positive")
         if max_output_tokens < 64:
             raise ValueError("max_output_tokens must be >= 64")
+        if max_guard_retries < 0:
+            raise ValueError("max_guard_retries must be >= 0")
         self._model = model.strip()
         self._transport = transport
         self._timeout_seconds = timeout_seconds
         self._max_output_tokens = max_output_tokens
         self._temperature = temperature
         self._quota_tracker = quota_tracker
+        self._max_guard_retries = max_guard_retries
         self._response_schema = LlmAnalysisNarration.model_json_schema()
 
     def _fallback(
@@ -255,82 +330,337 @@ class GeminiNarrator:
             external_data=external_data,
         )
 
+        current_payload = payload
+        last_reasons: tuple[str, ...] = ()
+        resolved_model = self._model
+        prompt_tokens: int | None = None
+        output_tokens: int | None = None
+
+        for attempt in range(1, self._max_guard_retries + 2):
+            try:
+                raw = await asyncio.wait_for(
+                    self._transport.generate_json(
+                        model=self._model,
+                        system_instruction=ANALYSIS_SYSTEM_PROMPT,
+                        contents=current_payload,
+                        response_json_schema=self._response_schema,
+                        max_output_tokens=self._max_output_tokens,
+                        temperature=self._temperature,
+                    ),
+                    timeout=self._timeout_seconds,
+                )
+            except TimeoutError:
+                return self._fallback(
+                    snapshot,
+                    status=NarrationStatus.FALLBACK_DETERMINISTIC,
+                    reasons=("gemini_timeout",),
+                    start_monotonic=started,
+                )
+            except Exception as exc:
+                return self._fallback(
+                    snapshot,
+                    status=NarrationStatus.FALLBACK_DETERMINISTIC,
+                    reasons=(f"gemini_error:{type(exc).__name__}",),
+                    start_monotonic=started,
+                )
+
+            resolved_model = raw.model_version or self._model
+            prompt_tokens = raw.prompt_tokens
+            output_tokens = raw.output_tokens
+            if not raw.text or not raw.text.strip():
+                last_reasons = ("malformed_or_invalid_schema",)
+                log_guard_violations(last_reasons, model_version=resolved_model, attempt=attempt)
+                break
+
+            try:
+                narration = LlmAnalysisNarration.model_validate_json(raw.text)
+            except (ValidationError, ValueError):
+                last_reasons = ("malformed_or_invalid_schema",)
+                log_guard_violations(last_reasons, model_version=resolved_model, attempt=attempt)
+                break
+
+            guard_result = validate_narration(narration, snapshot)
+            if guard_result.is_valid:
+                elapsed_ms = max(0, int((time.monotonic() - started) * 1000))
+                return NarrationOutcome(
+                    response=AnalysisResponse(
+                        snapshot=snapshot,
+                        narration_status=NarrationStatus.GENERATED,
+                        narration=narration,
+                    ),
+                    model_id=resolved_model,
+                    prompt_version=PROMPT_VERSION,
+                    validation_passed=True,
+                    rejection_reasons=(),
+                    latency_ms=elapsed_ms,
+                    prompt_tokens=prompt_tokens,
+                    output_tokens=output_tokens,
+                )
+
+            last_reasons = guard_result.reasons
+            log_guard_violations(last_reasons, model_version=resolved_model, attempt=attempt)
+            if attempt <= self._max_guard_retries:
+                feedback = ", ".join(last_reasons)
+                current_payload = (
+                    f"{payload}\n\n[GUARD_RETRY_FEEDBACK] Previous output failed validation "
+                    f"with violations: {feedback}. Regenerate using ONLY valid non-NONE "
+                    "{F<n>} placeholders and zero raw digits."
+                )
+
+        return self._fallback(
+            snapshot,
+            status=NarrationStatus.FALLBACK_DETERMINISTIC,
+            reasons=last_reasons or ("guard_rejected",),
+            start_monotonic=started,
+            model_id=resolved_model,
+            prompt_tokens=prompt_tokens,
+            output_tokens=output_tokens,
+        )
+
+    async def classify_intent_with_diagnostics(
+        self,
+        text: str,
+        *,
+        user_id: int | str = "anonymous",
+        recent_symbols: Sequence[str] = (),
+    ) -> IntentClassificationOutcome:
+        """Classify natural-language chat intent and return failure/token diagnostics."""
+        started = time.monotonic()
+
+        def _elapsed() -> int:
+            return max(0, int((time.monotonic() - started) * 1000))
+
+        if not text.strip():
+            return IntentClassificationOutcome(
+                failure_reason="empty_input",
+                model_id=self._model,
+                latency_ms=_elapsed(),
+            )
+        if self._quota_tracker is not None:
+            allowed, cap_reason = self._quota_tracker.try_consume(user_id)
+            if not allowed:
+                return IntentClassificationOutcome(
+                    failure_reason=cap_reason or "quota_exceeded",
+                    model_id=self._model,
+                    latency_ms=_elapsed(),
+                )
+
+        payload = json.dumps(
+            {
+                "recent_symbols": list(recent_symbols[:3]),
+                "user_message": f"<untrusted_data>{sanitize_untrusted_text(text)}</untrusted_data>",
+            },
+            ensure_ascii=False,
+        )
+        resolved_model = self._model
+        prompt_tokens: int | None = None
+        output_tokens: int | None = None
         try:
             raw = await asyncio.wait_for(
                 self._transport.generate_json(
                     model=self._model,
-                    system_instruction=ANALYSIS_SYSTEM_PROMPT,
+                    system_instruction=INTENT_CLASSIFIER_SYSTEM_PROMPT,
                     contents=payload,
-                    response_json_schema=self._response_schema,
-                    max_output_tokens=self._max_output_tokens,
-                    temperature=self._temperature,
+                    response_json_schema=NlpIntentClassification.model_json_schema(),
+                    max_output_tokens=200,
+                    temperature=0.0,
                 ),
                 timeout=self._timeout_seconds,
             )
+            resolved_model = raw.model_version or self._model
+            prompt_tokens = raw.prompt_tokens
+            output_tokens = raw.output_tokens
+            if not raw.text or not raw.text.strip():
+                return IntentClassificationOutcome(
+                    failure_reason="empty_response",
+                    model_id=resolved_model,
+                    latency_ms=_elapsed(),
+                    prompt_tokens=prompt_tokens,
+                    output_tokens=output_tokens,
+                )
+            raw_obj = json.loads(raw.text)
+            if isinstance(raw_obj, dict):
+                if isinstance(raw_obj.get("timeframe"), str):
+                    raw_obj["timeframe"] = raw_obj["timeframe"].strip().lower() or None
+                if isinstance(raw_obj.get("screen_side"), str):
+                    raw_obj["screen_side"] = raw_obj["screen_side"].strip().lower() or None
+                classified = NlpIntentClassification.model_validate(raw_obj)
+            else:
+                classified = NlpIntentClassification.model_validate_json(raw.text)
+            return IntentClassificationOutcome(
+                classification=classified,
+                model_id=resolved_model,
+                latency_ms=_elapsed(),
+                prompt_tokens=prompt_tokens,
+                output_tokens=output_tokens,
+            )
         except TimeoutError:
-            return self._fallback(
-                snapshot,
-                status=NarrationStatus.FALLBACK_DETERMINISTIC,
-                reasons=("gemini_timeout",),
-                start_monotonic=started,
+            logger.debug("Gemini classify_intent fallback: timeout")
+            return IntentClassificationOutcome(
+                failure_reason="timeout",
+                model_id=resolved_model,
+                latency_ms=_elapsed(),
+                prompt_tokens=prompt_tokens,
+                output_tokens=output_tokens,
+            )
+        except (json.JSONDecodeError, ValidationError, ValueError) as exc:
+            logger.debug("Gemini classify_intent fallback: %s", exc)
+            return IntentClassificationOutcome(
+                failure_reason="invalid_json_or_schema",
+                model_id=resolved_model,
+                latency_ms=_elapsed(),
+                prompt_tokens=prompt_tokens,
+                output_tokens=output_tokens,
             )
         except Exception as exc:
-            return self._fallback(
-                snapshot,
-                status=NarrationStatus.FALLBACK_DETERMINISTIC,
-                reasons=(f"gemini_error:{type(exc).__name__}",),
-                start_monotonic=started,
-            )
-
-        resolved_model = raw.model_version or self._model
-        if not raw.text or not raw.text.strip():
-            return self._fallback(
-                snapshot,
-                status=NarrationStatus.FALLBACK_DETERMINISTIC,
-                reasons=("malformed_or_invalid_schema",),
-                start_monotonic=started,
+            logger.debug("Gemini classify_intent fallback: %s", exc)
+            return IntentClassificationOutcome(
+                failure_reason=f"error:{type(exc).__name__}",
                 model_id=resolved_model,
-                prompt_tokens=raw.prompt_tokens,
-                output_tokens=raw.output_tokens,
+                latency_ms=_elapsed(),
+                prompt_tokens=prompt_tokens,
+                output_tokens=output_tokens,
             )
 
-        try:
-            narration = LlmAnalysisNarration.model_validate_json(raw.text)
-        except (ValidationError, ValueError):
-            return self._fallback(
-                snapshot,
-                status=NarrationStatus.FALLBACK_DETERMINISTIC,
-                reasons=("malformed_or_invalid_schema",),
-                start_monotonic=started,
-                model_id=resolved_model,
-                prompt_tokens=raw.prompt_tokens,
-                output_tokens=raw.output_tokens,
-            )
-
-        guard_result = validate_narration(narration, snapshot)
-        if not guard_result.is_valid:
-            return self._fallback(
-                snapshot,
-                status=NarrationStatus.FALLBACK_DETERMINISTIC,
-                reasons=guard_result.reasons,
-                start_monotonic=started,
-                model_id=resolved_model,
-                prompt_tokens=raw.prompt_tokens,
-                output_tokens=raw.output_tokens,
-            )
-
-        elapsed_ms = max(0, int((time.monotonic() - started) * 1000))
-        return NarrationOutcome(
-            response=AnalysisResponse(
-                snapshot=snapshot,
-                narration_status=NarrationStatus.GENERATED,
-                narration=narration,
-            ),
-            model_id=resolved_model,
-            prompt_version=PROMPT_VERSION,
-            validation_passed=True,
-            rejection_reasons=(),
-            latency_ms=elapsed_ms,
-            prompt_tokens=raw.prompt_tokens,
-            output_tokens=raw.output_tokens,
+    async def classify_intent(
+        self,
+        text: str,
+        *,
+        user_id: int | str = "anonymous",
+        recent_symbols: Sequence[str] = (),
+    ) -> NlpIntentClassification | None:
+        """Classify natural-language chat intent into structured backend routing metadata."""
+        outcome = await self.classify_intent_with_diagnostics(
+            text,
+            user_id=user_id,
+            recent_symbols=recent_symbols,
         )
+        return outcome.classification
+
+    async def answer_research_question_with_diagnostics(
+        self,
+        question: str,
+        *,
+        user_id: int | str = "anonymous",
+        user_context: str | None = None,
+    ) -> ConversationalQaOutcome:
+        """Answer an educational or contextual follow-up question and return diagnostics."""
+        started = time.monotonic()
+
+        def _elapsed() -> int:
+            return max(0, int((time.monotonic() - started) * 1000))
+
+        if not question.strip():
+            return ConversationalQaOutcome(
+                failure_reason="empty_input",
+                model_id=self._model,
+                latency_ms=_elapsed(),
+            )
+        if self._quota_tracker is not None:
+            allowed, cap_reason = self._quota_tracker.try_consume(user_id)
+            if not allowed:
+                return ConversationalQaOutcome(
+                    failure_reason=cap_reason or "quota_exceeded",
+                    model_id=self._model,
+                    latency_ms=_elapsed(),
+                )
+
+        context_block = (
+            f"<untrusted_data>\n{sanitize_untrusted_text(user_context)}\n</untrusted_data>"
+            if user_context and user_context.strip()
+            else "(belum ada riwayat analisa)"
+        )
+        safe_q = sanitize_untrusted_text(question)
+        payload = (
+            f"Konteks percakapan sebelumnya:\n{context_block}\n\n"
+            f"Pertanyaan pengguna:\n<untrusted_data>{safe_q}</untrusted_data>"
+        )
+        resolved_model = self._model
+        prompt_tokens: int | None = None
+        output_tokens: int | None = None
+        try:
+            raw = await asyncio.wait_for(
+                self._transport.generate_json(
+                    model=self._model,
+                    system_instruction=CONVERSATIONAL_QA_SYSTEM_PROMPT,
+                    contents=payload,
+                    response_json_schema=ConversationalAnswer.model_json_schema(),
+                    max_output_tokens=self._max_output_tokens,
+                    temperature=0.3,
+                ),
+                timeout=self._timeout_seconds,
+            )
+            resolved_model = raw.model_version or self._model
+            prompt_tokens = raw.prompt_tokens
+            output_tokens = raw.output_tokens
+            if not raw.text or not raw.text.strip():
+                return ConversationalQaOutcome(
+                    failure_reason="empty_response",
+                    model_id=resolved_model,
+                    latency_ms=_elapsed(),
+                    prompt_tokens=prompt_tokens,
+                    output_tokens=output_tokens,
+                )
+            parsed = ConversationalAnswer.model_validate_json(raw.text)
+            answer = parsed.answer.strip()
+            guard = validate_conversational_answer(answer)
+            if not guard.is_valid:
+                logger.warning(
+                    "Blocked conversational QA response by guard user_id=%s reasons=%s",
+                    user_id,
+                    ",".join(guard.reasons),
+                )
+                return ConversationalQaOutcome(
+                    failure_reason="guard_rejected",
+                    guard_violations=guard.reasons,
+                    model_id=resolved_model,
+                    latency_ms=_elapsed(),
+                    prompt_tokens=prompt_tokens,
+                    output_tokens=output_tokens,
+                )
+            return ConversationalQaOutcome(
+                answer=answer,
+                model_id=resolved_model,
+                latency_ms=_elapsed(),
+                prompt_tokens=prompt_tokens,
+                output_tokens=output_tokens,
+            )
+        except TimeoutError:
+            return ConversationalQaOutcome(
+                failure_reason="timeout",
+                model_id=resolved_model,
+                latency_ms=_elapsed(),
+                prompt_tokens=prompt_tokens,
+                output_tokens=output_tokens,
+            )
+        except (ValidationError, ValueError):
+            return ConversationalQaOutcome(
+                failure_reason="invalid_json_or_schema",
+                model_id=resolved_model,
+                latency_ms=_elapsed(),
+                prompt_tokens=prompt_tokens,
+                output_tokens=output_tokens,
+            )
+        except Exception as exc:
+            return ConversationalQaOutcome(
+                failure_reason=f"error:{type(exc).__name__}",
+                model_id=resolved_model,
+                latency_ms=_elapsed(),
+                prompt_tokens=prompt_tokens,
+                output_tokens=output_tokens,
+            )
+
+    async def answer_research_question(
+        self,
+        question: str,
+        *,
+        user_id: int | str = "anonymous",
+        user_context: str | None = None,
+    ) -> str | None:
+        """Answer an educational or contextual follow-up question safely."""
+        outcome = await self.answer_research_question_with_diagnostics(
+            question,
+            user_id=user_id,
+            user_context=user_context,
+        )
+        return outcome.answer
