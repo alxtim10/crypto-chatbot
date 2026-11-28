@@ -17,7 +17,9 @@ from datetime import UTC, datetime
 
 import pytest
 
-from crypto_chatbot.alerts.mtf import evaluate_htf_bias
+from crypto_chatbot.alerts.config import MtfTimeframesConfig, QuietHoursWib, ScreenerConfig
+from crypto_chatbot.alerts.mtf import evaluate_htf_bias_from_snapshot
+from crypto_chatbot.alerts.worker import run_alert_cycle
 from crypto_chatbot.analysis.mtf import evaluate_timeframe_context
 from crypto_chatbot.analysis.scanner import scan_market_setups
 from crypto_chatbot.analysis.service import AnalysisService, build_analysis_snapshot
@@ -250,19 +252,156 @@ async def test_mtf_parity_across_standalone_analyze_15m_alerts_and_scanner() -> 
     assert ov_by_tf[Timeframe.H1].market_structure is snap_1h.market_structure
     assert ov_by_tf[Timeframe.H1].adx_14 == pytest.approx(snap_1h.technical.adx_14)
 
-    # 3. `alerts run` MTF bias gate (uses the exact same shared evaluator!)
-    bias_eval = evaluate_htf_bias(
-        {Timeframe.H4: c_4h_with_forming, Timeframe.H1: c_1h_with_forming},
+    # 3. `alerts run` MTF bias gate (reads directly from `analyze_with_batches` snapshot!)
+    bias_eval = evaluate_htf_bias_from_snapshot(
+        snap_15m,
         (Timeframe.H4, Timeframe.H1),
-        cutoff=t_15m,
-        expected_venue="gate",
     )
+    assert bias_eval.missing_data is False
     assert bias_eval.per_tf_regime["4h"] is snap_4h.regime
     assert bias_eval.per_tf_structure["4h"] is snap_4h.market_structure
     assert bias_eval.per_tf_adx_14["4h"] == pytest.approx(snap_4h.technical.adx_14)
     assert bias_eval.per_tf_regime["1h"] is snap_1h.regime
     assert bias_eval.per_tf_structure["1h"] is snap_1h.market_structure
     assert bias_eval.per_tf_adx_14["1h"] == pytest.approx(snap_1h.technical.adx_14)
+    assert "unknown" not in bias_eval.reason.lower()
+
+    # 3b. End-to-end `run_alert_cycle` dry-run on the same AnalysisService produces identical 4h/1h
+    from collections.abc import Sequence
+    from typing import Any
+
+    from crypto_chatbot.storage.repositories import AlertRecord, AlertRunRecord, AlertSymbolState
+
+    class _ParityAlertRepo:
+        def __init__(self) -> None:
+            self.runs: dict[str, AlertRunRecord] = {}
+            self.states: dict[tuple[str, Timeframe], AlertSymbolState] = {}
+
+        def try_acquire_advisory_lock(self, lock_key: int) -> bool:
+            del lock_key
+            return True
+
+        def release_advisory_lock(self, lock_key: int) -> None:
+            del lock_key
+
+        def has_completed_run(self, run_id: str) -> bool:
+            r = self.runs.get(run_id)
+            return r is not None and r.status == "completed"
+
+        def record_run_start(self, run: AlertRunRecord) -> bool:
+            self.runs[run.run_id] = run
+            return True
+
+        def record_run_finish(
+            self,
+            run_id: str,
+            *,
+            status: str,
+            finished_at: datetime,
+            scanned_count: int,
+            ready_count: int,
+            alerted_count: int,
+            held_digest_count: int,
+            failed_symbols: Sequence[str],
+            symbol_errors: dict[str, str],
+            armed_count: int = 0,
+            expired_count: int = 0,
+            stage_failures: dict[str, dict[str, str]] | None = None,
+        ) -> None:
+            self.runs[run_id] = self.runs[run_id].model_copy(
+                update={
+                    "status": status,
+                    "finished_at": finished_at,
+                    "scanned_count": scanned_count,
+                    "ready_count": ready_count,
+                    "armed_count": armed_count,
+                    "expired_count": expired_count,
+                    "alerted_count": alerted_count,
+                    "held_digest_count": held_digest_count,
+                    "failed_symbols": tuple(failed_symbols),
+                    "symbol_errors": dict(symbol_errors),
+                    "stage_failures": {k: dict(v) for k, v in (stage_failures or {}).items()},
+                }
+            )
+
+        def get_latest_completed_run(self) -> AlertRunRecord | None:
+            return None
+
+        def list_recent_runs(self, *, since: datetime) -> tuple[AlertRunRecord, ...]:
+            del since
+            return tuple(self.runs.values())
+
+        def get_symbol_state(self, sym: str, tf: Timeframe) -> AlertSymbolState | None:
+            return self.states.get((sym, tf))
+
+        def upsert_symbol_state(self, state: AlertSymbolState) -> None:
+            self.states[(state.canonical_symbol, state.timeframe)] = state
+
+        def mute_symbol(self, *args: Any, **kwargs: Any) -> None:
+            del args, kwargs
+
+        def create_alert(self, alert: AlertRecord) -> bool:
+            del alert
+            return True
+
+        def list_pending_alerts(self, *, limit: int = 50) -> tuple[AlertRecord, ...]:
+            del limit
+            return ()
+
+        def list_held_digest_alerts(
+            self, *, since: datetime | None = None
+        ) -> tuple[AlertRecord, ...]:
+            del since
+            return ()
+
+        def list_recent_alerts(self, *, since: datetime) -> tuple[AlertRecord, ...]:
+            del since
+            return ()
+
+        def mark_alert_sent(self, *args: Any, **kwargs: Any) -> None:
+            del args, kwargs
+
+        def mark_alert_failed(self, *args: Any, **kwargs: Any) -> None:
+            del args, kwargs
+
+        def mark_alerts_digest_sent(self, *args: Any, **kwargs: Any) -> int:
+            del args, kwargs
+            return 0
+
+        def get_alert_by_id(self, alert_id: str) -> AlertRecord | None:
+            del alert_id
+            return None
+
+        def get_alert_by_snapshot_id(self, snapshot_id: str) -> AlertRecord | None:
+            del snapshot_id
+            return None
+
+    alert_repo = _ParityAlertRepo()
+    mtf_cfg = ScreenerConfig(
+        mtf_timeframes=MtfTimeframesConfig(
+            bias=(Timeframe.H4, Timeframe.H1),
+            setup=Timeframe.M15,
+            confirm=Timeframe.M5,
+        ),
+        timeframes=(Timeframe.M15,),
+        quiet_hours_wib=QuietHoursWib(enabled=False),
+    )
+    cycle = await run_alert_cycle(
+        analysis_service=mtf_svc,
+        alert_repo=alert_repo,
+        screener_config=mtf_cfg,
+        symbols=("BTC/USDT:USDT",),
+        dry_run=True,
+        clock=lambda: t_15m,
+    )
+    btc_stage = cycle.results[0].stage_failures["BTC/USDT:USDT"]
+    assert btc_stage["stage"] == "bias"
+    assert snap_4h.market_structure is not None
+    assert f"4h={snap_4h.regime.value}/{snap_4h.market_structure.value}" in btc_stage["reason"]
+    assert snap_1h.regime is not None
+    assert snap_1h.market_structure is not None
+    assert f"1h={snap_1h.regime.value}/{snap_1h.market_structure.value}" in btc_stage["reason"]
+    assert "unknown" not in btc_stage["reason"].lower()
 
     # 4. Scanner (`scan_market_setups`) produces the exact same 4h/1h parity inside its 15m snapshot
     captured: list[AnalysisSnapshot] = []

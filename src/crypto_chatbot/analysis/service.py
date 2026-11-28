@@ -1783,109 +1783,31 @@ class AnalysisService:
 
         return batches, pinned_provider, pinned_venue
 
-    async def fetch_mtf_candle_bundle(
+    async def warmup_candles(
         self,
         symbol: str,
-        timeframe_limits: Mapping[Timeframe, int],
+        timeframes: Sequence[Timeframe],
         *,
-        as_of: datetime | None = None,
-        incremental: bool = True,
-    ) -> tuple[dict[Timeframe, OhlcvBatch], str]:
-        """Fetch closed candles for all MTF timeframes from ONE venue, incrementally when cached."""
+        limit: int = DEFAULT_CANDLE_LIMIT,
+    ) -> dict[str, int]:
+        """Idempotently prefill `market_candles` for one symbol across timeframes from one venue."""
         mapping = resolve_default_perp_symbol(symbol)
-        cutoff = (as_of or datetime.now(UTC)).astimezone(UTC)
-
-        cached_by_tf: dict[Timeframe, tuple[MarketCandle, ...]] = {}
-        fetch_reqs: list[tuple[Timeframe, int]] = []
-
-        # Attempt incremental lookahead using cached closed candles from the primary venue.
-        candidate_venue: str | None = None
-        if isinstance(self._provider, FallbackMarketDataProvider):
-            for entry in getattr(self._provider, "_entries", ()):
-                v_name = getattr(entry, "venue", None)
-                if v_name:
-                    candidate_venue = str(v_name)
-                    break
-        else:
-            raw_v = getattr(self._provider, "venue", None)
-            if raw_v:
-                candidate_venue = str(raw_v)
-
-        for tf, full_limit in timeframe_limits.items():
-            req_limit = max(1, int(full_limit))
-            if incremental and self._repository is not None and candidate_venue:
-                try:
-                    cached = self._repository.load_candles(
-                        venue=candidate_venue,
-                        canonical_symbol=mapping.canonical_symbol,
-                        market_type=MarketType.PERPETUAL,
-                        timeframe=tf,
-                        end_close_time=cutoff,
-                        limit=req_limit,
-                    )
-                except Exception:
-                    cached = ()
-                if len(cached) >= min(req_limit, 60):
-                    cached_by_tf[tf] = cached
-                    last_close = cached[-1].close_time.astimezone(UTC)
-                    step_s = max(1, int(tf.duration.total_seconds()))
-                    elapsed_bars = max(0, int((cutoff - last_close).total_seconds() // step_s))
-                    req_limit = min(req_limit, max(12, elapsed_bars + 6))
-            fetch_reqs.append((tf, req_limit))
-
-        batches, _pinned_provider, pinned_venue = await self._fetch_timeframe_bundle(
+        unique_tfs = tuple(dict.fromkeys(timeframes))
+        requests = [(tf, limit) for tf in unique_tfs]
+        batches, _pinned_provider, _pinned_venue = await self._fetch_timeframe_bundle(
             mapping.canonical_symbol,
-            fetch_reqs,
+            requests,
         )
-
-        # Enforce strict single-venue consistency across all fetched timeframes.
-        venues: set[str] = set()
-        for batch in batches.values():
-            if not batch.candles:
+        counts: dict[str, int] = {}
+        for tf in unique_tfs:
+            batch = batches.get(tf)
+            if batch is None or batch.has_provider_error or not batch.candles:
+                counts[tf.value] = 0
                 continue
-            if batch.metadata.venue.strip():
-                venues.add(batch.metadata.venue.strip().lower())
-            for c in batch.candles:
-                if c.venue.strip():
-                    venues.add(c.venue.strip().lower())
-        if len(venues) > 1:
-            raise ValueError(f"mixed_venue_detected: {sorted(venues)}")
-
-        resolved_venue = (
-            next(iter(venues)) if venues else (pinned_venue or candidate_venue or "unknown").lower()
-        )
-
-        merged_batches: dict[Timeframe, OhlcvBatch] = {}
-        for tf, full_limit in timeframe_limits.items():
-            batch = batches[tf]
-            fresh_closed = [
-                c
-                for c in batch.candles
-                if c.close_time.astimezone(UTC) <= cutoff
-                and c.available_time.astimezone(UTC) <= cutoff
-            ]
-            if self._repository is not None and fresh_closed:
-                try:
-                    self._repository.save_candles(fresh_closed)
-                except Exception as exc:
-                    logger.debug("Incremental candle save skipped for %s %s: %s", symbol, tf, exc)
-
-            cached = cached_by_tf.get(tf, ())
-            if cached and cached[0].venue.strip().lower() == resolved_venue:
-                by_open: dict[datetime, MarketCandle] = {
-                    c.open_time.astimezone(UTC): c for c in cached
-                }
-                for c in fresh_closed:
-                    by_open[c.open_time.astimezone(UTC)] = c
-                combined = tuple(
-                    by_open[k] for k in sorted(by_open.keys())[-max(1, int(full_limit)) :]
-                )
-            else:
-                combined = tuple(fresh_closed[-max(1, int(full_limit)) :])
-
-            merged_batches[tf] = batch.model_copy(update={"candles": combined})
-
-        return merged_batches, resolved_venue
+            if self._repository is not None:
+                self._repository.save_candles(batch.candles)
+            counts[tf.value] = len(batch.candles)
+        return counts
 
     async def analyze_multi_style(
         self,
@@ -2051,6 +1973,31 @@ class AnalysisService:
         persist: bool = True,
     ) -> AnalysisSnapshot:
         """Fetch market data, build an `AnalysisSnapshot`, and optionally persist it."""
+        snapshot, _ = await self.analyze_with_batches(
+            symbol,
+            timeframe,
+            limit=limit,
+            include_mtf=include_mtf,
+            include_derivatives=include_derivatives,
+            persist=persist,
+        )
+        return snapshot
+
+    async def analyze_with_batches(
+        self,
+        symbol: str,
+        timeframe: Timeframe,
+        *,
+        limit: int = DEFAULT_CANDLE_LIMIT,
+        include_mtf: bool = True,
+        include_derivatives: bool = True,
+        persist: bool = True,
+    ) -> tuple[AnalysisSnapshot, dict[Timeframe, OhlcvBatch]]:
+        """Shared top-down analysis path returning `(AnalysisSnapshot, batches_by_tf)`.
+
+        Used by both CLI/bot `analyze` and `alerts run` so 4h/1h/15m/5m candles,
+        regimes, market structure, and setups are guaranteed identical.
+        """
         mapping = resolve_default_perp_symbol(symbol)
         other_tfs = (
             [tf for tf in (Timeframe.H1, Timeframe.H4, Timeframe.D1) if tf is not timeframe]
@@ -2474,7 +2421,10 @@ class AnalysisService:
         if persist and self._setup_repository is not None and snapshot.trade_setup is not None:
             self._setup_repository.save_setup(snapshot, snapshot.trade_setup)
 
-        return snapshot
+        all_batches: dict[Timeframe, OhlcvBatch] = {timeframe: primary}
+        if mtf_batches is not None:
+            all_batches.update(mtf_batches)
+        return snapshot, all_batches
 
     def recompute_from_stored(self, snapshot_id: str) -> AnalysisSnapshot:
         """Recompute a persisted snapshot strictly from stored candles and verify identity."""
