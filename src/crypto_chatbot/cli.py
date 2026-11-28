@@ -659,9 +659,11 @@ def _resolve_alert_chat_id(explicit_chat_id: int | None = None) -> int | None:
     return None
 
 
-def _run_settle_setups(max_bars: int = 24) -> int:
+def _run_settle_setups(max_bars: int = 24, strategy: str | None = None) -> int:
     from crypto_chatbot.alerts.sender import TelegramOutboxSender
     from crypto_chatbot.alerts.worker import render_settlement_reply
+    from crypto_chatbot.scalp.alerts import render_scalp_settlement_reply
+    from crypto_chatbot.scalp.settlement import ScalpTradeSpec, settle_scalp_trade_1m
     from crypto_chatbot.storage.repositories import PostgresAlertRepository
 
     try:
@@ -677,12 +679,17 @@ def _run_settle_setups(max_bars: int = 24) -> int:
 
     updated = 0
     replies_to_send: list[tuple[int, int, str]] = []
+    strat_filter = None if strategy in (None, "", "all") else strategy
     try:
         init_db(engine)
         market_repo = PostgresMarketRepository(engine)
         setup_repo = PostgresSetupLogRepository(engine)
         alert_repo = PostgresAlertRepository(engine)
-        pending = setup_repo.list_pending_setups(limit=200)
+        pending = (
+            setup_repo.list_pending_setups(limit=200, strategy=strat_filter)
+            if strat_filter is not None
+            else setup_repo.list_pending_setups(limit=200)
+        )
         for rec in pending:
             if rec.market_type in (MarketType.SPOT.value, MarketType.PERPETUAL.value):
                 resolved_market_type = MarketType(rec.market_type)
@@ -690,6 +697,57 @@ def _run_settle_setups(max_bars: int = 24) -> int:
                 resolved_market_type = (
                     MarketType.PERPETUAL if ":" in rec.canonical_symbol else MarketType.SPOT
                 )
+
+            if rec.strategy == "scalp_v1" and (
+                rec.entry_mid is not None
+                and rec.stop_loss is not None
+                and rec.tp1 is not None
+                and rec.tp2 is not None
+                and rec.bias in ("long", "short")
+            ):
+                candles_1m = market_repo.load_candles(
+                    venue=rec.venue,
+                    canonical_symbol=rec.canonical_symbol,
+                    market_type=resolved_market_type,
+                    timeframe=Timeframe.M1,
+                    start_open_time=rec.as_of,
+                )
+                scalp_spec = ScalpTradeSpec(
+                    direction="long" if rec.bias == "long" else "short",
+                    entry_limit=rec.entry_mid,
+                    stop_loss=rec.stop_loss,
+                    tp1=rec.tp1,
+                    tp2=rec.tp2,
+                    signal_time_utc=rec.as_of,
+                )
+                scalp_out = settle_scalp_trade_1m(scalp_spec, candles_1m)
+                outcome_status = scalp_out.status.value
+                settled_at = scalp_out.exit_time_utc if scalp_out.is_final else None
+                realized_r = scalp_out.net_r if scalp_out.is_final else None
+                if outcome_status != rec.outcome_status or settled_at != rec.settled_at:
+                    setup_repo.update_settlement(
+                        rec.snapshot_id,
+                        outcome_status=outcome_status,
+                        settled_at=settled_at,
+                        realized_r=realized_r,
+                    )
+                    updated += 1
+                    chat_id = rec.telegram_chat_id
+                    msg_id = rec.telegram_message_id
+                    if chat_id is None or msg_id is None:
+                        linked = alert_repo.get_alert_by_snapshot_id(rec.snapshot_id)
+                        if linked is not None:
+                            chat_id = chat_id or linked.chat_id
+                            msg_id = msg_id or linked.telegram_message_id
+                    if chat_id is not None and msg_id is not None:
+                        reply_html = render_scalp_settlement_reply(
+                            canonical_symbol=rec.canonical_symbol,
+                            snapshot_id=rec.snapshot_id,
+                            outcome=scalp_out,
+                        )
+                        replies_to_send.append((chat_id, msg_id, reply_html))
+                continue
+
             future_candles = market_repo.load_candles(
                 venue=rec.venue,
                 canonical_symbol=rec.canonical_symbol,
@@ -2350,13 +2408,14 @@ def _run_alerts(
             )
         return 0
 
-    symbols = load_universe(universe_path or screener_cfg.universe_path)
+    symbols = load_universe(universe_path or screener_cfg.effective_universe_path)
 
     if action == "run":
         active_sha = compute_active_params_sha256(
             screener_config=screener_cfg,
             universe=symbols,
         )
+        freeze_hint = "scalp_v1" if screener_cfg.is_scalp_mode else "v3"
         frozen_target = frozen_params_path or Path("frozen_params.json")
         if frozen_target.is_file():
             try:
@@ -2373,7 +2432,8 @@ def _run_alerts(
                     mismatch_msg = (
                         f"params_sha256 mismatch: active={active_sha[:12]}... "
                         f"!= frozen={frozen_art.params_sha256[:12]}... ({frozen_target}). "
-                        "Run `crypto-chatbot freeze-params v3` to update or pass --allow-unfrozen."
+                        f"Run `crypto-chatbot freeze-params {freeze_hint}` "
+                        "to update or pass --allow-unfrozen."
                     )
                     if not allow_unfrozen:
                         print(f"Error: {mismatch_msg}", file=sys.stderr)
@@ -2383,7 +2443,7 @@ def _run_alerts(
         else:
             print(
                 f"Warning: {frozen_target} not found (active params_sha256={active_sha[:12]}...). "
-                "Run `crypto-chatbot freeze-params v3` to freeze parameters.",
+                f"Run `crypto-chatbot freeze-params {freeze_hint}` to freeze parameters.",
                 file=sys.stderr,
             )
 
@@ -2455,10 +2515,14 @@ def _run_alerts(
                 risk_tiers_client=risk_tiers_client,
                 resample_from=_resolve_resample_from_env(),
             )
+            from crypto_chatbot.storage.repositories import PostgresScalpDecisionRepository
+
+            decision_repo = PostgresScalpDecisionRepository(engine)
             return await run_alert_cycle(
                 analysis_service=service,
                 alert_repo=alert_repo,
                 setup_repo=setup_repo,
+                decision_repo=decision_repo,
                 sender=sender,
                 screener_config=screener_cfg,
                 symbols=symbols,
@@ -2808,6 +2872,104 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=int,
         default=24,
         help="Maximum closed candles horizon after setup as_of (default: 24).",
+    )
+    settle_parser.add_argument(
+        "--strategy",
+        choices=("all", "scalp_v1", "swing_mtf"),
+        default="all",
+        help="Filter settlement by strategy (default: all).",
+    )
+
+    universe_parser = subcommands.add_parser(
+        "universe",
+        help="Refresh point-in-time trading universe (SC-03).",
+    )
+    universe_parser.add_argument(
+        "action",
+        choices=("refresh",),
+        help="Universe action (refresh).",
+    )
+    universe_parser.add_argument(
+        "--strategy",
+        choices=("scalp_v1",),
+        default="scalp_v1",
+        help="Target strategy (default: scalp_v1).",
+    )
+    universe_parser.add_argument(
+        "--fixture",
+        type=Path,
+        default=None,
+        help="Optional JSON fixture of ScalpUniverseCandidate records for offline refresh.",
+    )
+    universe_parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("config/universe_scalp.txt"),
+        help="Output universe file path (default: config/universe_scalp.txt).",
+    )
+    universe_parser.add_argument("--json", action="store_true", help="Print JSON output.")
+
+    scalp_bt_parser = subcommands.add_parser(
+        "scalp-backtest",
+        help="Run event-driven 1m scalp_v1 backtest & generate validation report (SC-10/SC-11).",
+    )
+    scalp_bt_parser.add_argument(
+        "--fixture",
+        type=Path,
+        required=True,
+        help="JSON fixture mapping canonical symbols to closed 1m candles.",
+    )
+    scalp_bt_parser.add_argument(
+        "--report",
+        type=Path,
+        default=Path("docs/research/scalp_v1-backtest.md"),
+        help="Output markdown validation report path.",
+    )
+    scalp_bt_parser.add_argument(
+        "--trial-id",
+        type=str,
+        default="scalp_v1-trial-001",
+        help="Registered trial identifier.",
+    )
+    scalp_bt_parser.add_argument("--seed", type=int, default=42, help="Deterministic RNG seed.")
+    scalp_bt_parser.add_argument("--json", action="store_true", help="Print validation JSON.")
+
+    export_fx_parser = subcommands.add_parser(
+        "export-scalp-fixture",
+        help="Export 1m perpetual candles from PostgreSQL into a scalp-backtest JSON fixture.",
+    )
+    export_fx_parser.add_argument(
+        "--symbols",
+        default="BTC,ETH,SOL,XRP,DOGE",
+        help="Comma-separated symbols (default: BTC,ETH,SOL,XRP,DOGE).",
+    )
+    export_fx_parser.add_argument(
+        "--from",
+        dest="from_date",
+        required=True,
+        help="Start UTC date inclusive (YYYY-MM-DD).",
+    )
+    export_fx_parser.add_argument(
+        "--to",
+        dest="to_date",
+        required=True,
+        help="End UTC date inclusive (YYYY-MM-DD).",
+    )
+    export_fx_parser.add_argument(
+        "--venue",
+        default="gateio",
+        help="Venue name in market_candles (default: gateio).",
+    )
+    export_fx_parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("data/scalp_1m_fixture.json"),
+        help="Output JSON fixture path (default: data/scalp_1m_fixture.json).",
+    )
+    export_fx_parser.add_argument(
+        "--database-url",
+        default=None,
+        help="Optional PostgreSQL URL override.",
     )
     ml_parser = subcommands.add_parser(
         "ml-experiment",
@@ -3475,7 +3637,116 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "purge-expired":
         return _run_purge_expired()
     if args.command == "settle-setups":
-        return _run_settle_setups(max_bars=args.max_bars)
+        return _run_settle_setups(max_bars=args.max_bars, strategy=args.strategy)
+    if args.command == "universe":
+        from crypto_chatbot.scalp.config import DEFAULT_SCALP_UNIVERSE
+        from crypto_chatbot.scalp.universe import ScalpUniverseCandidate, refresh_scalp_universe
+
+        if args.fixture is not None:
+            raw_list = json.loads(args.fixture.read_text(encoding="utf-8"))
+            cands = [ScalpUniverseCandidate.model_validate(item) for item in raw_list]
+        else:
+            cands = [
+                ScalpUniverseCandidate(
+                    canonical_symbol=sym,
+                    base_asset=sym.split("/", 1)[0],
+                    quote_volume_24h_usd=500_000_000.0,
+                    median_spread_7d_bps=0.5,
+                    median_bid_depth_10bps_usd=500_000.0,
+                    median_ask_depth_10bps_usd=500_000.0,
+                    listing_age_days=365,
+                )
+                for sym in DEFAULT_SCALP_UNIVERSE
+            ]
+        res = refresh_scalp_universe(cands, output_path=args.output)
+        if args.json:
+            print(res.model_dump_json(indent=2))
+        else:
+            print(
+                f"universe refresh ({res.strategy}, {res.snapshot_week_utc}): "
+                f"{len(res.eligible_symbols)} eligible -> {res.output_path}"
+            )
+        return 0
+    if args.command == "scalp-backtest":
+        from crypto_chatbot.scalp.backtest import (
+            compute_scalp_validation_report,
+            run_scalp_backtest_1m,
+            write_scalp_validation_report,
+        )
+        from crypto_chatbot.scalp.config import ScalpConfig
+        from crypto_chatbot.scalp.freeze import compute_scalp_params_bundle
+        from crypto_chatbot.schemas.market import MarketCandle
+
+        raw_map = json.loads(args.fixture.read_text(encoding="utf-8"))
+        candles_by_sym = {
+            sym: [MarketCandle.model_validate(c) for c in rows] for sym, rows in raw_map.items()
+        }
+        scalp_cfg = ScalpConfig()
+        params_sha, _ = compute_scalp_params_bundle(
+            scalp_config=scalp_cfg,
+            universe=sorted(candles_by_sym.keys()),
+        )
+        bt = run_scalp_backtest_1m(candles_by_sym, config=scalp_cfg, seed=args.seed)
+        report = compute_scalp_validation_report(
+            base_result=bt,
+            candles_1m_by_symbol=candles_by_sym,
+            trial_id=args.trial_id,
+            params_sha256=params_sha,
+            config=scalp_cfg,
+            seed=args.seed,
+        )
+        write_scalp_validation_report(report, output_path=args.report)
+        if args.json:
+            print(report.model_dump_json(indent=2))
+        else:
+            print(
+                f"scalp-backtest trial={report.trial_id} filled={report.overall.filled_trades} "
+                f"net_E[R]={report.overall.expectancy_net_r:+.3f}R "
+                f"shadow_gate={report.passes_shadow_gate} -> {args.report}"
+            )
+        return 0
+    if args.command == "export-scalp-fixture":
+        from crypto_chatbot.market_data.symbols import resolve_default_perp_symbol
+
+        resolved_url = args.database_url or os.environ.get("DATABASE_URL")
+        if not resolved_url:
+            try:
+                resolved_url = load_settings().database_url.get_secret_value()
+            except Exception:
+                resolved_url = None
+        if not resolved_url:
+            print("Error: DATABASE_URL is required for export-scalp-fixture.", file=sys.stderr)
+            return 1
+
+        start_dt = datetime.fromisoformat(args.from_date).replace(tzinfo=UTC)
+        end_dt = datetime.fromisoformat(args.to_date).replace(
+            hour=23, minute=59, second=59, tzinfo=UTC
+        )
+        raw_syms = [s.strip() for s in args.symbols.split(",") if s.strip()]
+        engine = create_db_engine(resolved_url)
+        payload: dict[str, list[dict[str, Any]]] = {}
+        try:
+            init_db(engine)
+            market_repo = PostgresMarketRepository(engine)
+            for sym in raw_syms:
+                canon = resolve_default_perp_symbol(sym).canonical_symbol
+                bars = market_repo.load_candles(
+                    venue=args.venue,
+                    canonical_symbol=canon,
+                    market_type=MarketType.PERPETUAL,
+                    timeframe=Timeframe.M1,
+                    start_open_time=start_dt,
+                    end_open_time=end_dt,
+                )
+                payload[canon] = [b.model_dump(mode="json") for b in bars]
+        finally:
+            engine.dispose()
+
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(payload), encoding="utf-8")
+        counts = ", ".join(f"{k}={len(v)}" for k, v in payload.items())
+        print(f"export-scalp-fixture -> {args.output} ({counts})")
+        return 0
     if args.command == "ml-experiment":
         return _run_ml_experiment(
             symbol_raw=args.symbol,

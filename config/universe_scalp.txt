@@ -1,0 +1,7 @@
+# Scalp v1 universe (Gate USDT-settled perpetuals)
+# Generated/maintained by `crypto-chatbot universe refresh --strategy scalp_v1`
+BTC
+ETH
+SOL
+XRP
+DOGE

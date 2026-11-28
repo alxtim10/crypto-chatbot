@@ -205,6 +205,7 @@ def build_telegram_application(
             sender=deadman_sender,
             chat_id=resolved_chat_id,
             max_silence_hours=screener_cfg.dead_man_hours,
+            max_silence_minutes=screener_cfg.effective_dead_man_minutes,
         )
 
     async def on_startup(app: Application[Any, Any, Any, Any, Any, Any]) -> None:

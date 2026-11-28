@@ -55,8 +55,9 @@ def compute_active_params_sha256(
     universe: Sequence[str] | None = None,
 ) -> str:
     """Compute canonical SHA-256 via the shared `compute_runtime_params_bundle` function."""
+    variant = "scalp_v1" if screener_config is not None and screener_config.is_scalp_mode else "v3"
     digest, _ = compute_runtime_params_bundle(
-        variant="v3",
+        variant=variant,
         screener_config=screener_config,
         universe=universe,
         mtf_engine_version=MTF_ENGINE_VERSION,
@@ -746,11 +747,287 @@ async def _run_mtf_alert_cycle(
     )
 
 
+async def _run_scalp_alert_cycle(
+    *,
+    analysis_service: AnalysisService,
+    alert_repo: AlertRepository,
+    setup_repo: SetupLogRepository | None,
+    decision_repo: Any | None,
+    sender: TelegramOutboxSender | None,
+    screener_config: ScreenerConfig,
+    targets: Sequence[str],
+    chat_id: int | None,
+    dry_run: bool,
+    params_sha: str,
+    now_fn: Callable[[], datetime],
+) -> TimeframeCycleResult:
+    """SC-01/SC-07/SC-08: 5m cadence scalp_v1 alert cycle routed via `strategy: scalp_v1`."""
+    from crypto_chatbot.analysis.structure import analyze_market_structure
+    from crypto_chatbot.scalp.alerts import (
+        build_scalp_inline_keyboard,
+        evaluate_scalp_symbol,
+        make_scalp_run_id,
+        render_scalp_alert_message,
+    )
+    from crypto_chatbot.scalp.config import load_event_calendar
+    from crypto_chatbot.schemas.analysis import SetupBias, TradeSetup
+
+    started_at = now_fn().astimezone(UTC)
+    candle_close_time = _floor_candle_close(started_at, Timeframe.M5)
+    run_id = make_scalp_run_id(candle_close_time)
+    scalp_cfg = screener_config.scalp
+    macro_events = load_event_calendar(scalp_cfg.filters.event_calendar_path)
+
+    if alert_repo.has_completed_run(run_id):
+        logger.info("Scalp alert run %s already completed; skipping duplicate execution", run_id)
+        return TimeframeCycleResult(
+            timeframe=Timeframe.M5,
+            run_id=run_id,
+            skipped_reason="already_completed",
+        )
+
+    inserted = alert_repo.record_run_start(
+        AlertRunRecord(
+            run_id=run_id,
+            strategy="scalp_v1",
+            timeframe=Timeframe.M5,
+            candle_close_time=candle_close_time,
+            started_at=started_at,
+            status="running",
+        )
+    )
+    if not inserted:
+        return TimeframeCycleResult(
+            timeframe=Timeframe.M5,
+            run_id=run_id,
+            skipped_reason="duplicate_run_id",
+        )
+
+    scanned = 0
+    ready_count = 0
+    alerted_count = 0
+    held_digest_count = 0
+    failed_symbols: list[str] = []
+    symbol_errors: dict[str, str] = {}
+    stage_failures: dict[str, dict[str, str]] = {}
+    quiet = screener_config.quiet_hours_wib.is_quiet(started_at)
+
+    # Compute trader risk state from recent scalp setups
+    realized_r_today = 0.0
+    open_taken = 0
+    last_sl_by_sym: dict[str, datetime] = {}
+    if setup_repo is not None:
+        day_start = started_at.replace(hour=0, minute=0, second=0, microsecond=0)
+        recent_setups = setup_repo.list_recent_setups(limit=200)
+        for s in recent_setups:
+            if s.strategy != "scalp_v1":
+                continue
+            if s.user_action in {"pasang", "ambil"}:
+                if s.outcome_status == "entry_triggered":
+                    open_taken += 1
+                if (
+                    s.settled_at is not None
+                    and s.settled_at >= day_start
+                    and s.realized_r is not None
+                ):
+                    realized_r_today += float(s.realized_r)
+            if s.outcome_status == "sl_hit" and s.settled_at is not None:
+                prev_sl = last_sl_by_sym.get(s.canonical_symbol)
+                if prev_sl is None or s.settled_at > prev_sl:
+                    last_sl_by_sym[s.canonical_symbol] = s.settled_at
+
+    for sym in targets:
+        scanned += 1
+        try:
+            snap_1h, batches = await analysis_service.analyze_with_batches(
+                sym,
+                Timeframe.H1,
+                limit=DEFAULT_CANDLE_LIMIT,
+                include_mtf=True,
+                include_derivatives=True,
+                persist=True,
+            )
+            candles_1h = tuple(batches[Timeframe.H1].candles) if Timeframe.H1 in batches else ()
+            candles_15m = tuple(batches[Timeframe.M15].candles) if Timeframe.M15 in batches else ()
+            candles_5m = tuple(batches[Timeframe.M5].candles) if Timeframe.M5 in batches else ()
+            struct_15m = (
+                analyze_market_structure(candles_15m).market_structure if candles_15m else None
+            )
+
+            ev = evaluate_scalp_symbol(
+                run_id=run_id,
+                canonical_symbol=sym,
+                venue=snap_1h.venue,
+                decision_time_utc=candle_close_time,
+                snapshot_1h=snap_1h,
+                candles_1h=candles_1h,
+                candles_15m=candles_15m,
+                candles_5m=candles_5m,
+                structure_15m=struct_15m,
+                config=scalp_cfg,
+                params_sha256=params_sha,
+                macro_events=macro_events,
+                realized_r_today_utc=realized_r_today,
+                last_sl_time_for_symbol_utc=last_sl_by_sym.get(sym),
+                open_taken_trades_count=open_taken,
+            )
+        except Exception as exc:
+            failed_symbols.append(sym)
+            symbol_errors[sym] = str(exc)
+            stage_failures[sym] = {"stage": "error", "reason": str(exc)}
+            continue
+
+        if decision_repo is not None and hasattr(decision_repo, "save_decision"):
+            decision_repo.save_decision(ev.decision)
+
+        if ev.decision.decision_status != "READY" or ev.setup is None or ev.setup.direction is None:
+            stage_failures[sym] = {
+                "stage": ev.decision.decision_status.lower(),
+                "reason": ",".join(ev.decision.reason_codes),
+            }
+            continue
+
+        ready_count += 1
+        if alerted_count >= screener_config.max_alerts_per_run:
+            continue
+
+        now_utc = now_fn().astimezone(UTC)
+        prev = alert_repo.get_symbol_state(sym, Timeframe.M5)
+        if prev is not None and prev.muted_until is not None and now_utc < prev.muted_until:
+            continue
+
+        alert_id = _make_alert_id(run_id, sym, ev.setup.direction)
+        msg_text = render_scalp_alert_message(
+            canonical_symbol=sym,
+            setup=ev.setup,
+            regime_1h_label=ev.regime_1h_label,
+            structure_15m_label=ev.structure_15m_label,
+            features=ev.features,
+            position_config=scalp_cfg.position,
+            phase=scalp_cfg.phase,
+            snapshot_id=ev.decision.decision_id,
+            params_sha256=params_sha,
+        )
+        kb = build_scalp_inline_keyboard(alert_id)
+
+        if setup_repo is not None and snap_1h.technical is not None:
+            trade_setup = TradeSetup(
+                status=SetupStatus.READY,
+                bias=SetupBias.LONG if ev.setup.direction == "long" else SetupBias.SHORT,
+                entry_timeframe=Timeframe.M5,
+                entry_source=ev.setup.zone_source,
+                entry_low=ev.setup.entry_low,
+                entry_high=ev.setup.entry_high,
+                entry_mid=ev.setup.entry_limit,
+                stop_loss=ev.setup.stop_loss,
+                tp1=ev.setup.tp1,
+                tp2=ev.setup.tp2,
+                rr_tp1=ev.setup.gross_rr_tp1,
+                rr_tp2=ev.setup.net_rr_tp2,
+            )
+            save_kwargs: dict[str, Any] = {"params_sha256": params_sha}
+            if hasattr(setup_repo, "save_setup"):
+                try:
+                    setup_repo.save_setup(  # type: ignore[call-arg]
+                        snap_1h.model_copy(
+                            update={
+                                "snapshot_id": ev.decision.decision_id,
+                                "timeframe": Timeframe.M5,
+                                "as_of": candle_close_time,
+                            }
+                        ),
+                        trade_setup,
+                        strategy="scalp_v1",
+                        mode=ev.setup.mode.value,
+                        cost_bps=(
+                            ev.setup.cost_breakdown.expected_round_trip_bps
+                            if ev.setup.cost_breakdown is not None
+                            else None
+                        ),
+                        cost_pct_r=(
+                            ev.setup.cost_breakdown.cost_pct_of_r
+                            if ev.setup.cost_breakdown is not None
+                            else None
+                        ),
+                        features_json=ev.features.model_dump(mode="json"),
+                        user_action="shadow" if scalp_cfg.phase == "shadow" else None,
+                        **save_kwargs,
+                    )
+                except TypeError:
+                    setup_repo.save_setup(snap_1h, trade_setup, params_sha256=params_sha)
+
+        status_str = "held_digest" if quiet else "pending"
+        created = alert_repo.create_alert(
+            AlertRecord(
+                alert_id=alert_id,
+                run_id=run_id,
+                strategy="scalp_v1",
+                snapshot_id=ev.decision.decision_id,
+                params_sha256=params_sha,
+                canonical_symbol=sym,
+                timeframe=Timeframe.M5,
+                direction=ev.setup.direction,
+                venue=snap_1h.venue,
+                chat_id=chat_id,
+                status=status_str,
+                hold_reason="quiet_hours_wib" if quiet else None,
+                message_text=msg_text,
+                reply_markup_json=kb,
+                created_at=now_utc,
+            )
+        )
+        if created:
+            if quiet:
+                held_digest_count += 1
+            else:
+                alerted_count += 1
+
+    sent_now = 0
+    failed_now = 0
+    if not dry_run and sender is not None and chat_id is not None:
+        sent_now, failed_now = await flush_pending_outbox(
+            alert_repo=alert_repo,
+            sender=sender,
+            default_chat_id=chat_id,
+            setup_repo=setup_repo,
+            clock=now_fn,
+            dry_run=dry_run,
+        )
+
+    finished_at = now_fn().astimezone(UTC)
+    alert_repo.record_run_finish(
+        run_id,
+        status="completed",
+        finished_at=finished_at,
+        scanned_count=scanned,
+        ready_count=ready_count,
+        alerted_count=alerted_count,
+        held_digest_count=held_digest_count,
+        failed_symbols=failed_symbols,
+        symbol_errors=symbol_errors,
+        stage_failures=stage_failures,
+    )
+    return TimeframeCycleResult(
+        timeframe=Timeframe.M5,
+        run_id=run_id,
+        scanned_count=scanned,
+        ready_count=ready_count,
+        queued_alerts=alerted_count,
+        sent_alerts=sent_now,
+        held_digest_alerts=held_digest_count,
+        failed_deliveries=failed_now,
+        failed_symbols=tuple(failed_symbols),
+        symbol_errors=symbol_errors,
+        stage_failures=stage_failures,
+    )
+
+
 async def run_alert_cycle(
     *,
     analysis_service: AnalysisService,
     alert_repo: AlertRepository,
     setup_repo: SetupLogRepository | None = None,
+    decision_repo: Any | None = None,
     sender: TelegramOutboxSender | None = None,
     screener_config: ScreenerConfig,
     symbols: Sequence[str] | None = None,
@@ -759,12 +1036,12 @@ async def run_alert_cycle(
     lock_key: int = ALERT_ADVISORY_LOCK_KEY,
     clock: Callable[[], datetime] | None = None,
 ) -> AlertCycleSummary:
-    """Execute one idempotent, advisory-locked alert worker cycle (MTF 15m or legacy single-TF)."""
+    """Execute one idempotent, advisory-locked alert cycle (scalp_v1, swing_mtf, or legacy)."""
     now_fn = clock or (lambda: datetime.now(UTC))
     targets = (
         tuple(symbols)
         if symbols is not None and len(symbols) > 0
-        else load_universe(screener_config.universe_path)
+        else load_universe(screener_config.effective_universe_path)
     )
     params_sha = compute_active_params_sha256(
         screener_config=screener_config,
@@ -777,6 +1054,26 @@ async def run_alert_cycle(
 
     results: list[TimeframeCycleResult] = []
     try:
+        if screener_config.is_scalp_mode:
+            scalp_res = await _run_scalp_alert_cycle(
+                analysis_service=analysis_service,
+                alert_repo=alert_repo,
+                setup_repo=setup_repo,
+                decision_repo=decision_repo,
+                sender=sender,
+                screener_config=screener_config,
+                targets=targets,
+                chat_id=chat_id,
+                dry_run=dry_run,
+                params_sha=params_sha,
+                now_fn=now_fn,
+            )
+            results.append(scalp_res)
+            return AlertCycleSummary(
+                locked_out=False,
+                params_sha256=params_sha,
+                results=tuple(results),
+            )
         if screener_config.is_mtf_mode:
             mtf_res = await _run_mtf_alert_cycle(
                 analysis_service=analysis_service,

@@ -484,24 +484,31 @@ def _make_mtf_snapshot(
 
 def test_screener_yaml_mtf_schema_and_params_sha256_sensitivity() -> None:
     cfg = load_screener_config("config/screener.yaml")
-    assert cfg.is_mtf_mode is True
-    assert cfg.mtf_timeframes is not None
-    assert cfg.mtf_timeframes.bias == (Timeframe.H4, Timeframe.H1)
-    assert cfg.mtf_timeframes.setup is Timeframe.M15
-    assert cfg.mtf_timeframes.confirm is Timeframe.M5
-    assert cfg.cadence_minutes == 15
-    assert cfg.setup_expiry_minutes == 90
-    assert cfg.cooldown_for(Timeframe.M15) == timedelta(hours=2)
-    assert cfg.dead_man_hours == 1.0
+    # Active strategy in config/screener.yaml is scalp_v1 (SC-01); swing MTF is kept in code
+    assert cfg.is_scalp_mode is True
+    assert cfg.is_mtf_mode is False
+    assert cfg.cadence_minutes == 5
+    assert cfg.effective_dead_man_minutes == 15.0
+
+    # Switching strategy -> swing_mtf re-enables legacy MTF flow without code changes
+    swing_cfg = cfg.model_copy(update={"strategy": "swing_mtf", "cadence_minutes": 15})
+    assert swing_cfg.is_mtf_mode is True
+    assert swing_cfg.mtf_timeframes is not None
+    assert swing_cfg.mtf_timeframes.bias == (Timeframe.H4, Timeframe.H1)
+    assert swing_cfg.mtf_timeframes.setup is Timeframe.M15
+    assert swing_cfg.mtf_timeframes.confirm is Timeframe.M5
+    assert swing_cfg.setup_expiry_minutes == 90
+    assert swing_cfg.cooldown_for(Timeframe.M15) == timedelta(hours=2)
+    assert swing_cfg.dead_man_hours == 1.0
 
     # params_sha256 includes MTF engine version + screener.yaml + universe.txt
-    sha_a = compute_active_params_sha256(screener_config=cfg, universe=("BTC/USDT:USDT",))
+    sha_a = compute_active_params_sha256(screener_config=swing_cfg, universe=("BTC/USDT:USDT",))
     sha_b = compute_active_params_sha256(
-        screener_config=cfg.model_copy(update={"setup_expiry_minutes": 60}),
+        screener_config=swing_cfg.model_copy(update={"setup_expiry_minutes": 60}),
         universe=("BTC/USDT:USDT",),
     )
     sha_c = compute_active_params_sha256(
-        screener_config=cfg,
+        screener_config=swing_cfg,
         universe=("BTC/USDT:USDT", "ETH/USDT:USDT"),
     )
     assert sha_a != sha_b
@@ -866,10 +873,10 @@ def test_freeze_params_hash_matches_alerts_run_and_enforces_mismatch(
 
     frozen_file = Path(tmp_path) / "frozen_params.json"
     cfg = load_screener_config("config/screener.yaml")
-    universe = load_universe(cfg.universe_path)
+    universe = load_universe(cfg.effective_universe_path)
 
     artifact = freeze_variant_params(
-        "v3",
+        "scalp_v1",
         output_path=frozen_file,
         screener_config=cfg,
         universe=universe,
@@ -878,7 +885,7 @@ def test_freeze_params_hash_matches_alerts_run_and_enforces_mismatch(
 
     assert artifact.params_sha256 == alerts_sha
     assert artifact.setup_params_sha256 is not None
-    assert artifact.mtf_engine_version == "mtf-15m-v2"
+    assert artifact.mtf_engine_version == "scalp-v1.0"
     assert artifact.screener_config_sha256 is not None
     assert artifact.universe_sha256 is not None
 
@@ -888,9 +895,11 @@ def test_freeze_params_hash_matches_alerts_run_and_enforces_mismatch(
     # Verify CLI `_run_alerts` refuses with exit code 2 when frozen_params.json mismatches
     drifted_file = Path(tmp_path) / "drifted_frozen.json"
     freeze_variant_params(
-        "v3",
+        "scalp_v1",
         output_path=drifted_file,
-        screener_config=cfg.model_copy(update={"setup_expiry_minutes": 45}),
+        screener_config=cfg.model_copy(
+            update={"scalp": cfg.scalp.model_copy(update={"max_hold_bars_5m": 12})}
+        ),
         universe=universe,
     )
 
