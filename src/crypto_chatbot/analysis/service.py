@@ -1869,7 +1869,7 @@ class AnalysisService:
                 m5_batch = await self._fetch_optional_ltf(
                     effective_symbol,
                     Timeframe.M5,
-                    limit=150,
+                    limit=limit,
                     provider=pinned_provider,
                 )
                 if m5_batch is not None:
@@ -2039,7 +2039,7 @@ class AnalysisService:
                         self._fetch_optional_ltf(
                             effective_symbol,
                             Timeframe.M15,
-                            limit=200,
+                            limit=limit,
                             provider=pinned_provider,
                         ),
                     )
@@ -2051,7 +2051,7 @@ class AnalysisService:
                         self._fetch_optional_ltf(
                             effective_symbol,
                             Timeframe.M5,
-                            limit=150,
+                            limit=limit,
                             provider=pinned_provider,
                         ),
                     )
